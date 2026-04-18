@@ -1,0 +1,22 @@
+{
+  "title": "aaa",
+  "created_at": "2025-12-27T13:55:47.027059",
+  "messages": [
+    {
+      "role": "user",
+      "content": "ciao"
+    },
+    {
+      "role": "assistant",
+      "content": "Ho capito: ciao. Dimmi come posso aiutarti."
+    },
+    {
+      "role": "user",
+      "content": "ciao"
+    },
+    {
+      "role": "assistant",
+      "content": "Ho capito: ciao. Dimmi come posso aiutarti."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "user_id": "anonymous",
+  "chat_id": "Nuova chat 88",
+  "messages": [
+    {
+      "role": "user",
+      "content": "ciao"
+    },
+    {
+      "role": "assistant",
+      "content": "Ho capito: ciao. Dimmi come posso aiutarti."
+    }
+  ]
+}
