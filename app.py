@@ -212,19 +212,33 @@ PUBLIC_PATHS = ["/api/ping", "/api/runner/register", "/api/runner/heartbeat", "/
 # ----------------------------------------
 # CORS
 # ----------------------------------------
+# Browser `Origin` is normally without path; optional trailing slash covers odd clients.
+_NETLIFY_APP_ORIGIN = "https://fastidious-buttercream-9b59bc.netlify.app"
+_cors_env = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+_cors_extra = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else []
+CORS_ALLOW_ORIGINS = list(
+    dict.fromkeys(
+        [
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            _NETLIFY_APP_ORIGIN,
+            f"{_NETLIFY_APP_ORIGIN}/",
+            *_cors_extra,
+        ]
+    )
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-        "http://127.0.0.1:8000",
-        "http://localhost:8000",
-    ],
-    allow_credentials=True,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    # Bearer token via Authorization: no credentialed cookies on cross-origin fetch → False
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+f
 
 
 # ----------------------------------------
