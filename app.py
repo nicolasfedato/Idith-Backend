@@ -32,6 +32,10 @@ def _bootstrap_dotenv() -> None:
             break
 _bootstrap_dotenv()
 
+# Logging prima degli import opzionali, così i tentativi su supabase_queue hanno handler su Railway.
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 from fastapi import FastAPI, Depends, HTTPException, Body, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -61,15 +65,54 @@ except Exception as e1:
 
 orchestrator = orchestrator_mod
 
-# Supabase queue module (dopo load_env, non fa più raise a import-time)
+# Supabase queue module (dopo load_env, non fa raise a import-time).
+# In deploy (es. uvicorn app:app dalla cartella idith/) il package relativo fallisce:
+# servono fallback come per orchestrator, incluso import diretto del modulo sibling.
+supabase_queue = None
 try:
-    from . import supabase_queue
-except ImportError:
+    from . import supabase_queue as _supabase_queue_mod
+    supabase_queue = _supabase_queue_mod
+    logger.info("[SUPABASE_QUEUE] import supabase_queue OK (relative: from . import supabase_queue)")
+except Exception as e1:
+    logger.warning(
+        "[SUPABASE_QUEUE] import supabase_queue FAILED (relative), trying next: %s",
+        e1,
+        exc_info=True,
+    )
     try:
-        from idith import supabase_queue
-    except ImportError:
-        supabase_queue = None
-        print("[APP] WARNING: supabase_queue import failed")
+        import idith.supabase_queue as _supabase_queue_mod
+
+        supabase_queue = _supabase_queue_mod
+        logger.info("[SUPABASE_QUEUE] import supabase_queue OK (idith.supabase_queue)")
+    except Exception as e2:
+        logger.warning(
+            "[SUPABASE_QUEUE] import supabase_queue FAILED (idith.supabase_queue), trying next: %s",
+            e2,
+            exc_info=True,
+        )
+        try:
+            from idith import supabase_queue as _supabase_queue_mod
+
+            supabase_queue = _supabase_queue_mod
+            logger.info("[SUPABASE_QUEUE] import supabase_queue OK (from idith import supabase_queue)")
+        except Exception as e3:
+            logger.warning(
+                "[SUPABASE_QUEUE] import supabase_queue FAILED (from idith import), trying next: %s",
+                e3,
+                exc_info=True,
+            )
+            try:
+                import supabase_queue as _supabase_queue_mod
+
+                supabase_queue = _supabase_queue_mod
+                logger.info("[SUPABASE_QUEUE] import supabase_queue OK (plain: import supabase_queue)")
+            except Exception as e4:
+                logger.error(
+                    "[SUPABASE_QUEUE] import supabase_queue FAILED (all attempts exhausted). Last error: %s",
+                    e4,
+                    exc_info=True,
+                )
+                supabase_queue = None
 
 # ----------------------------------------
 # ENV
@@ -91,12 +134,6 @@ if not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_SERVICE_KEY or SUPABASE_SERVICE_ROLE_KEY missing in .env")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-
-# ----------------------------------------
-# LOGGING
-# ----------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # ----------------------------------------
 # CIRCUIT BREAKER (in-memory, per-process)
@@ -4189,8 +4226,15 @@ def _enqueue_command_to_runner(
     Ritorna (success: bool, command_id: str)
     """
     if not supabase_queue:
-        logger.error("[CHAT] supabase_queue module not available")
-        return (False, "")
+        error_msg = (
+            "Modulo supabase_queue non caricato nel server: impossibile accodare il comando al runner. "
+            "Cerca nei log [SUPABASE_QUEUE] import supabase_queue FAILED (all attempts exhausted) con traceback."
+        )
+        logger.error(
+            "[CHAT] supabase_queue module not available — enqueue skipped. detail=%s",
+            error_msg,
+        )
+        return (False, error_msg)
     
     try:
         # Ottieni device_id dalla chat
