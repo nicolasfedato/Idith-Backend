@@ -273,7 +273,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
     # Bearer token via Authorization: no credentialed cookies on cross-origin fetch → False
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
