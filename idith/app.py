@@ -262,6 +262,8 @@ CORS_ALLOW_ORIGINS = list(
             "http://localhost:8000",
             _NETLIFY_APP_ORIGIN,
             f"{_NETLIFY_APP_ORIGIN}/",
+            "https://idith.tech",
+            "https://www.idith.tech",
             *_cors_extra,
         ]
     )
