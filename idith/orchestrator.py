@@ -3055,7 +3055,9 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     confirmation = f"Ok 👍 Ho aggiornato {param_name}."
                 else:
                     confirmation = f"Ok 👍 Ho aggiornato {len(applied_updates)} parametri."
-                next_question = _step_question(current_step, params)
+                updated_step = cs.get("step", current_step)
+                step_for_question = updated_step if "market_type" in applied_updates else current_step
+                next_question = _step_question(step_for_question, params)
                 reply_text = f"{confirmation} {next_question}"
                 if errors:
                     reply_text += "\n\nNon ho potuto applicare:\n" + "\n".join(f"• {err}" for err in errors.values())
