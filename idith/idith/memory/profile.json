@@ -1,0 +1,22 @@
+{
+  "language": "it",
+  "tone": "amichevole_pro",
+  "style_variation": "alta",
+  "identity": "consulente_empatico",
+  "ui_theme": "dark",
+  "exchange": "bybit_testnet",
+  "live_mode_enabled": false,
+  "pair": "BTCUSDT",
+  "timeframe": "1h",
+  "strategy": "trend",
+  "risk_pct": "1%",
+  "sl": "ATR 2x",
+  "tp": "RR 1.5x",
+  "leverage": "1x",
+  "lang_register": "adaptive",
+  "last_pair": null,
+  "last_timeframe": null,
+  "last_strategy": null,
+  "last_indicators": null,
+  "updated_at": 1766261099
+}
