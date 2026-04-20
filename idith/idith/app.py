@@ -128,10 +128,10 @@ APP_ENV = os.getenv("ENV", "").strip().lower()
 RUNNER_TOKEN_TTL_HOURS = float(os.getenv("RUNNER_TOKEN_TTL_HOURS", "24.0"))
 
 if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL missing in .env")
+    raise RuntimeError("SUPABASE_URL missing from environment")
 
 if not SUPABASE_SERVICE_KEY:
-    raise RuntimeError("SUPABASE_SERVICE_KEY or SUPABASE_SERVICE_ROLE_KEY missing in .env")
+    raise RuntimeError("SUPABASE_SERVICE_KEY or SUPABASE_SERVICE_ROLE_KEY missing from environment")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
