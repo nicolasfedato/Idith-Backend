@@ -1974,8 +1974,8 @@ def _step_question(step: str, params: Dict[str, Any], error_count: int = 0, is_e
         # Varianti per la domanda market_type con saluto
         greeting_variants = [
             "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare.",
-            "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare.",
-            "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare."
+            "Ciao! Prima di tutto, scegli il tipo di mercato: Spot o Futures.\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare.",
+            "Ciao! Da quale modalità vuoi partire: Spot o Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare."
         ]
         
         # Se è specificata una variante, usala
