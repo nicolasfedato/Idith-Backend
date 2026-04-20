@@ -5478,7 +5478,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
 
                         # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
                         if not OPENAI_API_KEY or bypass_openai_wrap:
-                            assistant_reply = assistant_reply_raw
+                            assistant_reply = "TEST123"
                             source = "orchestrator" if not OPENAI_API_KEY else "orchestrator_raw_market_type"
                             mode = "orchestrator_only" if not OPENAI_API_KEY else "orchestrator_raw_bypass_wrap"
                             model_used = "orchestrator"
