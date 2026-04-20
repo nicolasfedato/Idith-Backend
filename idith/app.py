@@ -5460,11 +5460,6 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             )
                             state_for_model = orch_state
 
-                        # Prima domanda market_type: mantieni il testo raw dell'orchestrator (no wrap OpenAI)
-                        raw_is_first_market_type_question = (
-                            "Vuoi operare in Spot o in Futures?" in assistant_reply_raw
-                            and "recenti aggiornamenti normativi" in assistant_reply_raw
-                        )
                         current_step_for_wrap = None
                         if isinstance(orch_state, dict):
                             _cfg = orch_state.get("config_state")
@@ -5474,13 +5469,12 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             _cfg = state.get("config_state")
                             if isinstance(_cfg, dict):
                                 current_step_for_wrap = _cfg.get("step")
-                        bypass_openai_wrap = raw_is_first_market_type_question or (current_step_for_wrap == "market_type")
 
                         # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
-                        if not OPENAI_API_KEY or bypass_openai_wrap:
+                        if not OPENAI_API_KEY:
                             assistant_reply = assistant_reply_raw
-                            source = "orchestrator" if not OPENAI_API_KEY else "orchestrator_raw_market_type"
-                            mode = "orchestrator_only" if not OPENAI_API_KEY else "orchestrator_raw_bypass_wrap"
+                            source = "orchestrator"
+                            mode = "orchestrator_only"
                             model_used = "orchestrator"
                         else:
                             # Wrap con OpenAI per renderla davvero "IA"
@@ -5513,6 +5507,40 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             source = "orchestrator+openai"
                             mode = "orchestrator_wrapped"
                             model_used = chosen_model
+
+                        # market_type / prima domanda Spot-Futures: dopo il wrap, garantisci la nota normativa Bybit EU
+                        _bybit_eu_futures_disclaimer = (
+                            "\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\n"
+                            "Se scegli Futures, il bot proverà comunque a operare."
+                        )
+                        _ar_fin = assistant_reply or ""
+                        _ar_l = _ar_fin.lower()
+                        _raw_l = (assistant_reply_raw or "").lower()
+                        _has_bybit_eu_futures_regulatory_concept = (
+                            "recenti aggiornamenti normativi" in _ar_fin
+                            or "⚠️ nota: per alcuni account europei i futures su bybit" in _ar_l
+                            or (
+                                "account europei" in _ar_l
+                                and "bybit" in _ar_l
+                                and ("futures" in _ar_l or "future" in _ar_l)
+                                and any(
+                                    k in _ar_l
+                                    for k in ("normativ", "disponibil", "aggiornament", "regolament", "restrizion")
+                                )
+                            )
+                        )
+                        _looks_like_first_spot_futures_question = (
+                            "spot" in _raw_l
+                            and ("futures" in _raw_l or "future" in _raw_l)
+                            and any(
+                                k in _raw_l
+                                for k in ("operare", "vuoi", "scegli", "preferisci", "spot o", "o in ")
+                            )
+                        )
+                        if not _has_bybit_eu_futures_regulatory_concept and (
+                            current_step_for_wrap == "market_type" or _looks_like_first_spot_futures_question
+                        ):
+                            assistant_reply = _ar_fin + _bybit_eu_futures_disclaimer
 
                 except Exception as e:
                     import traceback
