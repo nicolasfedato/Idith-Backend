@@ -5416,30 +5416,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             logger.error(f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}")
                             raise HTTPException(status_code=500, detail=f"Save chat state failed: {reason}")
 
-                    # Prima domanda wizard su market_type: testo normativo fisso (no reply orchestrator, no wrap OpenAI)
-                    is_first_wizard_market_type_question = False
-                    if isinstance(orch_state, dict):
-                        _cfg_first_mt = orch_state.get("config_state")
-                        if isinstance(_cfg_first_mt, dict) and _cfg_first_mt.get("step") == "market_type":
-                            _params_first_mt = _cfg_first_mt.get("params") or {}
-                            if isinstance(_params_first_mt, dict) and _params_first_mt.get("market_type") is None:
-                                _ec_first_mt = _cfg_first_mt.get("error_count") or {}
-                                if isinstance(_ec_first_mt, dict) and int(_ec_first_mt.get("market_type", 0) or 0) == 0:
-                                    is_first_wizard_market_type_question = True
-
-                    if orch_res and isinstance(orch_res, dict) and is_first_wizard_market_type_question:
-                        assistant_reply = (
-                            "Ciao! Vuoi operare in Spot o in Futures?\n\n"
-                            "⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\n"
-                            "Se scegli Futures, il bot proverà comunque a operare."
-                        )
-                        source = "app_fixed_wizard_first_market_type"
-                        mode = "wizard_first_market_type_fixed"
-                        model_used = "orchestrator"
-                        logger.info(
-                            "[CHAT] Fixed first wizard market_type reply (no orchestrator text, no OpenAI wrap)"
-                        )
-                    elif orch_res and isinstance(orch_res, dict) and orch_res.get("reply"):
+                    if orch_res and isinstance(orch_res, dict) and orch_res.get("reply"):
                         assistant_reply_raw = orch_res["reply"].strip()
                         if orch_res.get("error_code"):
                             orch_error_code = orch_res["error_code"]
