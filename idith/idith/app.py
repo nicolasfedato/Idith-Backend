@@ -1468,7 +1468,11 @@ def runner_status(
     chat_id_q = (chat_id or "").strip()
     if chat_id_q:
         if not _runner_status_user_owns_chat(str(user_id), chat_id_q):
-            raise HTTPException(status_code=403, detail="Chat non disponibile")
+            return {
+                "runner_connected": False,
+                "bot_active": False,
+                "events": [],
+            }
 
     session_chat_id = _runner_chat_id_from_command_id(start_command_id) if start_command_id else None
 
