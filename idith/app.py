@@ -5478,6 +5478,10 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             "Vuoi operare in Spot o in Futures?" in assistant_reply_raw
                         )
 
+                        logger.info(f"[CHAT_DIAG] current_step_for_wrap={current_step_for_wrap!r}")
+                        logger.info(f"[CHAT_DIAG] bypass_openai_wrap={bypass_openai_wrap!r}")
+                        logger.info(f"[CHAT_DIAG] assistant_reply_raw={assistant_reply_raw!r}")
+
                         # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
                         if not OPENAI_API_KEY or bypass_openai_wrap:
                             assistant_reply = "TEST123"
