@@ -4823,6 +4823,7 @@ def chat_smoke(payload: ChatPayload, request: Request):
 
 @app.post("/api/chat")
 def chat(payload: ChatPayload, user=Depends(get_current_user)):
+    raise Exception("QUI PASSO DA QUESTO FILE")
     """
     Endpoint POST /chat: gestisce messaggi utente e genera risposte.
     
