@@ -128,10 +128,10 @@ APP_ENV = os.getenv("ENV", "").strip().lower()
 RUNNER_TOKEN_TTL_HOURS = float(os.getenv("RUNNER_TOKEN_TTL_HOURS", "24.0"))
 
 if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL missing in .env")
+    raise RuntimeError("SUPABASE_URL missing from environment")
 
 if not SUPABASE_SERVICE_KEY:
-    raise RuntimeError("SUPABASE_SERVICE_KEY or SUPABASE_SERVICE_ROLE_KEY missing in .env")
+    raise RuntimeError("SUPABASE_SERVICE_KEY or SUPABASE_SERVICE_ROLE_KEY missing from environment")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -601,7 +601,7 @@ def build_conversational_prompt(user_text: str, history: list[dict], state: dict
     if is_info_request and not is_config_value and current_step:
         # Mappa step a domande di riaggancio
         step_questions = {
-            "market_type": "Vuoi operare in Spot o in Futures?",
+            "market_type": "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare.",
             "symbol": "Perfetto. Che coppia USDT vuoi utilizzare? (es. BTCUSDT)",
             # Nel piano FREE lo step strategia è la modalità operativa
             "operating_mode": "Che modalità preferisci: aggressiva, equilibrata o selettiva?",
@@ -1468,7 +1468,11 @@ def runner_status(
     chat_id_q = (chat_id or "").strip()
     if chat_id_q:
         if not _runner_status_user_owns_chat(str(user_id), chat_id_q):
-            raise HTTPException(status_code=403, detail="Chat non disponibile")
+            return {
+                "runner_connected": False,
+                "bot_active": False,
+                "events": [],
+            }
 
     session_chat_id = _runner_chat_id_from_command_id(start_command_id) if start_command_id else None
 
@@ -4928,7 +4932,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
             }
         
         # Genera prima domanda (market_type) per il piano FREE v2: ordine market_type -> symbol -> timeframe -> operating_mode -> ...
-        first_question = "Ciao! Vuoi operare in Spot o in Futures?"
+        first_question = "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare."
         if orchestrator:
             try:
                 _step_question = getattr(orchestrator, "_step_question", None)
@@ -4936,7 +4940,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     first_question = _step_question("market_type", {}, error_count=0, is_error=False, greeting_variant=0)
             except Exception as e:
                 logger.warning(f"[RESET] Fallback su stringa hardcoded per prima domanda: {e}")
-                first_question = "Ciao! Vuoi operare in Spot o in Futures?"
+                first_question = "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare."
         
         assistant_reply = f"✅ Bot resettato. Ripartiamo da zero.\n\n{first_question}"
         source = "reset"
@@ -5456,11 +5460,27 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             )
                             state_for_model = orch_state
 
+                        # Prima domanda market_type: mantieni il testo raw dell'orchestrator (no wrap OpenAI)
+                        raw_is_first_market_type_question = (
+                            "Vuoi operare in Spot o in Futures?" in assistant_reply_raw
+                            and "recenti aggiornamenti normativi" in assistant_reply_raw
+                        )
+                        current_step_for_wrap = None
+                        if isinstance(orch_state, dict):
+                            _cfg = orch_state.get("config_state")
+                            if isinstance(_cfg, dict):
+                                current_step_for_wrap = _cfg.get("step")
+                        if current_step_for_wrap is None and isinstance(state, dict):
+                            _cfg = state.get("config_state")
+                            if isinstance(_cfg, dict):
+                                current_step_for_wrap = _cfg.get("step")
+                        bypass_openai_wrap = raw_is_first_market_type_question or (current_step_for_wrap == "market_type")
+
                         # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
-                        if not OPENAI_API_KEY:
+                        if not OPENAI_API_KEY or bypass_openai_wrap:
                             assistant_reply = assistant_reply_raw
-                            source = "orchestrator"
-                            mode = "orchestrator_only"
+                            source = "orchestrator" if not OPENAI_API_KEY else "orchestrator_raw_market_type"
+                            mode = "orchestrator_only" if not OPENAI_API_KEY else "orchestrator_raw_bypass_wrap"
                             model_used = "orchestrator"
                         else:
                             # Wrap con OpenAI per renderla davvero "IA"

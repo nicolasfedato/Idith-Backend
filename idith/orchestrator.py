@@ -1973,9 +1973,9 @@ def _step_question(step: str, params: Dict[str, Any], error_count: int = 0, is_e
     elif step == "market_type":
         # Varianti per la domanda market_type con saluto
         greeting_variants = [
-            "Ciao! Vuoi operare in Spot o in Futures?",
-            "Ciao! Partiamo dalla modalità: Spot o Futures?",
-            "Ciao! Prima scelta: preferisci Spot o Futures?"
+            "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare.",
+            "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare.",
+            "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare."
         ]
         
         # Se è specificata una variante, usala
@@ -3058,6 +3058,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 updated_step = cs.get("step", current_step)
                 step_for_question = updated_step if "market_type" in applied_updates else current_step
                 next_question = _step_question(step_for_question, params)
+                next_question = re.sub(r"^\s*ok[\s\.\,\!\?;:-]*", "", next_question, flags=re.IGNORECASE)
                 reply_text = f"{confirmation} {next_question}"
                 if errors:
                     reply_text += "\n\nNon ho potuto applicare:\n" + "\n".join(f"• {err}" for err in errors.values())
