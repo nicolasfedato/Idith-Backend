@@ -5474,7 +5474,9 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             _cfg = state.get("config_state")
                             if isinstance(_cfg, dict):
                                 current_step_for_wrap = _cfg.get("step")
-                        bypass_openai_wrap = True if current_step_for_wrap == "market_type" else raw_is_first_market_type_question
+                        bypass_openai_wrap = (
+                            "Vuoi operare in Spot o in Futures?" in assistant_reply_raw
+                        )
 
                         # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
                         if not OPENAI_API_KEY or bypass_openai_wrap:
