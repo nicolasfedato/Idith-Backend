@@ -5402,8 +5402,37 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     # Salva stato ogni volta che l'orchestrator restituisce uno state (PATCH su chats)
                     # FIX: orch_res.get("state") è falsy per {} - usare "is not None" per non saltare save
                     if orch_res and isinstance(orch_res, dict) and orch_state is not None and isinstance(orch_state, dict):
+                        orch_state_to_save = dict(orch_state)
+                        _cs_save = orch_state_to_save.get("config_state")
+                        _step_save = _cs_save.get("step") if isinstance(_cs_save, dict) else None
+                        if isinstance(_cs_save, dict) and _step_save is not None:
+                            _css_save = orch_state_to_save.get("config_status")
+                            if _css_save is None:
+                                prev_cs = (state or {}).get("config_status") if isinstance(state, dict) else None
+                                derived_cs = (
+                                    prev_cs
+                                    if prev_cs in ("in_progress", "complete", "ready")
+                                    else "in_progress"
+                                )
+                                orch_state_to_save["config_status"] = derived_cs
+                                logger.info(
+                                    "[CHAT_DIAG] config_status updated to %s (was absent on orchestrator state, step=%s)",
+                                    derived_cs,
+                                    _step_save,
+                                )
+                            elif _css_save == "new":
+                                orch_state_to_save["config_status"] = "in_progress"
+                                logger.info(
+                                    "[CHAT_DIAG] config_status updated to in_progress (was new during guided step=%s)",
+                                    _step_save,
+                                )
+                        logger.info("[CHAT_DIAG] persisting config_state from orchestrator")
                         logger.info("[CONFIG_SAVE] saving state for chat_id=%s", chat_id)
-                        save_result = save_chat_state(chat_id, user_id, orch_state)
+                        save_result = save_chat_state(chat_id, user_id, orch_state_to_save)
+                        if not save_result.get("ok", False):
+                            reason = save_result.get("reason", "unknown")
+                            logger.error(f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}")
+                            raise HTTPException(status_code=500, detail=f"Save chat state failed: {reason}")
                     else:
                         _skip_reason = (
                             "orch_res invalid" if not (orch_res and isinstance(orch_res, dict))
@@ -5411,10 +5440,6 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             else "orch_state not dict"
                         )
                         logger.info("[CONFIG_SAVE] SKIP save for chat_id=%s: %s", chat_id, _skip_reason)
-                        if not save_result.get("ok", False):
-                            reason = save_result.get("reason", "unknown")
-                            logger.error(f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}")
-                            raise HTTPException(status_code=500, detail=f"Save chat state failed: {reason}")
 
                     if orch_res and isinstance(orch_res, dict) and orch_res.get("reply"):
                         assistant_reply_raw = orch_res["reply"].strip()
@@ -5460,27 +5485,25 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             )
                             state_for_model = orch_state
 
-                        # Prima domanda market_type: mantieni il testo raw dell'orchestrator (no wrap OpenAI)
-                        raw_is_first_market_type_question = (
-                            "Vuoi operare in Spot o in Futures?" in assistant_reply_raw
-                            and "recenti aggiornamenti normativi" in assistant_reply_raw
-                        )
-                        current_step_for_wrap = None
+                        # Flow guidato: nessun wrap OpenAI — mostra il testo dell'orchestrator così com'è
+                        guided_flow_active = False
                         if isinstance(orch_state, dict):
-                            _cfg = orch_state.get("config_state")
-                            if isinstance(_cfg, dict):
-                                current_step_for_wrap = _cfg.get("step")
-                        if current_step_for_wrap is None and isinstance(state, dict):
-                            _cfg = state.get("config_state")
-                            if isinstance(_cfg, dict):
-                                current_step_for_wrap = _cfg.get("step")
-                        bypass_openai_wrap = raw_is_first_market_type_question or (current_step_for_wrap == "market_type")
+                            _cfg_g = orch_state.get("config_state")
+                            _st_g = orch_state.get("config_status")
+                            if (
+                                isinstance(_cfg_g, dict)
+                                and _cfg_g.get("step") is not None
+                                and _st_g not in ("complete", "ready")
+                            ):
+                                guided_flow_active = True
 
                         # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
-                        if not OPENAI_API_KEY or bypass_openai_wrap:
+                        if not OPENAI_API_KEY or guided_flow_active:
+                            if guided_flow_active:
+                                logger.info("[CHAT_DIAG] using raw orchestrator flow")
                             assistant_reply = assistant_reply_raw
-                            source = "orchestrator" if not OPENAI_API_KEY else "orchestrator_raw_market_type"
-                            mode = "orchestrator_only" if not OPENAI_API_KEY else "orchestrator_raw_bypass_wrap"
+                            source = "orchestrator"
+                            mode = "orchestrator_only" if not OPENAI_API_KEY else "orchestrator_guided_raw"
                             model_used = "orchestrator"
                         else:
                             # Wrap con OpenAI per renderla davvero "IA"
