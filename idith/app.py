@@ -5416,7 +5416,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             logger.error(f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}")
                             raise HTTPException(status_code=500, detail=f"Save chat state failed: {reason}")
 
-                    if orch_res and isinstance(orch_res, dict) and "reply" in orch_res:
+                    if orch_res and isinstance(orch_res, dict) and orch_res.get("reply"):
                         assistant_reply_raw = orch_res["reply"].strip()
                         if orch_res.get("error_code"):
                             orch_error_code = orch_res["error_code"]
@@ -5516,8 +5516,6 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
 
                 except Exception as e:
                     import traceback
-                    print("ERRORE REALE:", str(e))
-                    traceback.print_exc()
 
                     logger.error(f"[CHAT] Errore orchestrator: {e}")
                     logger.exception("Errore orchestrator con stacktrace completo")
