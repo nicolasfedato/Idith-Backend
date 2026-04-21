@@ -4823,7 +4823,6 @@ def chat_smoke(payload: ChatPayload, request: Request):
 
 @app.post("/api/chat")
 def chat(payload: ChatPayload, user=Depends(get_current_user)):
-    raise Exception("QUI PASSO DA QUESTO FILE")
     """
     Endpoint POST /chat: gestisce messaggi utente e genera risposte.
     
@@ -5475,17 +5474,11 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             _cfg = state.get("config_state")
                             if isinstance(_cfg, dict):
                                 current_step_for_wrap = _cfg.get("step")
-                        bypass_openai_wrap = (
-                            "Vuoi operare in Spot o in Futures?" in assistant_reply_raw
-                        )
-
-                        logger.info(f"[CHAT_DIAG] current_step_for_wrap={current_step_for_wrap!r}")
-                        logger.info(f"[CHAT_DIAG] bypass_openai_wrap={bypass_openai_wrap!r}")
-                        logger.info(f"[CHAT_DIAG] assistant_reply_raw={assistant_reply_raw!r}")
+                        bypass_openai_wrap = raw_is_first_market_type_question or (current_step_for_wrap == "market_type")
 
                         # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
                         if not OPENAI_API_KEY or bypass_openai_wrap:
-                            assistant_reply = "TEST123"
+                            assistant_reply = assistant_reply_raw
                             source = "orchestrator" if not OPENAI_API_KEY else "orchestrator_raw_market_type"
                             mode = "orchestrator_only" if not OPENAI_API_KEY else "orchestrator_raw_bypass_wrap"
                             model_used = "orchestrator"
