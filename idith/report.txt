@@ -1,0 +1,22 @@
+=== REPORT (2025-10-25 23:13:04) ===
+
+01. 1: Flusso base SPOT === → ✅ PASS
+02. 2: Futures con leva bassa === → ✅ PASS
+03. 3: Futures con leva alta === → ✅ PASS
+04. 4: Testnet === → ✅ PASS
+05. 5: Live === → ✅ PASS
+06. 6: Ortografia errata === → ✅ PASS
+07. 7: Domanda di spiegazione === → ✅ PASS
+08. 8: Linguaggio volgare === → ✅ PASS
+09. 9: Ansia === → ✅ PASS
+10. 10: Guadagni === → ✅ PASS
+11. 11: Ordine invertito === → ✅ PASS
+12. 12: Cambia idea === → ✅ PASS
+13. 13: Riepilogo prematuro === → ✅ PASS
+14. 14: Codice prematuro === → ✅ PASS
+15. 15: Salta SL === → ✅ PASS
+16. 16: Off-topic === → ✅ PASS
+17. 17: Psicologia === → ✅ PASS
+18. 18: Errori di battitura === → ✅ PASS
+19. 19: Risposte vuote === → ✅ PASS
+20. 20: Loop di conferme === → ✅ PASS
