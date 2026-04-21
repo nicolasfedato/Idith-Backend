@@ -2063,10 +2063,6 @@ def _build_summary(params: Dict[str, Any]) -> str:
     if operating_mode in OPERATING_MODE_CANONICAL:
         lines.append(f"Modalità operativa: {operating_mode}")
 
-    strategy_id = params.get("strategy_id")
-    if strategy_id:
-        lines.append(f"Strategy ID: {strategy_id}")
-
     # Non mostriamo più dettagli interni di strategy_params (indicator‑level).
     
     if params.get("market_type") == "futures" and params.get("leverage"):
