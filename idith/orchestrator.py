@@ -1912,25 +1912,7 @@ def prompt_retry(step_name: str, error_count: int, market_type: Optional[str] = 
     return "Riprova inserendo un valore valido."
 
 
-FUTURES_BYBIT_WARNING = (
-    "⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili "
-    "a causa di recenti aggiornamenti normativi.\n"
-    "Se scegli Futures, il bot proverà comunque a operare."
-)
-
-
-def _with_futures_bybit_warning(message: str) -> str:
-    return f"{message}\n\n{FUTURES_BYBIT_WARNING}"
-
-
-def _step_question(
-    step: str,
-    params: Dict[str, Any],
-    error_count: int = 0,
-    is_error: bool = False,
-    greeting_variant: Optional[int] = None,
-    include_futures_warning: bool = False,
-) -> str:
+def _step_question(step: str, params: Dict[str, Any], error_count: int = 0, is_error: bool = False, greeting_variant: Optional[int] = None) -> str:
     """
     Restituisce la domanda per lo step corrente (UNA SOLA domanda).
     
@@ -1940,7 +1922,6 @@ def _step_question(
         error_count: Numero di errori consecutivi (per variare messaggi)
         is_error: Se True, NON usa "Perfetto/Ottimo"
         greeting_variant: Indice della variante da usare per market_type (0, 1, o 2). Se None, usa la prima.
-        include_futures_warning: Se True, aggiunge l'avviso normativo Futures Bybit alla domanda market_type.
     """
     # PATCH: indicator periods - se strategy/strategy_params e manca un periodo, chiedilo
     if step in ("strategy", "strategy_params"):
@@ -1992,21 +1973,17 @@ def _step_question(
     elif step == "market_type":
         # Varianti per la domanda market_type con saluto
         greeting_variants = [
-            "Ciao! Vuoi operare in Spot o in Futures?",
-            "Ciao! Partiamo dalla modalità: Spot o Futures?",
-            "Ciao! Prima scelta: preferisci Spot o Futures?"
+            "Ciao! Vuoi operare in Spot o in Futures? ⚠️ Nota: visti i recenti aggiornamenti normativi, per alcuni account europei i Futures su Bybit potrebbero non essere disponibili. Se scegli Futures, il bot proverà comunque a tradare.",
+            "Ciao! Partiamo dalla modalità: Spot o Futures? ⚠️ Nota importante: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi. Se scegli Futures, il bot proverà comunque a operare.",
+            "Ciao! Prima scelta: preferisci Spot o Futures? ⚠️ Attenzione: a causa delle recenti normative, per alcuni account europe i Futures su Bybit potrebbero non essere disponibili. Se scegli Futures, il bot proverà comunque a tradare."
         ]
-        selected_question = greeting_variants[0]
-
+        
         # Se è specificata una variante, usala
         if greeting_variant is not None and 0 <= greeting_variant < len(greeting_variants):
-            selected_question = greeting_variants[greeting_variant]
-
-        if include_futures_warning:
-            return _with_futures_bybit_warning(selected_question)
-
-        # Altrimenti usa la variante selezionata senza avviso
-        return selected_question
+            return greeting_variants[greeting_variant]
+        
+        # Altrimenti usa la prima variante (comportamento di default)
+        return greeting_variants[0]
     
     elif step == "timeframe":
         if is_error:
@@ -2595,8 +2572,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         }
         state.pop("params", None)
         return {
-            "reply": "Ho resettato la configurazione. Iniziamo da capo.\n\n"
-            + _step_question("market_type", {}, include_futures_warning=True),
+            "reply": "Ho resettato la configurazione. Iniziamo da capo.\n\n" + _step_question("market_type", {}),
             "state": state,
         }
     
@@ -3432,8 +3408,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             }
             state.pop("params", None)
             return {
-                "reply": "Ho resettato la configurazione. Iniziamo da capo.\n\n"
-                + _step_question("market_type", {}, include_futures_warning=True),
+                "reply": "Ho resettato la configurazione. Iniziamo da capo.\n\n" + _step_question("market_type", {}),
                 "state": state,
             }
         
@@ -3493,12 +3468,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             cs["last_greeting_variant"] = next_variant
             
             # Genera la risposta con la variante scelta
-            reply = _step_question(
-                "market_type",
-                params,
-                greeting_variant=next_variant,
-                include_futures_warning=(last_variant is None),
-            )
+            reply = _step_question("market_type", params, greeting_variant=next_variant)
             
             params = _sync_strategy_from_periods(params)
             state, cs, params = _sync_state(state, cs, params)
