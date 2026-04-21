@@ -412,6 +412,27 @@ def choose_model(user_text: str, state: dict | None, history: list[dict] | None)
     return "gpt-4o-mini"
 
 
+def is_bot_configuration_flow_active(state: dict | None) -> bool:
+    """
+    Router per decidere se il messaggio deve passare obbligatoriamente dall'orchestrator.
+    Regola: durante configurazione guidata bot (new/in_progress o step attivo) => orchestrator.
+    """
+    if not isinstance(state, dict):
+        return False
+
+    config_status = (state.get("config_status") or "").strip().lower()
+    if config_status in {"new", "in_progress"}:
+        return True
+
+    config_state = state.get("config_state")
+    if isinstance(config_state, dict):
+        step = (config_state.get("step") or "").strip().lower()
+        if step and step not in {"complete", "completed", "done", "ready"}:
+            return True
+
+    return False
+
+
 def build_state_context(chat_state: dict | None) -> str:
     """
     Converte lo stato chat (caricato da Supabase) in un contesto autorevole per il modello.
@@ -5370,12 +5391,22 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
             # Carica stato conversazione (scaletta)
             state = load_chat_state(chat_id)
 
+            # ------------------------------------------------
+            # ROUTING: flow configurazione bot vs domanda libera
+            # ------------------------------------------------
+            flow_router_active = is_bot_configuration_flow_active(state)
+            logger.info(
+                "[CHAT_ROUTER] flow_router_active=%s config_status=%s",
+                flow_router_active,
+                (state or {}).get("config_status"),
+            )
+
             # -------------------------
-            # 1) TRY ORCHESTRATOR FIRST
+            # 1) ORCHESTRATOR (flow only)
             # -------------------------
-            if not orchestrator:
-                logger.warning("[ORCH] orchestrator is None - skip orchestrator path, config_state will NOT be saved")
-            if orchestrator:
+            if flow_router_active and not orchestrator:
+                logger.warning("[ORCH] flow attivo ma orchestrator is None - impossibile proseguire flow")
+            if flow_router_active and orchestrator:
                 orch_payload = {
                     "message": user_message_content,
                     "session_id": chat_id,
@@ -5402,37 +5433,8 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     # Salva stato ogni volta che l'orchestrator restituisce uno state (PATCH su chats)
                     # FIX: orch_res.get("state") è falsy per {} - usare "is not None" per non saltare save
                     if orch_res and isinstance(orch_res, dict) and orch_state is not None and isinstance(orch_state, dict):
-                        orch_state_to_save = dict(orch_state)
-                        _cs_save = orch_state_to_save.get("config_state")
-                        _step_save = _cs_save.get("step") if isinstance(_cs_save, dict) else None
-                        if isinstance(_cs_save, dict) and _step_save is not None:
-                            _css_save = orch_state_to_save.get("config_status")
-                            if _css_save is None:
-                                prev_cs = (state or {}).get("config_status") if isinstance(state, dict) else None
-                                derived_cs = (
-                                    prev_cs
-                                    if prev_cs in ("in_progress", "complete", "ready")
-                                    else "in_progress"
-                                )
-                                orch_state_to_save["config_status"] = derived_cs
-                                logger.info(
-                                    "[CHAT_DIAG] config_status updated to %s (was absent on orchestrator state, step=%s)",
-                                    derived_cs,
-                                    _step_save,
-                                )
-                            elif _css_save == "new":
-                                orch_state_to_save["config_status"] = "in_progress"
-                                logger.info(
-                                    "[CHAT_DIAG] config_status updated to in_progress (was new during guided step=%s)",
-                                    _step_save,
-                                )
-                        logger.info("[CHAT_DIAG] persisting config_state from orchestrator")
                         logger.info("[CONFIG_SAVE] saving state for chat_id=%s", chat_id)
-                        save_result = save_chat_state(chat_id, user_id, orch_state_to_save)
-                        if not save_result.get("ok", False):
-                            reason = save_result.get("reason", "unknown")
-                            logger.error(f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}")
-                            raise HTTPException(status_code=500, detail=f"Save chat state failed: {reason}")
+                        save_result = save_chat_state(chat_id, user_id, orch_state)
                     else:
                         _skip_reason = (
                             "orch_res invalid" if not (orch_res and isinstance(orch_res, dict))
@@ -5440,6 +5442,10 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             else "orch_state not dict"
                         )
                         logger.info("[CONFIG_SAVE] SKIP save for chat_id=%s: %s", chat_id, _skip_reason)
+                        if not save_result.get("ok", False):
+                            reason = save_result.get("reason", "unknown")
+                            logger.error(f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}")
+                            raise HTTPException(status_code=500, detail=f"Save chat state failed: {reason}")
 
                     if orch_res and isinstance(orch_res, dict) and orch_res.get("reply"):
                         assistant_reply_raw = orch_res["reply"].strip()
@@ -5485,57 +5491,12 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             )
                             state_for_model = orch_state
 
-                        # Flow guidato: nessun wrap OpenAI — mostra il testo dell'orchestrator così com'è
-                        guided_flow_active = False
-                        if isinstance(orch_state, dict):
-                            _cfg_g = orch_state.get("config_state")
-                            _st_g = orch_state.get("config_status")
-                            if (
-                                isinstance(_cfg_g, dict)
-                                and _cfg_g.get("step") is not None
-                                and _st_g not in ("complete", "ready")
-                            ):
-                                guided_flow_active = True
-
-                        # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
-                        if not OPENAI_API_KEY or guided_flow_active:
-                            if guided_flow_active:
-                                logger.info("[CHAT_DIAG] using raw orchestrator flow")
-                            assistant_reply = assistant_reply_raw
-                            source = "orchestrator"
-                            mode = "orchestrator_only" if not OPENAI_API_KEY else "orchestrator_guided_raw"
-                            model_used = "orchestrator"
-                        else:
-                            # Wrap con OpenAI per renderla davvero "IA"
-                            client = OpenAI(api_key=OPENAI_API_KEY)
-                            chosen_model = choose_model(user_message_content, state_for_model, history)
-                            logger.info(f"[CHAT] OpenAI wrap: chosen_model={chosen_model}")
-
-                            # Aggiungi prompt conversazionale se necessario
-                            conversational_prompt = build_conversational_prompt(user_message_content, history, state_for_model)
-                            system_messages = [
-                                {"role": "system", "content": SYSTEM_BASE_IDITH},
-                                {"role": "system", "content": build_state_context(state_for_model)},
-                                {"role": "system", "content": build_orchestrator_wrap_prompt(assistant_reply_raw)},
-                            ]
-                            if conversational_prompt:
-                                system_messages.append({"role": "system", "content": conversational_prompt})
-
-                            response = client.chat.completions.create(
-                                model=chosen_model,
-                                messages=[
-                                    *system_messages,
-                                    *history,
-                                    {"role": "user", "content": user_message_content},
-                                ],
-                                temperature=0.7,
-                                max_tokens=350
-                            )
-
-                            assistant_reply = (response.choices[0].message.content or "").strip() or assistant_reply_raw
-                            source = "orchestrator+openai"
-                            mode = "orchestrator_wrapped"
-                            model_used = chosen_model
+                        # Durante flow guidato non fare mai wrap OpenAI:
+                        # manteniamo la domanda secca/semplice dell'orchestrator.
+                        assistant_reply = assistant_reply_raw
+                        source = "orchestrator"
+                        mode = "orchestrator_only"
+                        model_used = "orchestrator"
 
                 except Exception as e:
                     import traceback
@@ -5545,46 +5506,51 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     logger.error(traceback.format_exc())
 
             # -------------------------
-            # 2) FALLBACK: OPENAI DIRECT
+            # 2) NON-FLOW: OPENAI DIRECT
             # -------------------------
             if not assistant_reply:
-                if not OPENAI_API_KEY:
-                    assistant_reply = "OPENAI_API_KEY non configurata"
+                if flow_router_active:
+                    assistant_reply = "Si e verificato un errore nel flow guidato. Riprova."
                     source = "error"
-                    mode = "no_api_key"
+                    mode = "flow_error"
                 else:
-                    client = OpenAI(api_key=OPENAI_API_KEY)
-                    chosen_model = choose_model(user_message_content, state, history)
-                    logger.info(f"[CHAT] OpenAI direct: chosen_model={chosen_model}")
-                    
-                    # Aggiungi prompt conversazionale se necessario
-                    conversational_prompt = build_conversational_prompt(user_message_content, history, state)
-                    system_messages = [
-                        {"role": "system", "content": SYSTEM_BASE_IDITH},
-                        {"role": "system", "content": build_state_context(state)},
-                    ]
-                    if conversational_prompt:
-                        system_messages.append({"role": "system", "content": conversational_prompt})
-                    
-                    response = client.chat.completions.create(
-                        model=chosen_model,
-                        messages=[
-                            *system_messages,
-                            *history,
-                        ],
-                        temperature=0.7,
-                        max_tokens=500
-                    )
-
-                    assistant_reply = (response.choices[0].message.content or "").strip()
-                    if not assistant_reply:
-                        assistant_reply = "Risposta vuota da OpenAI"
+                    if not OPENAI_API_KEY:
+                        assistant_reply = "OpenAI non disponibile al momento."
                         source = "error"
-                        mode = "empty_response"
+                        mode = "no_api_key_non_flow"
                     else:
-                        source = "openai"
-                        mode = "openai_direct"
-                        model_used = chosen_model
+                        client = OpenAI(api_key=OPENAI_API_KEY)
+                        chosen_model = choose_model(user_message_content, state, history)
+                        logger.info(f"[CHAT] OpenAI direct: chosen_model={chosen_model}")
+                        
+                        # Aggiungi prompt conversazionale se necessario
+                        conversational_prompt = build_conversational_prompt(user_message_content, history, state)
+                        system_messages = [
+                            {"role": "system", "content": SYSTEM_BASE_IDITH},
+                            {"role": "system", "content": build_state_context(state)},
+                        ]
+                        if conversational_prompt:
+                            system_messages.append({"role": "system", "content": conversational_prompt})
+                        
+                        response = client.chat.completions.create(
+                            model=chosen_model,
+                            messages=[
+                                *system_messages,
+                                *history,
+                            ],
+                            temperature=0.7,
+                            max_tokens=500
+                        )
+
+                        assistant_reply = (response.choices[0].message.content or "").strip()
+                        if not assistant_reply:
+                            assistant_reply = "Risposta vuota da OpenAI"
+                            source = "error"
+                            mode = "empty_response"
+                        else:
+                            source = "openai"
+                            mode = "openai_direct"
+                            model_used = chosen_model
 
     except Exception as e:
         error_details = str(e)
