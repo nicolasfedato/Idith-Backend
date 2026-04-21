@@ -4928,15 +4928,27 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
             }
         
         # Genera prima domanda (market_type) per il piano FREE v2: ordine market_type -> symbol -> timeframe -> operating_mode -> ...
-        first_question = "Ciao! Vuoi operare in Spot o in Futures?"
+        futures_warning = (
+            "⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili "
+            "a causa di recenti aggiornamenti normativi.\n"
+            "Se scegli Futures, il bot proverà comunque a operare."
+        )
+        first_question = f"Ciao! Vuoi operare in Spot o in Futures?\n\n{futures_warning}"
         if orchestrator:
             try:
                 _step_question = getattr(orchestrator, "_step_question", None)
                 if _step_question and callable(_step_question):
-                    first_question = _step_question("market_type", {}, error_count=0, is_error=False, greeting_variant=0)
+                    first_question = _step_question(
+                        "market_type",
+                        {},
+                        error_count=0,
+                        is_error=False,
+                        greeting_variant=0,
+                        include_futures_warning=True,
+                    )
             except Exception as e:
                 logger.warning(f"[RESET] Fallback su stringa hardcoded per prima domanda: {e}")
-                first_question = "Ciao! Vuoi operare in Spot o in Futures?"
+                first_question = f"Ciao! Vuoi operare in Spot o in Futures?\n\n{futures_warning}"
         
         assistant_reply = f"✅ Bot resettato. Ripartiamo da zero.\n\n{first_question}"
         source = "reset"
