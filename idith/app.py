@@ -44,26 +44,8 @@ from openai import OpenAI
 
 
 # Orchestrator (Idith conversation engine)
-orchestrator_mod = None
-try:
-    from . import orchestrator as orchestrator_mod
-    logging.getLogger(__name__).info("[ORCH] imported successfully (relative)")
-except Exception as e1:
-    try:
-        import idith.orchestrator as orchestrator_mod
-        logging.getLogger(__name__).info("[ORCH] imported successfully (idith.orchestrator)")
-    except Exception as e2:
-        try:
-            from idith import orchestrator as orchestrator_mod
-            logging.getLogger(__name__).info("[ORCH] imported successfully (idith.orchestrator)")
-        except Exception as e3:
-            orchestrator_mod = None
-            logging.getLogger(__name__).error(
-                "[ORCH] import failed. e1=%s e2=%s e3=%s",
-                e1, e2, e3,
-            )
-
-orchestrator = orchestrator_mod
+from idith import orchestrator
+print("[ORCH] orchestrator imported successfully")
 
 # Supabase queue module (dopo load_env, non fa raise a import-time).
 # In deploy (es. uvicorn app:app dalla cartella idith/) il package relativo fallisce:
