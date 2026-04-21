@@ -128,10 +128,10 @@ APP_ENV = os.getenv("ENV", "").strip().lower()
 RUNNER_TOKEN_TTL_HOURS = float(os.getenv("RUNNER_TOKEN_TTL_HOURS", "24.0"))
 
 if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL missing from environment")
+    raise RuntimeError("SUPABASE_URL missing in .env")
 
 if not SUPABASE_SERVICE_KEY:
-    raise RuntimeError("SUPABASE_SERVICE_KEY or SUPABASE_SERVICE_ROLE_KEY missing from environment")
+    raise RuntimeError("SUPABASE_SERVICE_KEY or SUPABASE_SERVICE_ROLE_KEY missing in .env")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -412,27 +412,6 @@ def choose_model(user_text: str, state: dict | None, history: list[dict] | None)
     return "gpt-4o-mini"
 
 
-def is_bot_configuration_flow_active(state: dict | None) -> bool:
-    """
-    Router per decidere se il messaggio deve passare obbligatoriamente dall'orchestrator.
-    Regola: durante configurazione guidata bot (new/in_progress o step attivo) => orchestrator.
-    """
-    if not isinstance(state, dict):
-        return False
-
-    config_status = (state.get("config_status") or "").strip().lower()
-    if config_status in {"new", "in_progress"}:
-        return True
-
-    config_state = state.get("config_state")
-    if isinstance(config_state, dict):
-        step = (config_state.get("step") or "").strip().lower()
-        if step and step not in {"complete", "completed", "done", "ready"}:
-            return True
-
-    return False
-
-
 def build_state_context(chat_state: dict | None) -> str:
     """
     Converte lo stato chat (caricato da Supabase) in un contesto autorevole per il modello.
@@ -622,7 +601,7 @@ def build_conversational_prompt(user_text: str, history: list[dict], state: dict
     if is_info_request and not is_config_value and current_step:
         # Mappa step a domande di riaggancio
         step_questions = {
-            "market_type": "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare.",
+            "market_type": "Vuoi operare in Spot o in Futures?",
             "symbol": "Perfetto. Che coppia USDT vuoi utilizzare? (es. BTCUSDT)",
             # Nel piano FREE lo step strategia è la modalità operativa
             "operating_mode": "Che modalità preferisci: aggressiva, equilibrata o selettiva?",
@@ -1489,11 +1468,7 @@ def runner_status(
     chat_id_q = (chat_id or "").strip()
     if chat_id_q:
         if not _runner_status_user_owns_chat(str(user_id), chat_id_q):
-            return {
-                "runner_connected": False,
-                "bot_active": False,
-                "events": [],
-            }
+            raise HTTPException(status_code=403, detail="Chat non disponibile")
 
     session_chat_id = _runner_chat_id_from_command_id(start_command_id) if start_command_id else None
 
@@ -4953,7 +4928,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
             }
         
         # Genera prima domanda (market_type) per il piano FREE v2: ordine market_type -> symbol -> timeframe -> operating_mode -> ...
-        first_question = "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare."
+        first_question = "Ciao! Vuoi operare in Spot o in Futures?"
         if orchestrator:
             try:
                 _step_question = getattr(orchestrator, "_step_question", None)
@@ -4961,7 +4936,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     first_question = _step_question("market_type", {}, error_count=0, is_error=False, greeting_variant=0)
             except Exception as e:
                 logger.warning(f"[RESET] Fallback su stringa hardcoded per prima domanda: {e}")
-                first_question = "Ciao! Vuoi operare in Spot o in Futures?\n\n⚠️ Nota: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi.\nSe scegli Futures, il bot proverà comunque a operare."
+                first_question = "Ciao! Vuoi operare in Spot o in Futures?"
         
         assistant_reply = f"✅ Bot resettato. Ripartiamo da zero.\n\n{first_question}"
         source = "reset"
@@ -5391,22 +5366,12 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
             # Carica stato conversazione (scaletta)
             state = load_chat_state(chat_id)
 
-            # ------------------------------------------------
-            # ROUTING: flow configurazione bot vs domanda libera
-            # ------------------------------------------------
-            flow_router_active = is_bot_configuration_flow_active(state)
-            logger.info(
-                "[CHAT_ROUTER] flow_router_active=%s config_status=%s",
-                flow_router_active,
-                (state or {}).get("config_status"),
-            )
-
             # -------------------------
-            # 1) ORCHESTRATOR (flow only)
+            # 1) TRY ORCHESTRATOR FIRST
             # -------------------------
-            if flow_router_active and not orchestrator:
-                logger.warning("[ORCH] flow attivo ma orchestrator is None - impossibile proseguire flow")
-            if flow_router_active and orchestrator:
+            if not orchestrator:
+                logger.warning("[ORCH] orchestrator is None - skip orchestrator path, config_state will NOT be saved")
+            if orchestrator:
                 orch_payload = {
                     "message": user_message_content,
                     "session_id": chat_id,
@@ -5491,12 +5456,43 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             )
                             state_for_model = orch_state
 
-                        # Durante flow guidato non fare mai wrap OpenAI:
-                        # manteniamo la domanda secca/semplice dell'orchestrator.
-                        assistant_reply = assistant_reply_raw
-                        source = "orchestrator"
-                        mode = "orchestrator_only"
-                        model_used = "orchestrator"
+                        # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
+                        if not OPENAI_API_KEY:
+                            assistant_reply = assistant_reply_raw
+                            source = "orchestrator"
+                            mode = "orchestrator_only"
+                            model_used = "orchestrator"
+                        else:
+                            # Wrap con OpenAI per renderla davvero "IA"
+                            client = OpenAI(api_key=OPENAI_API_KEY)
+                            chosen_model = choose_model(user_message_content, state_for_model, history)
+                            logger.info(f"[CHAT] OpenAI wrap: chosen_model={chosen_model}")
+
+                            # Aggiungi prompt conversazionale se necessario
+                            conversational_prompt = build_conversational_prompt(user_message_content, history, state_for_model)
+                            system_messages = [
+                                {"role": "system", "content": SYSTEM_BASE_IDITH},
+                                {"role": "system", "content": build_state_context(state_for_model)},
+                                {"role": "system", "content": build_orchestrator_wrap_prompt(assistant_reply_raw)},
+                            ]
+                            if conversational_prompt:
+                                system_messages.append({"role": "system", "content": conversational_prompt})
+
+                            response = client.chat.completions.create(
+                                model=chosen_model,
+                                messages=[
+                                    *system_messages,
+                                    *history,
+                                    {"role": "user", "content": user_message_content},
+                                ],
+                                temperature=0.7,
+                                max_tokens=350
+                            )
+
+                            assistant_reply = (response.choices[0].message.content or "").strip() or assistant_reply_raw
+                            source = "orchestrator+openai"
+                            mode = "orchestrator_wrapped"
+                            model_used = chosen_model
 
                 except Exception as e:
                     import traceback
@@ -5504,58 +5500,48 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     logger.error(f"[CHAT] Errore orchestrator: {e}")
                     logger.exception("Errore orchestrator con stacktrace completo")
                     logger.error(traceback.format_exc())
-                    print("ERRORE ORCHESTRATOR:", str(e))
-                    traceback.print_exc()
-                    assistant_reply = f"Errore interno: {str(e)}"
-                    source = "error"
-                    mode = "flow_error_internal"
 
             # -------------------------
-            # 2) NON-FLOW: OPENAI DIRECT
+            # 2) FALLBACK: OPENAI DIRECT
             # -------------------------
             if not assistant_reply:
-                if flow_router_active:
-                    assistant_reply = "Si e verificato un errore nel flow guidato. Riprova."
+                if not OPENAI_API_KEY:
+                    assistant_reply = "OPENAI_API_KEY non configurata"
                     source = "error"
-                    mode = "flow_error"
+                    mode = "no_api_key"
                 else:
-                    if not OPENAI_API_KEY:
-                        assistant_reply = "OpenAI non disponibile al momento."
-                        source = "error"
-                        mode = "no_api_key_non_flow"
-                    else:
-                        client = OpenAI(api_key=OPENAI_API_KEY)
-                        chosen_model = choose_model(user_message_content, state, history)
-                        logger.info(f"[CHAT] OpenAI direct: chosen_model={chosen_model}")
-                        
-                        # Aggiungi prompt conversazionale se necessario
-                        conversational_prompt = build_conversational_prompt(user_message_content, history, state)
-                        system_messages = [
-                            {"role": "system", "content": SYSTEM_BASE_IDITH},
-                            {"role": "system", "content": build_state_context(state)},
-                        ]
-                        if conversational_prompt:
-                            system_messages.append({"role": "system", "content": conversational_prompt})
-                        
-                        response = client.chat.completions.create(
-                            model=chosen_model,
-                            messages=[
-                                *system_messages,
-                                *history,
-                            ],
-                            temperature=0.7,
-                            max_tokens=500
-                        )
+                    client = OpenAI(api_key=OPENAI_API_KEY)
+                    chosen_model = choose_model(user_message_content, state, history)
+                    logger.info(f"[CHAT] OpenAI direct: chosen_model={chosen_model}")
+                    
+                    # Aggiungi prompt conversazionale se necessario
+                    conversational_prompt = build_conversational_prompt(user_message_content, history, state)
+                    system_messages = [
+                        {"role": "system", "content": SYSTEM_BASE_IDITH},
+                        {"role": "system", "content": build_state_context(state)},
+                    ]
+                    if conversational_prompt:
+                        system_messages.append({"role": "system", "content": conversational_prompt})
+                    
+                    response = client.chat.completions.create(
+                        model=chosen_model,
+                        messages=[
+                            *system_messages,
+                            *history,
+                        ],
+                        temperature=0.7,
+                        max_tokens=500
+                    )
 
-                        assistant_reply = (response.choices[0].message.content or "").strip()
-                        if not assistant_reply:
-                            assistant_reply = "Risposta vuota da OpenAI"
-                            source = "error"
-                            mode = "empty_response"
-                        else:
-                            source = "openai"
-                            mode = "openai_direct"
-                            model_used = chosen_model
+                    assistant_reply = (response.choices[0].message.content or "").strip()
+                    if not assistant_reply:
+                        assistant_reply = "Risposta vuota da OpenAI"
+                        source = "error"
+                        mode = "empty_response"
+                    else:
+                        source = "openai"
+                        mode = "openai_direct"
+                        model_used = chosen_model
 
     except Exception as e:
         error_details = str(e)
