@@ -1,0 +1,30 @@
+{
+  "user_id": "user_test",
+  "chat_id": "chat_test",
+  "messages": [
+    {
+      "role": "user",
+      "content": "ciao"
+    },
+    {
+      "role": "assistant",
+      "content": "Ho capito: ciao. Dimmi come posso aiutarti."
+    },
+    {
+      "role": "user",
+      "content": "ciao"
+    },
+    {
+      "role": "assistant",
+      "content": "Ho capito: ciao. Dimmi come posso aiutarti."
+    },
+    {
+      "role": "user",
+      "content": "secondo messaggio"
+    },
+    {
+      "role": "assistant",
+      "content": "Ho capito: secondo messaggio. Dimmi come posso aiutarti."
+    }
+  ]
+}
