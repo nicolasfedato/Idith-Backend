@@ -5504,6 +5504,11 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     logger.error(f"[CHAT] Errore orchestrator: {e}")
                     logger.exception("Errore orchestrator con stacktrace completo")
                     logger.error(traceback.format_exc())
+                    print("ERRORE ORCHESTRATOR:", str(e))
+                    traceback.print_exc()
+                    assistant_reply = f"Errore interno: {str(e)}"
+                    source = "error"
+                    mode = "flow_error_internal"
 
             # -------------------------
             # 2) NON-FLOW: OPENAI DIRECT
