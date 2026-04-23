@@ -94,7 +94,7 @@ OPERATING_MODE_FALLBACK_PRESETS = {
 }
 
 
-def _parse_operating_mode(user_text: str) -> Optional[str]:
+def _parse_operating_mode(user_text: str, allow_implicit_numeric: bool = False) -> Optional[str]:
     """
     Riconosce la modalità operativa dall'input utente.
 
@@ -102,7 +102,7 @@ def _parse_operating_mode(user_text: str) -> Optional[str]:
     - "aggressiva", "aggressivo", "aggressive"
     - "equilibrata", "equilibrato", "balanced"
     - "selettiva", "selettivo", "selective"
-    - opzionale: "1/2/3" e "prima/seconda/terza"
+    - opzionale (solo se allow_implicit_numeric=True): "1/2/3" e "prima/seconda/terza"
 
     Ritorna il valore canonico: "aggressiva" | "equilibrata" | "selettiva"
     oppure None se non riconosciuto.
@@ -111,24 +111,27 @@ def _parse_operating_mode(user_text: str) -> Optional[str]:
     if not t:
         return None
 
-    # Mapping numerico opzionale: 1 → aggressiva, 2 → equilibrata, 3 → selettiva
-    m = re.search(r"\b([1-3])\b", t)
-    if m:
-        num = m.group(1)
-        if num == "1":
-            return "aggressiva"
-        if num == "2":
-            return "equilibrata"
-        if num == "3":
-            return "selettiva"
+    if allow_implicit_numeric:
+        # Mapping numerico opzionale: 1 → aggressiva, 2 → equilibrata, 3 → selettiva.
+        # Abilitato solo nel flusso dedicato allo step operating_mode, per evitare falsi positivi
+        # durante update parziali (es. "rischio 2%" che contiene "2").
+        m = re.search(r"\b([1-3])\b", t)
+        if m:
+            num = m.group(1)
+            if num == "1":
+                return "aggressiva"
+            if num == "2":
+                return "equilibrata"
+            if num == "3":
+                return "selettiva"
 
-    # Ordinali: "prima/seconda/terza"
-    if re.search(r"\b(la\s+)?prima(\s+modalita)?\b", t):
-        return "aggressiva"
-    if re.search(r"\b(la\s+)?seconda(\s+modalita)?\b", t):
-        return "equilibrata"
-    if re.search(r"\b(la\s+)?terza(\s+modalita)?\b", t):
-        return "selettiva"
+        # Ordinali: "prima/seconda/terza"
+        if re.search(r"\b(la\s+)?prima(\s+modalita)?\b", t):
+            return "aggressiva"
+        if re.search(r"\b(la\s+)?seconda(\s+modalita)?\b", t):
+            return "equilibrata"
+        if re.search(r"\b(la\s+)?terza(\s+modalita)?\b", t):
+            return "selettiva"
 
     # Aggressiva
     if re.search(r"\baggressiv\w*\b", t) or "aggressive" in t:
@@ -1197,7 +1200,7 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
                 return {"indicator": missing_indicator, "period": None}  # None = usa default
     
     if step == "operating_mode":
-        mode = _parse_operating_mode(user_text)
+        mode = _parse_operating_mode(user_text, allow_implicit_numeric=True)
         extracted_value = mode
         logger.info(
             f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}"
@@ -2909,6 +2912,16 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                         params["leverage"] = None
                         cs["pending_leverage_confirmation"] = None
                     # Spot → Futures: step già ricalcolato da apply_config_patch (BUG 2+3)
+                elif param_name == "sl":
+                    # Se lo SL è stato aggiornato con un nuovo valore valido, il pending precedente non è più valido.
+                    cs["pending_sl_confirmation"] = None
+                    cs["suggested_sl"] = None
+                elif param_name == "risk_pct":
+                    # Stesso principio: nuovo rischio valido => nessun pending precedente attivo.
+                    cs["pending_risk_confirmation"] = None
+                elif param_name == "leverage":
+                    # Stesso principio: nuova leva valida => nessun pending precedente attivo.
+                    cs["pending_leverage_confirmation"] = None
             
             # Log delle modifiche applicate (già fatto da apply_config_patch, ma aggiungiamo un riepilogo)
             if patch_result["changed"]:
@@ -3152,8 +3165,47 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
     if params.get("market_type") == "spot":
         cs["pending_leverage_confirmation"] = None
     elif cs.get("pending_leverage_confirmation") is not None:
-        confirmation = _extract_confirmation(user_text)
         pending_lev = cs.get("pending_leverage_confirmation")
+        # Se arriva una NUOVA leva valida durante pending, sostituisce completamente la precedente.
+        new_lev_value = _extract_step_value(user_text, "leverage", params)
+        if new_lev_value is not None:
+            is_valid, error_msg, _ = _validate_step_value("leverage", new_lev_value, params)
+            if not is_valid:
+                state, cs, params = _sync_state(state, cs, params)
+                reply = (error_msg or "Leva non valida.") + "\n\n" + _step_question(current_step, params)
+                if empathetic_response:
+                    reply = empathetic_response + " " + reply
+                return {"reply": reply, "state": state}
+            lev_int = int(float(new_lev_value))
+            sym = params.get("symbol") or "questa coppia"
+            requires_confirm, warning_msg = _check_leverage_warning(lev_int, sym)
+            params["leverage"] = lev_int
+            cs["pending_leverage_confirmation"] = lev_int if requires_confirm else None
+            if requires_confirm and warning_msg:
+                state, cs, params = _sync_state(state, cs, params)
+                reply = warning_msg
+                if empathetic_response and empathetic_response.lower() not in warning_msg.lower():
+                    reply = empathetic_response + " " + reply
+                return {"reply": reply, "state": state}
+            next_step = _get_next_step(current_step, params, cs)
+            if next_step is None:
+                state["config_status"] = "complete"
+                _cleanup_config_state_when_complete(cs)
+                params = _sync_strategy_from_periods(params)
+                state, cs, params = _sync_state(state, cs, params)
+                return {
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params) + "\n\nVuoi avviare il bot adesso?",
+                    "state": state,
+                }
+            cs["step"] = next_step
+            params = _sync_strategy_from_periods(params)
+            state, cs, params = _sync_state(state, cs, params)
+            reply = _step_question(next_step, params)
+            if empathetic_response:
+                reply = empathetic_response + " " + reply
+            return {"reply": reply, "state": state}
+
+        confirmation = _extract_confirmation(user_text)
 
         if confirmation is True:
             params["leverage"] = pending_lev
@@ -3193,8 +3245,52 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 return {"reply": reply, "state": state}
 
     if cs.get("pending_risk_confirmation") is not None:
-        confirmation = _extract_confirmation(user_text)
         pending_risk = cs.get("pending_risk_confirmation")
+        # Se arriva un NUOVO rischio valido durante pending, sostituisce il valore precedente ovunque.
+        new_risk_value = _extract_step_value(user_text, "risk_pct", params)
+        if new_risk_value is not None:
+            is_valid, error_msg, _ = _validate_step_value("risk_pct", new_risk_value, params)
+            if not is_valid:
+                state, cs, params = _sync_state(state, cs, params)
+                reply = (error_msg or "Valore rischio non valido.") + "\n\n" + _step_question(current_step, params)
+                if empathetic_response:
+                    reply = empathetic_response + " " + reply
+                return {"reply": reply, "state": state}
+            risk_float = float(str(new_risk_value).replace("%", ""))
+            market_type = params.get("market_type", "futures")
+            requires_confirm, warning_msg = _check_risk_warning(risk_float, market_type)
+            params["risk_pct"] = risk_float
+            cs["pending_risk_confirmation"] = risk_float if requires_confirm else None
+            if requires_confirm and warning_msg:
+                state, cs, params = _sync_state(state, cs, params)
+                reply = warning_msg
+                if empathetic_response and not empathetic_response.lower() in warning_msg.lower():
+                    reply = empathetic_response + " " + reply
+                return {"reply": reply, "state": state}
+            _ec = cs.get("error_count")
+            if isinstance(_ec, dict):
+                _ec2 = dict(_ec)
+                _ec2.pop("risk_pct", None)
+                cs["error_count"] = _ec2
+            next_step = _get_next_step(current_step, params, cs)
+            if next_step is None:
+                state["config_status"] = "complete"
+                _cleanup_config_state_when_complete(cs)
+                params = _sync_strategy_from_periods(params)
+                state, cs, params = _sync_state(state, cs, params)
+                return {
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params) + "\n\nVuoi avviare il bot adesso?",
+                    "state": state,
+                }
+            cs["step"] = next_step
+            params = _sync_strategy_from_periods(params)
+            state, cs, params = _sync_state(state, cs, params)
+            reply = _step_question(next_step, params)
+            if empathetic_response:
+                reply = empathetic_response + " " + reply
+            return {"reply": reply, "state": state}
+
+        confirmation = _extract_confirmation(user_text)
 
         if confirmation is True:
             try:
@@ -3253,7 +3349,25 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             sl_val = float(str(new_sl_value).replace("%", ""))
             is_valid, error_msg, _ = _validate_step_value("sl", new_sl_value, params)
             if is_valid:
-                params["sl"] = f"{sl_val}%"
+                # Scrivi SEMPRE il nuovo valore nello stato reale (cs["params"]) prima della risposta.
+                patch_result = apply_config_patch(cs, {"sl": sl_val})
+                if not patch_result.get("ok", True):
+                    state, cs, params = _sync_state(state, cs, params)
+                    reply = patch_result.get("message", "Stop loss non valido.") + "\n\n" + _step_question(current_step, params)
+                    if empathetic_response:
+                        reply = empathetic_response + " " + reply
+                    return {"reply": reply, "state": state}
+                params = cs["params"].copy()
+                # Rivaluta il nuovo valore: se richiede ancora conferma, sostituisci il pending col nuovo numero.
+                requires_confirm, warning_msg, new_suggested = _check_sl_warning(sl_val)
+                if requires_confirm:
+                    cs["pending_sl_confirmation"] = sl_val
+                    cs["suggested_sl"] = new_suggested
+                    state, cs, params = _sync_state(state, cs, params)
+                    reply = warning_msg or "Confermi questo stop loss?"
+                    if empathetic_response and empathetic_response.lower() not in (reply or "").lower():
+                        reply = empathetic_response + " " + reply
+                    return {"reply": reply, "state": state}
                 cs["pending_sl_confirmation"] = None
                 cs["suggested_sl"] = None
                 next_step = _get_next_step(current_step, params, cs)
