@@ -94,7 +94,7 @@ OPERATING_MODE_FALLBACK_PRESETS = {
 }
 
 
-def _parse_operating_mode(user_text: str, allow_implicit_numeric: bool = False) -> Optional[str]:
+def _parse_operating_mode(user_text: str) -> Optional[str]:
     """
     Riconosce la modalità operativa dall'input utente.
 
@@ -102,7 +102,7 @@ def _parse_operating_mode(user_text: str, allow_implicit_numeric: bool = False) 
     - "aggressiva", "aggressivo", "aggressive"
     - "equilibrata", "equilibrato", "balanced"
     - "selettiva", "selettivo", "selective"
-    - opzionale (solo se allow_implicit_numeric=True): "1/2/3" e "prima/seconda/terza"
+    - opzionale: "1/2/3" e "prima/seconda/terza"
 
     Ritorna il valore canonico: "aggressiva" | "equilibrata" | "selettiva"
     oppure None se non riconosciuto.
@@ -111,27 +111,24 @@ def _parse_operating_mode(user_text: str, allow_implicit_numeric: bool = False) 
     if not t:
         return None
 
-    if allow_implicit_numeric:
-        # Mapping numerico opzionale: 1 → aggressiva, 2 → equilibrata, 3 → selettiva.
-        # Abilitato solo nel flusso dedicato allo step operating_mode, per evitare falsi positivi
-        # durante update parziali (es. "rischio 2%" che contiene "2").
-        m = re.search(r"\b([1-3])\b", t)
-        if m:
-            num = m.group(1)
-            if num == "1":
-                return "aggressiva"
-            if num == "2":
-                return "equilibrata"
-            if num == "3":
-                return "selettiva"
-
-        # Ordinali: "prima/seconda/terza"
-        if re.search(r"\b(la\s+)?prima(\s+modalita)?\b", t):
+    # Mapping numerico opzionale: 1 → aggressiva, 2 → equilibrata, 3 → selettiva
+    m = re.search(r"\b([1-3])\b", t)
+    if m:
+        num = m.group(1)
+        if num == "1":
             return "aggressiva"
-        if re.search(r"\b(la\s+)?seconda(\s+modalita)?\b", t):
+        if num == "2":
             return "equilibrata"
-        if re.search(r"\b(la\s+)?terza(\s+modalita)?\b", t):
+        if num == "3":
             return "selettiva"
+
+    # Ordinali: "prima/seconda/terza"
+    if re.search(r"\b(la\s+)?prima(\s+modalita)?\b", t):
+        return "aggressiva"
+    if re.search(r"\b(la\s+)?seconda(\s+modalita)?\b", t):
+        return "equilibrata"
+    if re.search(r"\b(la\s+)?terza(\s+modalita)?\b", t):
+        return "selettiva"
 
     # Aggressiva
     if re.search(r"\baggressiv\w*\b", t) or "aggressive" in t:
@@ -1200,7 +1197,7 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
                 return {"indicator": missing_indicator, "period": None}  # None = usa default
     
     if step == "operating_mode":
-        mode = _parse_operating_mode(user_text, allow_implicit_numeric=True)
+        mode = _parse_operating_mode(user_text)
         extracted_value = mode
         logger.info(
             f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}"
@@ -2912,16 +2909,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                         params["leverage"] = None
                         cs["pending_leverage_confirmation"] = None
                     # Spot → Futures: step già ricalcolato da apply_config_patch (BUG 2+3)
-                elif param_name == "sl":
-                    # Se lo SL è stato aggiornato con un nuovo valore valido, il pending precedente non è più valido.
-                    cs["pending_sl_confirmation"] = None
-                    cs["suggested_sl"] = None
-                elif param_name == "risk_pct":
-                    # Stesso principio: nuovo rischio valido => nessun pending precedente attivo.
-                    cs["pending_risk_confirmation"] = None
-                elif param_name == "leverage":
-                    # Stesso principio: nuova leva valida => nessun pending precedente attivo.
-                    cs["pending_leverage_confirmation"] = None
             
             # Log delle modifiche applicate (già fatto da apply_config_patch, ma aggiungiamo un riepilogo)
             if patch_result["changed"]:
@@ -3349,25 +3336,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             sl_val = float(str(new_sl_value).replace("%", ""))
             is_valid, error_msg, _ = _validate_step_value("sl", new_sl_value, params)
             if is_valid:
-                # Scrivi SEMPRE il nuovo valore nello stato reale (cs["params"]) prima della risposta.
-                patch_result = apply_config_patch(cs, {"sl": sl_val})
-                if not patch_result.get("ok", True):
-                    state, cs, params = _sync_state(state, cs, params)
-                    reply = patch_result.get("message", "Stop loss non valido.") + "\n\n" + _step_question(current_step, params)
-                    if empathetic_response:
-                        reply = empathetic_response + " " + reply
-                    return {"reply": reply, "state": state}
-                params = cs["params"].copy()
-                # Rivaluta il nuovo valore: se richiede ancora conferma, sostituisci il pending col nuovo numero.
-                requires_confirm, warning_msg, new_suggested = _check_sl_warning(sl_val)
-                if requires_confirm:
-                    cs["pending_sl_confirmation"] = sl_val
-                    cs["suggested_sl"] = new_suggested
-                    state, cs, params = _sync_state(state, cs, params)
-                    reply = warning_msg or "Confermi questo stop loss?"
-                    if empathetic_response and empathetic_response.lower() not in (reply or "").lower():
-                        reply = empathetic_response + " " + reply
-                    return {"reply": reply, "state": state}
+                params["sl"] = f"{sl_val}%"
                 cs["pending_sl_confirmation"] = None
                 cs["suggested_sl"] = None
                 next_step = _get_next_step(current_step, params, cs)
