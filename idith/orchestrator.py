@@ -1362,7 +1362,7 @@ def _check_risk_warning(risk_pct: float, market_type: str) -> tuple[bool, Option
     REGOLA BUG3: >=HIGH_RISK_PCT_WARNING_THRESHOLD% → warning + conferma obbligatoria; <soglia → accettato normalmente
     """
     if risk_pct >= HIGH_RISK_PCT_WARNING_THRESHOLD:
-        return (True, f"Attenzione: rischiare il {risk_pct}% per trade è molto aggressivo. Confermi di volerlo impostare?")
+        return (True, f"⚠️ Attenzione: rischiare il {risk_pct}% per trade è molto aggressivo. Confermi di volerlo impostare?")
     return (False, None)
 
 def _check_leverage_warning(leverage_int: int, symbol: str) -> tuple[bool, Optional[str]]:
@@ -1373,7 +1373,7 @@ def _check_leverage_warning(leverage_int: int, symbol: str) -> tuple[bool, Optio
     """
     if leverage_int >= HIGH_LEVERAGE_WARNING_THRESHOLD:
         sym = symbol or "questa coppia"
-        return (True, f"Attenzione: una leva di {leverage_int}x aumenta molto il rischio. Confermi di volerla impostare?")
+        return (True, f"⚠️ Attenzione: una leva di {leverage_int}x aumenta molto il rischio. Confermi di volerla impostare?")
     return (False, None)
 
 def _check_sl_warning(sl_pct: float) -> tuple[bool, Optional[str], Optional[float]]:
@@ -1388,10 +1388,10 @@ def _check_sl_warning(sl_pct: float) -> tuple[bool, Optional[str], Optional[floa
     if sl_pct > 10:
         # Stop loss molto alto (>10%): richiede conferma + proposta alternativa
         suggested_sl = 2.0
-        return (True, f"Attenzione: stai impostando uno stop loss del {sl_pct}%, che è molto alto e rischioso. Ti suggerisco un valore più prudente del {suggested_sl}%. Vuoi usare {suggested_sl}% o preferisci confermare {sl_pct}%?", suggested_sl)
+        return (True, f"⚠️ Attenzione: stai impostando uno stop loss del {sl_pct}%, che è molto alto e rischioso. Ti suggerisco un valore più prudente del {suggested_sl}%. Vuoi usare {suggested_sl}% o preferisci confermare {sl_pct}%?", suggested_sl)
     elif sl_pct > 5:
         # Stop loss alto ma tecnicamente accettabile (5-10%): avviso + conferma
-        return (True, f"Attenzione: stai impostando uno stop loss del {sl_pct}%, che è alto. Assicurati di comprendere i rischi. Vuoi confermare {sl_pct}% o preferisci un valore più prudente?", None)
+        return (True, f"⚠️ Attenzione: stai impostando uno stop loss del {sl_pct}%, che è alto. Assicurati di comprendere i rischi. Vuoi confermare {sl_pct}% o preferisci un valore più prudente?", None)
     return (False, None, None)
 
 def _extract_confirmation(user_text: str) -> Optional[bool]:
@@ -1648,7 +1648,7 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
         warning_msg = None
         if leverage_int >= 51:
             warning_msg = (
-                f"Attenzione: stai usando una leva alta ({leverage_int}x) per {sym_display}. "
+                f"⚠️ Attenzione: stai usando una leva alta ({leverage_int}x) per {sym_display}. "
                 "Le leve elevate aumentano significativamente il rischio. "
                 "Assicurati di comprendere i rischi prima di procedere."
             )
@@ -2737,6 +2737,42 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
     # Funziona sia durante la configurazione che quando è completa
     if _is_explicit_modification_request(user_text):
         updates = _extract_modification_requests(user_text, params, current_step)
+        if cs.get("pending_sl_confirmation") is not None and isinstance(updates, dict):
+            # Caso reale: con pending SL attivo, frasi tipo "metti 3%" devono valere come nuovo SL
+            # anche se il parser di modifica esplicita non rileva "sl" o inferisce altro (es. operating_mode).
+            lt_updates = user_text.strip().lower()
+            has_sl_update = "sl" in updates
+            if not has_sl_update and re.search(r"\d+(?:\.\d+)?\s*%", user_text):
+                has_other_param_context = any(
+                    token in lt_updates
+                    for token in ["take profit", "tp", "rischio", "risk", "leva", "leverage"]
+                )
+                if not has_other_param_context:
+                    m_pct = re.search(r"(\d+(?:\.\d+)?)\s*%", user_text)
+                    if m_pct:
+                        try:
+                            updates.pop("operating_mode", None)
+                            updates["sl"] = float(m_pct.group(1))
+                        except Exception:
+                            pass
+        if cs.get("pending_risk_confirmation") is not None and isinstance(updates, dict):
+            # Pending rischio attivo: frasi tipo "metti 1%" devono aggiornare il rischio,
+            # evitando che "1" venga interpretato come operating_mode.
+            lt_updates = user_text.strip().lower()
+            has_risk_update = "risk_pct" in updates
+            if not has_risk_update and re.search(r"\d+(?:\.\d+)?\s*%", user_text):
+                has_other_param_context = any(
+                    token in lt_updates
+                    for token in ["stop loss", "stoploss", "sl", "take profit", "tp", "leva", "leverage"]
+                )
+                if not has_other_param_context:
+                    m_pct = re.search(r"(\d+(?:\.\d+)?)\s*%", user_text)
+                    if m_pct:
+                        try:
+                            updates.pop("operating_mode", None)
+                            updates["risk_pct"] = float(m_pct.group(1))
+                        except Exception:
+                            pass
         
         if updates:
             # Raccogli errori, conferme e update validi
@@ -2899,8 +2935,18 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     # Log quando symbol viene salvato correttamente (solo nel percorso valido)
                     market_type = params.get("market_type", "futures")
                     logger.info(f"[SYMBOL_OK] saved symbol=%s market_type=%s", new_value, market_type)
+                elif param_name == "leverage":
+                    # Nuova leva definitiva applicata (non richiedeva conferma): pulisci pending residuo.
+                    cs["pending_leverage_confirmation"] = None
                 elif param_name == "operating_mode":
                     logger.info("[LOCAL_UPDATE] operating_mode -> %s", new_value)
+                elif param_name == "sl":
+                    # Nuovo SL definitivo applicato via modifica esplicita: pulisci pending residuo.
+                    cs["pending_sl_confirmation"] = None
+                    cs["suggested_sl"] = None
+                elif param_name == "risk_pct":
+                    # Nuovo rischio definitivo applicato via modifica esplicita: pulisci pending residuo.
+                    cs["pending_risk_confirmation"] = None
                 
                 # REGOLA CRITICA: Gestione cambio market_type (apply_config_patch già pulisce params)
                 elif param_name == "market_type":
@@ -3166,8 +3212,12 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             lev_int = int(float(new_lev_value))
             sym = params.get("symbol") or "questa coppia"
             requires_confirm, warning_msg = _check_leverage_warning(lev_int, sym)
-            params["leverage"] = lev_int
-            cs["pending_leverage_confirmation"] = lev_int if requires_confirm else None
+            if requires_confirm:
+                # Pending reale: non promuovere la nuova leva in params prima della conferma esplicita.
+                cs["pending_leverage_confirmation"] = lev_int
+            else:
+                params["leverage"] = lev_int
+                cs["pending_leverage_confirmation"] = None
             if requires_confirm and warning_msg:
                 state, cs, params = _sync_state(state, cs, params)
                 reply = warning_msg
@@ -3232,6 +3282,11 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 return {"reply": reply, "state": state}
 
     if cs.get("pending_risk_confirmation") is not None:
+        logger.info(
+            "[PENDING_RISK_DEBUG] enter branch: params[risk_pct]_before=%s pending_before=%s",
+            params.get("risk_pct"),
+            cs.get("pending_risk_confirmation"),
+        )
         pending_risk = cs.get("pending_risk_confirmation")
         # Se arriva un NUOVO rischio valido durante pending, sostituisce il valore precedente ovunque.
         new_risk_value = _extract_step_value(user_text, "risk_pct", params)
@@ -3246,13 +3301,34 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             risk_float = float(str(new_risk_value).replace("%", ""))
             market_type = params.get("market_type", "futures")
             requires_confirm, warning_msg = _check_risk_warning(risk_float, market_type)
+            logger.info(
+                "[PENDING_RISK_DEBUG] parsed new risk: risk_float=%s requires_confirm=%s",
+                risk_float,
+                requires_confirm,
+            )
             params["risk_pct"] = risk_float
             cs["pending_risk_confirmation"] = risk_float if requires_confirm else None
+            logger.info(
+                "[PENDING_RISK_DEBUG] pending after set=%s",
+                cs.get("pending_risk_confirmation"),
+            )
             if requires_confirm and warning_msg:
+                logger.info(
+                    "[PENDING_RISK_DEBUG] before _sync_state (confirm path): params[risk_pct]=%s",
+                    params.get("risk_pct"),
+                )
                 state, cs, params = _sync_state(state, cs, params)
+                logger.info(
+                    "[PENDING_RISK_DEBUG] after _sync_state (confirm path): params[risk_pct]=%s",
+                    params.get("risk_pct"),
+                )
                 reply = warning_msg
                 if empathetic_response and not empathetic_response.lower() in warning_msg.lower():
                     reply = empathetic_response + " " + reply
+                logger.info(
+                    "[PENDING_RISK_DEBUG] pre-return state risk (confirm path)=%s",
+                    ((state.get("config_state") or {}).get("params") or {}).get("risk_pct"),
+                )
                 return {"reply": reply, "state": state}
             _ec = cs.get("error_count")
             if isinstance(_ec, dict):
@@ -3264,17 +3340,41 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 state["config_status"] = "complete"
                 _cleanup_config_state_when_complete(cs)
                 params = _sync_strategy_from_periods(params)
+                logger.info(
+                    "[PENDING_RISK_DEBUG] before _sync_state (complete path): params[risk_pct]=%s",
+                    params.get("risk_pct"),
+                )
                 state, cs, params = _sync_state(state, cs, params)
+                logger.info(
+                    "[PENDING_RISK_DEBUG] after _sync_state (complete path): params[risk_pct]=%s",
+                    params.get("risk_pct"),
+                )
+                logger.info(
+                    "[PENDING_RISK_DEBUG] pre-return state risk (complete path)=%s",
+                    ((state.get("config_state") or {}).get("params") or {}).get("risk_pct"),
+                )
                 return {
                     "reply": "Configurazione completata ✅\n\n" + _build_summary(params) + "\n\nVuoi avviare il bot adesso?",
                     "state": state,
                 }
             cs["step"] = next_step
             params = _sync_strategy_from_periods(params)
+            logger.info(
+                "[PENDING_RISK_DEBUG] before _sync_state (next-step path): params[risk_pct]=%s",
+                params.get("risk_pct"),
+            )
             state, cs, params = _sync_state(state, cs, params)
+            logger.info(
+                "[PENDING_RISK_DEBUG] after _sync_state (next-step path): params[risk_pct]=%s",
+                params.get("risk_pct"),
+            )
             reply = _step_question(next_step, params)
             if empathetic_response:
                 reply = empathetic_response + " " + reply
+            logger.info(
+                "[PENDING_RISK_DEBUG] pre-return state risk (next-step path)=%s",
+                ((state.get("config_state") or {}).get("params") or {}).get("risk_pct"),
+            )
             return {"reply": reply, "state": state}
 
         confirmation = _extract_confirmation(user_text)
@@ -3332,10 +3432,34 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         suggested_sl = cs.get("suggested_sl")
 
         new_sl_value = _extract_step_value(user_text, "sl", params)
+        if new_sl_value is None:
+            # Pending SL attivo: accetta anche frasi tipo "metti 3%" senza keyword "sl"
+            lt_pending = user_text.strip().lower()
+            if re.search(r"\d+(?:\.\d+)?\s*%", user_text):
+                has_other_param_context = any(
+                    token in lt_pending
+                    for token in ["take profit", "tp", "rischio", "risk", "leva", "leverage"]
+                )
+                if not has_other_param_context:
+                    m_pct = re.search(r"(\d+(?:\.\d+)?)\s*%", user_text)
+                    if m_pct:
+                        new_sl_value = f"{m_pct.group(1)}%"
         if new_sl_value is not None:
             sl_val = float(str(new_sl_value).replace("%", ""))
             is_valid, error_msg, _ = _validate_step_value("sl", new_sl_value, params)
             if is_valid:
+                requires_confirm, confirmation_msg, suggested_value = _check_sl_warning(sl_val)
+                if requires_confirm:
+                    # Caso B: nuovo valore ancora ad alto rischio -> NON scrivere in params["sl"]
+                    cs["pending_sl_confirmation"] = sl_val
+                    cs["suggested_sl"] = suggested_value
+                    state, cs, params = _sync_state(state, cs, params)
+                    reply = confirmation_msg or "Confermi questo stop loss?"
+                    if empathetic_response and not empathetic_response.lower() in reply.lower():
+                        reply = empathetic_response + " " + reply
+                    return {"reply": reply, "state": state}
+
+                # Caso A: nuovo valore definitivo (non richiede conferma) -> commit reale + pulizia pending
                 params["sl"] = f"{sl_val}%"
                 cs["pending_sl_confirmation"] = None
                 cs["suggested_sl"] = None
