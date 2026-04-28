@@ -843,13 +843,28 @@ def normalize_timeframe(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         value = str(value)
     
-    value = value.strip().lower().replace(" ", "")
+    raw_value = value.strip().lower()
+
+    verbal_match = re.fullmatch(
+        r"(\d+|un)\s*(minuto|minuti|min|minute|minutes|ora|ore|hour|hours|h)",
+        raw_value,
+    )
+    if verbal_match:
+        num, unit = verbal_match.groups()
+        if num == "un":
+            num = "1"
+        if unit in {"minuto", "minuti", "min", "minute", "minutes"}:
+            return f"{num}m"
+        if unit in {"ora", "ore", "hour", "hours", "h"}:
+            return f"{num}h"
+
+    value = raw_value.replace(" ", "")
     
     # Normalizza "min" -> "m"
     if value.endswith("min"):
         value = value[:-3] + "m"
     
-    # Normalizza "hour" o "h" -> "h"
+    # Normalizza "hour" -> "h"
     if value.endswith("hour"):
         value = value[:-4] + "h"
     
@@ -1013,15 +1028,18 @@ def apply_config_patch(config_state: Dict[str, Any], patch_dict: Dict[str, Any])
             # Ottieni timeframe validi
             valid_tfs = validators.get_valid_timeframes(None, current_market_type)
             
+            # Normalizza timeframe prima della validazione Bybit/config
+            tf_for_validation = normalize_timeframe(new_value) or str(new_value)
+
             # Valida timeframe
-            is_valid, error_msg = validators.validate_timeframe(str(new_value), valid_tfs)
+            is_valid, error_msg = validators.validate_timeframe(tf_for_validation, valid_tfs)
             if not is_valid:
                 logger.warning(f"[CONFIG_PATCH] {error_msg}")
                 logger.info(f"[PATCH] keys={list(patch_dict.keys())} ok=False step={config_state.get('step')}")
                 return {"ok": False, "message": error_msg, "changed": changed, "warnings": warnings}
             
             # Timeframe valido, normalizza formato
-            normalized_value = normalize_timeframe(new_value)
+            normalized_value = normalize_timeframe(tf_for_validation)
             if normalized_value is None:
                 error_msg = f"Valore non valido per {param_name}: {new_value} (ignorato)"
                 warnings.append(error_msg)
@@ -1231,8 +1249,6 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
         return None
     
     elif step == "timeframe":
-        # REGOLA RIGIDA: Solo estrazione esatta, nessuna normalizzazione verbale
-        # Accettiamo solo valori esatti: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w
         m = TF_RE.search(text)
         if m:
             tf = m.group(1).lower().replace(" ", "")
@@ -1244,7 +1260,11 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
             extracted_value = tf
             logger.info(f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}")
             return tf
-        # NON proviamo pattern verbali (es. "7minuti", "2ore") - sono INVALIDI
+        tf_normalized = normalize_timeframe(text)
+        if tf_normalized is not None:
+            extracted_value = tf_normalized
+            logger.info(f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}")
+            return tf_normalized
         extracted_value = None
         logger.info(f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}")
         return None
@@ -1409,15 +1429,16 @@ def _extract_confirmation(user_text: str) -> Optional[bool]:
     return None
 
 
-def _commit_pending_risk_or_leverage_on_confirm(user_text: str, cs: Dict[str, Any], params: Dict[str, Any]) -> None:
+def _flush_all_high_risk_pending_to_params(cs: Dict[str, Any], params: Dict[str, Any]) -> None:
     """
-    BUG3: applica su params i valori in pending_* quando l'utente conferma (stesse regole del blocco dedicato).
-    Ordine: leva prima, poi rischio. Idempotente se non c'è conferma o nessun pending.
+    Scrive in params tutti i valori ancora in pending_leverage_confirmation / pending_risk_confirmation /
+    pending_sl_confirmation e azzera i tre pending. Chiamare solo dopo aver verificato la conferma utente.
     """
-    if _extract_confirmation(user_text) is not True:
-        return
     if cs.get("pending_leverage_confirmation") is not None:
-        params["leverage"] = cs.get("pending_leverage_confirmation")
+        try:
+            params["leverage"] = int(float(cs.get("pending_leverage_confirmation")))
+        except (TypeError, ValueError):
+            params["leverage"] = cs.get("pending_leverage_confirmation")
         cs["pending_leverage_confirmation"] = None
     if cs.get("pending_risk_confirmation") is not None:
         pending_risk = cs.get("pending_risk_confirmation")
@@ -1431,6 +1452,25 @@ def _commit_pending_risk_or_leverage_on_confirm(user_text: str, cs: Dict[str, An
             _ec2 = dict(_ec)
             _ec2.pop("risk_pct", None)
             cs["error_count"] = _ec2
+    if cs.get("pending_sl_confirmation") is not None:
+        pending_sl = cs.get("pending_sl_confirmation")
+        try:
+            ps = float(pending_sl)
+            params["sl"] = f"{ps}%"
+        except (TypeError, ValueError):
+            pass
+        cs["pending_sl_confirmation"] = None
+        cs["suggested_sl"] = None
+
+
+def _commit_pending_risk_or_leverage_on_confirm(user_text: str, cs: Dict[str, Any], params: Dict[str, Any]) -> None:
+    """
+    BUG3: applica su params i valori in pending_* quando l'utente conferma (stesse regole del blocco dedicato).
+    Ordine: leva prima, poi rischio. Idempotente se non c'è conferma o nessun pending.
+    """
+    if _extract_confirmation(user_text) is not True:
+        return
+    _flush_all_high_risk_pending_to_params(cs, params)
 
 
 def _detect_empathetic_phrase(user_text: str) -> Optional[str]:
@@ -1559,7 +1599,7 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
         market_type = params.get("market_type", "futures")  # Default a futures se non specificato
         valid_tfs = validators.get_valid_timeframes(None, market_type)
 
-        v = str(value).strip().lower()
+        v = normalize_timeframe(value) or str(value).strip().lower()
         is_valid, error_msg = validators.validate_timeframe(v, valid_tfs)
         if is_valid:
             return (True, None, None)
@@ -1973,9 +2013,9 @@ def _step_question(step: str, params: Dict[str, Any], error_count: int = 0, is_e
     elif step == "market_type":
         # Varianti per la domanda market_type con saluto
         greeting_variants = [
-            "Ciao! Vuoi operare in Spot o in Futures? ⚠️ Nota: visti i recenti aggiornamenti normativi, per alcuni account europei i Futures su Bybit potrebbero non essere disponibili. Se scegli Futures, il bot proverà comunque a tradare.",
-            "Ciao! Partiamo dalla modalità: Spot o Futures? ⚠️ Nota importante: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi. Se scegli Futures, il bot proverà comunque a operare.",
-            "Ciao! Prima scelta: preferisci Spot o Futures? ⚠️ Attenzione: a causa delle recenti normative, per alcuni account europe i Futures su Bybit potrebbero non essere disponibili. Se scegli Futures, il bot proverà comunque a tradare."
+            "Iniziamo! Vuoi operare in Spot o in Futures? ⚠️ Nota: visti i recenti aggiornamenti normativi, per alcuni account europei i Futures su Bybit potrebbero non essere disponibili. Se scegli Futures, il bot proverà comunque a tradare.",
+            "Partiamo dalla modalità: Spot o Futures? ⚠️ Nota importante: per alcuni account europei i Futures su Bybit potrebbero non essere disponibili a causa di recenti aggiornamenti normativi. Se scegli Futures, il bot proverà comunque a operare.",
+            "Prima scelta: preferisci Spot o Futures? ⚠️ Attenzione: a causa delle recenti normative, per alcuni account europe i Futures su Bybit potrebbero non essere disponibili. Se scegli Futures, il bot proverà comunque a tradare."
         ]
         
         # Se è specificata una variante, usala
@@ -2876,98 +2916,93 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 # Valore VALIDO e non richiede conferma: aggiungi agli update da applicare
                 applied_updates[param_name] = (old_values[param_name], new_value)
             
-            # Se ci sono errori e nessun update valido, ritorna il primo errore
-            # Se ci sono sia errori che applied_updates, continua e applica i validi (reply includerà anche gli errori)
-            if errors and not applied_updates:
+            # Errore bloccante solo se non c'è nulla da applicare né in immediato né in pending
+            if errors and not applied_updates and not requires_confirmation_list:
                 first_error_param = list(errors.keys())[0]
                 state, cs, params = _sync_state(state, cs, params)
                 return {
                     "reply": errors[first_error_param],
                     "state": state
                 }
-            
-            # Se ci sono richieste di conferma, gestisci la prima
-            if requires_confirmation_list:
-                first_confirmation_param = list(requires_confirmation_list.keys())[0]
-                confirmation_msg, suggested_value, new_value = requires_confirmation_list[first_confirmation_param]
-                
-                if first_confirmation_param == "risk_pct":
-                    cs["pending_risk_confirmation"] = new_value
-                elif first_confirmation_param == "leverage":
-                    cs["pending_leverage_confirmation"] = int(float(new_value)) if new_value is not None else None
-                elif first_confirmation_param == "sl":
-                    cs["pending_sl_confirmation"] = float(str(new_value).replace("%", ""))
-                    cs["suggested_sl"] = suggested_value
-                
-                state, cs, params = _sync_state(state, cs, params)
-                
-                return {
-                    "reply": confirmation_msg,
-                    "state": state
-                }
-            
-            # Applica tutti gli update validi usando apply_config_patch
-            # Prepara il patch_dict con i valori già validati
-            patch_dict = {}
-            for param_name, (old_value, new_value) in applied_updates.items():
-                patch_dict[param_name] = new_value
-            
-            # Log del patch_dict finale per debugging
+
+            # 1) Applica subito tutti gli update che non richiedono conferma (stesso messaggio).
+            patch_dict = {param_name: new_value for param_name, (_, new_value) in applied_updates.items()}
+            patch_result: Dict[str, Any] = {"ok": True, "changed": {}, "warnings": []}
+
             if patch_dict:
                 logger.info("[STRATEGY_UPDATE] patch_dict=%s (before apply_config_patch)", patch_dict)
-            
-            # Applica la patch
-            patch_result = apply_config_patch(cs, patch_dict)
-            if not patch_result.get("ok", True):
-                state, cs, params = _sync_state(state, cs, cs["params"])
-                return {
-                    "reply": patch_result.get("message", "Modifica non applicabile."),
-                    "state": state
-                }
-            
-            # IMPORTANTE: apply_config_patch modifica cs["params"] direttamente e chiama _sync_strategy_from_periods
-            # Sincronizza params da cs["params"] per avere i valori aggiornati
-            params = cs["params"].copy()
-            
-            # Gestisci logica speciale post-patch
-            for param_name, (old_value, new_value) in applied_updates.items():
-                if param_name == "symbol":
-                    # Log quando symbol viene salvato correttamente (solo nel percorso valido)
-                    market_type = params.get("market_type", "futures")
-                    logger.info(f"[SYMBOL_OK] saved symbol=%s market_type=%s", new_value, market_type)
-                elif param_name == "leverage":
-                    # Nuova leva definitiva applicata (non richiedeva conferma): pulisci pending residuo.
-                    cs["pending_leverage_confirmation"] = None
-                elif param_name == "operating_mode":
-                    logger.info("[LOCAL_UPDATE] operating_mode -> %s", new_value)
-                elif param_name == "sl":
-                    # Nuovo SL definitivo applicato via modifica esplicita: pulisci pending residuo.
-                    cs["pending_sl_confirmation"] = None
-                    cs["suggested_sl"] = None
-                elif param_name == "risk_pct":
-                    # Nuovo rischio definitivo applicato via modifica esplicita: pulisci pending residuo.
-                    cs["pending_risk_confirmation"] = None
-                
-                # REGOLA CRITICA: Gestione cambio market_type (apply_config_patch già pulisce params)
-                elif param_name == "market_type":
-                    if new_value == "spot":
-                        # Futures → Spot: leverage già rimosso da apply_config_patch, azzera pending
-                        params["leverage"] = None
+                patch_result = apply_config_patch(cs, patch_dict)
+                if not patch_result.get("ok", True):
+                    state, cs, params = _sync_state(state, cs, cs["params"])
+                    return {
+                        "reply": patch_result.get("message", "Modifica non applicabile."),
+                        "state": state
+                    }
+
+                params = cs["params"].copy()
+
+                for param_name, (old_value, new_value) in applied_updates.items():
+                    if param_name == "symbol":
+                        market_type = params.get("market_type", "futures")
+                        logger.info(f"[SYMBOL_OK] saved symbol=%s market_type=%s", new_value, market_type)
+                    elif param_name == "leverage":
                         cs["pending_leverage_confirmation"] = None
-                    # Spot → Futures: step già ricalcolato da apply_config_patch (BUG 2+3)
-            
-            # Log delle modifiche applicate (già fatto da apply_config_patch, ma aggiungiamo un riepilogo)
-            if patch_result["changed"]:
-                logger.info(f"[MOD_UPDATES] Applied changes: {patch_result['changed']}")
-            if patch_result["warnings"]:
-                logger.warning(f"[MOD_UPDATES] Warnings: {patch_result['warnings']}")
-            
-            # Log delle modifiche applicate
-            logger.info(f"[MOD_UPDATES] updates={updates} final_params={params}")
-            
-            # Salva i parametri aggiornati (normalizza dopo le modifiche manuali)
-            params = _sync_strategy_from_periods(params)
-            state, cs, params = _sync_state(state, cs, params)
+                    elif param_name == "operating_mode":
+                        logger.info("[LOCAL_UPDATE] operating_mode -> %s", new_value)
+                    elif param_name == "sl":
+                        cs["pending_sl_confirmation"] = None
+                        cs["suggested_sl"] = None
+                    elif param_name == "risk_pct":
+                        cs["pending_risk_confirmation"] = None
+                    elif param_name == "market_type":
+                        if new_value == "spot":
+                            params["leverage"] = None
+                            cs["pending_leverage_confirmation"] = None
+
+                if patch_result.get("changed"):
+                    logger.info(f"[MOD_UPDATES] Applied changes: {patch_result['changed']}")
+                if patch_result.get("warnings"):
+                    logger.warning(f"[MOD_UPDATES] Warnings: {patch_result['warnings']}")
+                logger.info(f"[MOD_UPDATES] updates={updates} final_params={params}")
+
+                params = _sync_strategy_from_periods(params)
+                state, cs, params = _sync_state(state, cs, params)
+
+            # 2) Registra TUTTI i parametri rischiosi in pending (nessun return nel loop).
+            if requires_confirmation_list:
+                reply_parts: List[str] = []
+                for param_name in list(updates.keys()):
+                    if param_name not in requires_confirmation_list:
+                        continue
+                    confirmation_msg, suggested_value, new_value = requires_confirmation_list[param_name]
+                    if param_name == "risk_pct":
+                        try:
+                            cs["pending_risk_confirmation"] = float(
+                                str(new_value).replace("%", "").replace(",", ".")
+                            )
+                        except (TypeError, ValueError):
+                            cs["pending_risk_confirmation"] = new_value
+                    elif param_name == "leverage":
+                        cs["pending_leverage_confirmation"] = (
+                            int(float(new_value)) if new_value is not None else None
+                        )
+                    elif param_name == "sl":
+                        cs["pending_sl_confirmation"] = float(str(new_value).replace("%", "").replace(",", "."))
+                        cs["suggested_sl"] = suggested_value
+                    if confirmation_msg:
+                        reply_parts.append(confirmation_msg)
+
+                state, cs, params = _sync_state(state, cs, params)
+                reply = (
+                    "\n\n".join(reply_parts)
+                    if reply_parts
+                    else "Conferma i valori proposti prima di procedere."
+                )
+                if errors:
+                    reply += "\n\nNon ho potuto applicare:\n" + "\n".join(
+                        f"• {err}" for err in errors.values()
+                    )
+                return {"reply": reply, "state": state}
             
             # REGOLA CRITICA: Gestione speciale per cambio market_type
             market_type_changed = "market_type" in applied_updates
@@ -3245,8 +3280,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         confirmation = _extract_confirmation(user_text)
 
         if confirmation is True:
-            params["leverage"] = pending_lev
-            cs["pending_leverage_confirmation"] = None
+            _flush_all_high_risk_pending_to_params(cs, params)
             next_step = _get_next_step(current_step, params, cs)
             if next_step is None:
                 state["config_status"] = "complete"
@@ -3380,16 +3414,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         confirmation = _extract_confirmation(user_text)
 
         if confirmation is True:
-            try:
-                params["risk_pct"] = float(pending_risk)
-            except (TypeError, ValueError):
-                params["risk_pct"] = pending_risk
-            cs["pending_risk_confirmation"] = None
-            _ec = cs.get("error_count")
-            if isinstance(_ec, dict):
-                _ec2 = dict(_ec)
-                _ec2.pop("risk_pct", None)
-                cs["error_count"] = _ec2
+            _flush_all_high_risk_pending_to_params(cs, params)
             next_step = _get_next_step(current_step, params, cs)
             if next_step is None:
                 state["config_status"] = "complete"
@@ -3541,9 +3566,12 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         pending_str = str(int(pending_sl)) if pending_sl == int(pending_sl) else str(pending_sl)
         confirm_extreme = any(phrase in lt for phrase in ["confermo", "lascialo così", "mantieni", "tieni", f"confermo {pending_str}", f"{pending_str}%"])
         if confirm_extreme or _extract_confirmation(user_text) is True:
-            params["sl"] = f"{pending_sl}%"
-            cs["pending_sl_confirmation"] = None
-            cs["suggested_sl"] = None
+            if _extract_confirmation(user_text) is True:
+                _flush_all_high_risk_pending_to_params(cs, params)
+            else:
+                params["sl"] = f"{pending_sl}%"
+                cs["pending_sl_confirmation"] = None
+                cs["suggested_sl"] = None
             next_step = _get_next_step(current_step, params, cs)
             if next_step is None:
                 state["config_status"] = "complete"
