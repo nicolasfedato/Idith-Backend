@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 import os
@@ -1833,11 +1833,12 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
                     f"Ricontrolla il simbolo e riprova (esempi validi: {examples_str}).",
                     None
                 )
-            except Exception as e:
+            except Exception:
                 return (
                     False,
-                    f"Errore nel recupero dei simboli da Bybit: {str(e)}",
-                    None
+                    "Non siamo riusciti a verificare la coppia in questo momento. "
+                    "Controlla il formato (es. SOLUSDT) e riprova.",
+                    None,
                 )
         
         return (True, None, None)
