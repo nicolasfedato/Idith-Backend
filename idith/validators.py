@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 validators.py - Validazione rigorosa e centralizzata per Idith
-Usa Bybit come source of truth, nessuna interpretazione o autocorrezione.
+Lista simboli Bybit: endpoint pubblico REST (nessuna API key server).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Optional, Tuple, Dict, Any
 from dotenv import load_dotenv
+
+# REST pubblico mainnet (market data, nessuna autenticazione)
+BYBIT_PUBLIC_REST = "https://api.bybit.com"
 
 # Carica .env
 load_dotenv()
@@ -68,8 +75,55 @@ _symbol_cache: Dict[str, set] = {
     "spot": set(),
     "futures": set(),
 }
+# True dopo il primo tentativo di caricamento per quel mercato
+_symbol_universe_loaded: Dict[str, bool] = {"spot": False, "futures": False}
+# Se la lista Bybit non è disponibile: accetta solo formato USDT (normalize_symbol_strict)
+_symbol_list_fallback_usdt: Dict[str, bool] = {}
 
 _leverage_cache: Dict[str, Optional[Tuple[float, float]]] = {}  # symbol -> (min_leverage, max_leverage)
+
+
+def _symbols_from_instruments_list(instruments: list) -> set:
+    valid_symbols: set = set()
+    for inst in instruments:
+        symbol = (inst.get("symbol") or "").upper()
+        if not symbol or not symbol.endswith("USDT"):
+            continue
+        status = (inst.get("status") or "").upper()
+        if status == "TRADING":
+            valid_symbols.add(symbol)
+    return valid_symbols
+
+
+def _fetch_valid_symbols_public_http(market_type: str) -> set:
+    """
+    Elenco strumenti da Bybit V5 market (pubblico, senza API key).
+    spot -> category=spot; futures -> category=linear (perpetual USDT).
+    """
+    category = "spot" if market_type == "spot" else "linear"
+    acc: set = set()
+    cursor = ""
+    for _ in range(120):
+        q: Dict[str, str] = {"category": category, "limit": "500"}
+        if cursor:
+            q["cursor"] = cursor
+        url = f"{BYBIT_PUBLIC_REST}/v5/market/instruments-info?{urllib.parse.urlencode(q)}"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Idith/1.0"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if payload.get("retCode") != 0:
+            raise RuntimeError(payload.get("retMsg") or "bybit")
+        result = payload.get("result") or {}
+        instruments = result.get("list") or []
+        acc |= _symbols_from_instruments_list(instruments)
+        cursor = (result.get("nextPageCursor") or "").strip()
+        if not cursor:
+            break
+    return acc
 
 
 def fetch_valid_symbols(market_type: str) -> set:
@@ -83,46 +137,29 @@ def fetch_valid_symbols(market_type: str) -> set:
 
 def _fetch_valid_symbols_internal(market_type: str) -> set:
     """
-    Recupera i simboli validi da Bybit per il market_type specificato.
-    Usa cache per evitare troppe chiamate API.
+    Recupera i simboli USDT in trading da Bybit (solo REST pubblico).
+    Se la chiamata fallisce: fallback formato USDT (non blocca il wizard).
     """
     if market_type not in ["spot", "futures"]:
         return set()
-    
-    # Se cache è vuota, popola
-    if not _symbol_cache[market_type]:
-        try:
-            session = _get_bybit_session()
-            
-            if market_type == "spot":
-                # Per spot, usa get_instruments_info con category="spot"
-                response = session.get_instruments_info(category="spot")
-            else:  # futures
-                # Per futures, usa get_instruments_info con category="linear" (USDT perpetual)
-                response = session.get_instruments_info(category="linear")
-            
-            result = response.get("result", {})
-            instruments = result.get("list", [])
-            
-            valid_symbols = set()
-            for inst in instruments:
-                symbol = inst.get("symbol", "").upper()
-                # Filtra solo coppie USDT
-                if symbol.endswith("USDT") and symbol:
-                    # Verifica che lo strumento sia disponibile per il trading
-                    status = inst.get("status", "").upper()
-                    if status == "TRADING":
-                        valid_symbols.add(symbol)
-            
-            _symbol_cache[market_type] = valid_symbols
-            
-        except Exception as e:
-            # Se fallisce, solleva errore esplicito
-            raise RuntimeError(
-                f"Impossibile recuperare i simboli da Bybit {market_type}: {str(e)}. "
-                "Verifica le API key e la connessione."
-            )
-    
+
+    if _symbol_universe_loaded.get(market_type):
+        return _symbol_cache[market_type]
+
+    valid_symbols: set = set()
+    try:
+        valid_symbols = _fetch_valid_symbols_public_http(market_type)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError, RuntimeError):
+        valid_symbols = set()
+
+    if valid_symbols:
+        _symbol_cache[market_type] = valid_symbols
+        _symbol_list_fallback_usdt[market_type] = False
+    else:
+        _symbol_cache[market_type] = set()
+        _symbol_list_fallback_usdt[market_type] = True
+
+    _symbol_universe_loaded[market_type] = True
     return _symbol_cache[market_type]
 
 
@@ -197,12 +234,10 @@ def is_symbol_listed(exchange_client: Optional[Any], market_type: str, symbol: s
     if symbol_normalized is None:
         return False
     
-    # Recupera simboli validi da Bybit
-    try:
-        valid_symbols = _fetch_valid_symbols_internal(market_type)
-        return symbol_normalized in valid_symbols
-    except Exception:
-        return False
+    _fetch_valid_symbols_internal(market_type)
+    if _symbol_list_fallback_usdt.get(market_type):
+        return True
+    return symbol_normalized in _symbol_cache[market_type]
 
 
 def get_valid_timeframes(exchange_client: Optional[Any], market_type: str) -> set[str]:
@@ -319,13 +354,10 @@ def validate_symbol(symbol: str, market_type: str) -> Tuple[bool, Optional[str]]
             f"Tipo di mercato non valido: {market_type}. Deve essere 'spot' o 'futures'."
         )
     
-    # Recupera simboli validi da Bybit
-    try:
-        valid_symbols = _fetch_valid_symbols_internal(market_type)
-    except RuntimeError as e:
-        # Errore nella connessione a Bybit
-        return (False, str(e))
-    
+    valid_symbols = _fetch_valid_symbols_internal(market_type)
+    if _symbol_list_fallback_usdt.get(market_type):
+        return (True, None)
+
     # Verifica ESATTA corrispondenza (nessuna interpretazione)
     if symbol_normalized not in valid_symbols:
         # Costruisci messaggio di errore umano con esempi REALI (3-6 simboli)
@@ -604,11 +636,13 @@ def validate_indicator_period(indicator: str, period: int) -> Tuple[bool, Option
 
 def clear_cache():
     """Pulisce le cache (utile per testing o aggiornamenti)."""
-    global _symbol_cache, _leverage_cache
+    global _symbol_cache, _leverage_cache, _symbol_universe_loaded, _symbol_list_fallback_usdt
     _symbol_cache = {
         "spot": set(),
         "futures": set(),
     }
+    _symbol_universe_loaded = {"spot": False, "futures": False}
+    _symbol_list_fallback_usdt = {}
     _leverage_cache = {}
 
 
