@@ -10,6 +10,7 @@ import time
 import random
 import logging
 import json
+import copy
 import uuid
 import traceback
 import requests
@@ -2443,6 +2444,132 @@ def _deep_merge_config_state(existing: dict, incoming: dict) -> dict:
     return result
 
 
+OPERATING_MODE_STRATEGY_PRESETS = {
+    "aggressiva": ("1", {"rsi_buy": 45, "rsi_sell": 55, "rsi_period": 5}),
+    "equilibrata": ("2", {"rsi_buy": 45, "rsi_sell": 55, "rsi_period": 7, "ema_period": 7}),
+    "selettiva": (
+        "3",
+        {
+            "rsi_buy": 45,
+            "rsi_sell": 55,
+            "rsi_period": 7,
+            "ema_period": 10,
+            "atr_period": 7,
+            "atr_min_threshold": 0.05,
+        },
+    ),
+}
+
+
+def _normalize_config_state_for_save(incoming_cfg: dict, config_status: str) -> dict:
+    """
+    Ricostruisce il config_state finale da un'unica sorgente (incoming orchestrator),
+    senza leggere valori preesistenti in DB.
+    """
+    cfg = copy.deepcopy(incoming_cfg) if isinstance(incoming_cfg, dict) else {}
+    params_in = cfg.get("params") if isinstance(cfg.get("params"), dict) else {}
+
+    params_out = copy.deepcopy(params_in)
+    for req_key in (
+        "market_type",
+        "symbol",
+        "timeframe",
+        "operating_mode",
+        "strategy_id",
+        "strategy_params",
+        "leverage",
+        "risk_pct",
+        "sl",
+        "tp",
+    ):
+        if req_key not in params_out:
+            params_out[req_key] = None
+    params_out["strategy_params"] = copy.deepcopy(params_out.get("strategy_params"))
+
+    market_type = params_out.get("market_type")
+    market_type_norm = str(market_type).strip().lower() if market_type is not None else None
+    if market_type_norm in ("spot", "futures"):
+        params_out["market_type"] = market_type_norm
+    if params_out.get("market_type") == "spot":
+        params_out["leverage"] = None
+
+    mode_raw = params_out.get("operating_mode")
+    mode = str(mode_raw).strip().lower() if mode_raw is not None else None
+    if mode in OPERATING_MODE_STRATEGY_PRESETS:
+        sid, sparams = OPERATING_MODE_STRATEGY_PRESETS[mode]
+        params_out["operating_mode"] = mode
+        params_out["strategy_id"] = sid
+        # Replace completo, mai merge con parametri precedenti
+        params_out["strategy_params"] = copy.deepcopy(sparams)
+
+    cfg["params"] = params_out
+    cfg["pending_sl_confirmation"] = cfg.get("pending_sl_confirmation")
+    cfg["pending_risk_confirmation"] = cfg.get("pending_risk_confirmation")
+    cfg["pending_leverage_confirmation"] = cfg.get("pending_leverage_confirmation")
+    try:
+        _orch = orchestrator_mod
+        if _orch is not None and _orch.is_config_complete(params_out):
+            cfg["step"] = None
+        else:
+            cfg["step"] = None if config_status == "complete" else cfg.get("step")
+    except Exception:
+        cfg["step"] = None if config_status == "complete" else cfg.get("step")
+    return cfg
+
+
+def _reconcile_config_state_step_before_save(state: dict, config_state_to_save: Optional[dict]) -> None:
+    """
+    Allinea config_state.step e state.step al vero stato dei params prima del persist.
+
+    - Se is_config_complete(params): step sempre None (non salvare mai uno step stale es. leverage).
+    - Altrimenti: step = primo campo wizard FREE mancante (first_missing_free_wizard_field), che non riapre
+      leverage se la leva è già valorizzata e non c'è pending_leverage_confirmation.
+
+    Non modifica params.
+    """
+    if not isinstance(config_state_to_save, dict):
+        return
+
+    orch = orchestrator_mod
+    raw_params = config_state_to_save.get("params")
+    params = raw_params if isinstance(raw_params, dict) else {}
+
+    if orch is None:
+        if str(state.get("config_status", "") or "").lower() == "complete":
+            config_state_to_save["step"] = None
+            state["step"] = None
+            state["config_state"] = config_state_to_save
+            logger.info("[SAVE_STEP_RECONCILE] orchestrator unavailable; config_status=complete -> step=None")
+        return
+
+    try:
+        params_complete = bool(orch.is_config_complete(params))
+    except Exception as exc:
+        logger.warning("[SAVE_STEP_RECONCILE] is_config_complete failed: %s", exc)
+        params_complete = False
+
+    if params_complete:
+        config_state_to_save["step"] = None
+        state["step"] = None
+        logger.info("[SAVE_STEP_RECONCILE] is_config_complete=True -> step=None")
+    else:
+        try:
+            mw = orch.free_plan.first_missing_free_wizard_field(
+                params,
+                orch._is_step_filled,
+                config_state_to_save,
+            )
+        except Exception as exc:
+            logger.warning("[SAVE_STEP_RECONCILE] first_missing failed: %s", exc)
+            mw = config_state_to_save.get("step")
+
+        config_state_to_save["step"] = mw
+        state["step"] = mw
+        logger.info("[SAVE_STEP_RECONCILE] is_config_complete=False -> step=%r", mw)
+
+    state["config_state"] = config_state_to_save
+
+
 def save_chat_state(chat_id: str, user_id: str, state: dict):
     """
     Salva lo state dentro la tabella chats.
@@ -2517,42 +2644,53 @@ def save_chat_state(chat_id: str, user_id: str, state: dict):
             )
             return {"ok": False, "reason": "user_mismatch"}
         
-        # Merge config_state: esistente (DB) + incoming (orchestrator); campi non-None in incoming SOVRASCRIVONO sempre.
+        # Salvataggio config_state da sorgente unica (incoming orchestrator), senza merge con DB.
         # Caso speciale RESET:
         #   - se incoming_cfg è None, forza config_state a NULL in DB
-        #   - se incoming_cfg è lo "scheletro" completo (tutti params null, strategy lista vuota),
-        #     sostituisci completamente l'esistente per azzerare davvero la configurazione.
-        existing_cfg = chat_data.get("config_state")
+        #   - se incoming_cfg contiene __force_full_reset, sostituisci col template di reset completo.
         incoming_cfg = state.get("config_state")
+        force_full_reset = (
+            isinstance(incoming_cfg, dict) and incoming_cfg.get("__force_full_reset") is True
+        )
         if incoming_cfg is None:
             merged_config_state = None
-        elif isinstance(incoming_cfg, dict):
-            # Rileva scheletro di reset completo
-            incoming_params = incoming_cfg.get("params") or {}
-            is_reset_skeleton = (
-                incoming_cfg.get("step") == "market_type"
-                and isinstance(incoming_params, dict)
-                and incoming_params.get("strategy") == []
-                and incoming_params.get("market_type") is None
-                and incoming_params.get("symbol") is None
-                and incoming_params.get("timeframe") is None
-                and incoming_params.get("strategy_id") is None
-                and incoming_params.get("operating_mode") is None
-                and incoming_params.get("strategy_params") is None
-                and incoming_params.get("leverage") is None
-                and incoming_params.get("risk_pct") is None
-                and incoming_params.get("sl") is None
-                and incoming_params.get("tp") is None
+        elif force_full_reset:
+            tmpl = getattr(orchestrator_mod, "FORCE_FULL_RESET_CONFIG_STATE_SNAPSHOT", None)
+            if tmpl is None:
+                tmpl = {
+                    "step": "market_type",
+                    "params": {
+                        "sl": None,
+                        "tp": None,
+                        "symbol": None,
+                        "leverage": None,
+                        "risk_pct": None,
+                        "strategy": [],
+                        "timeframe": None,
+                        "market_type": None,
+                        "strategy_id": None,
+                        "operating_mode": None,
+                        "strategy_params": None,
+                    },
+                    "error_count": {},
+                    "suggested_sl": None,
+                    "last_greeting_variant": None,
+                    "pending_sl_confirmation": None,
+                    "pending_risk_confirmation": None,
+                    "pending_leverage_confirmation": None,
+                }
+            merged_config_state = copy.deepcopy(tmpl)
+            incoming_cfg.pop("__force_full_reset", None)
+            logger.info(
+                "[CONFIG_STATE_MERGE] __force_full_reset=True: full replace config_state (skip DB merge)"
             )
-            if is_reset_skeleton:
-                # RESET COMPLETO: ignora lo stato esistente e usa direttamente lo scheletro
-                merged_config_state = incoming_cfg
-            elif isinstance(existing_cfg, dict):
-                merged_config_state = _deep_merge_config_state(existing_cfg, incoming_cfg)
-            else:
-                merged_config_state = incoming_cfg
+        elif isinstance(incoming_cfg, dict):
+            merged_config_state = _normalize_config_state_for_save(
+                incoming_cfg,
+                state.get("config_status", "new"),
+            )
         else:
-            merged_config_state = existing_cfg
+            merged_config_state = None
         
         # Garantire un valore coerente per l'UPDATE
         if merged_config_state is None:
@@ -2566,7 +2704,42 @@ def save_chat_state(chat_id: str, user_id: str, state: dict):
             config_state_to_save = merged_config_state
         else:
             config_state_to_save = {}
-        
+
+        if isinstance(config_state_to_save, dict):
+            config_state_to_save.pop("__force_full_reset", None)
+
+        if isinstance(config_state_to_save, dict):
+            _reconcile_config_state_step_before_save(state, config_state_to_save)
+
+        final_step = None
+        final_pending_sl = None
+        final_pending_risk = None
+        final_pending_leverage = None
+        final_params = {}
+        if isinstance(config_state_to_save, dict):
+            final_step = config_state_to_save.get("step")
+            final_pending_sl = config_state_to_save.get("pending_sl_confirmation")
+            final_pending_risk = config_state_to_save.get("pending_risk_confirmation")
+            final_pending_leverage = config_state_to_save.get("pending_leverage_confirmation")
+            if isinstance(config_state_to_save.get("params"), dict):
+                final_params = config_state_to_save.get("params", {})
+
+        logger.info("[FINAL_SAVE_CONFIG]")
+        logger.info("market_type=%s", final_params.get("market_type"))
+        logger.info("symbol=%s", final_params.get("symbol"))
+        logger.info("timeframe=%s", final_params.get("timeframe"))
+        logger.info("operating_mode=%s", final_params.get("operating_mode"))
+        logger.info("strategy_id=%s", final_params.get("strategy_id"))
+        logger.info("strategy_params=%s", final_params.get("strategy_params"))
+        logger.info("leverage=%s", final_params.get("leverage"))
+        logger.info("risk_pct=%s", final_params.get("risk_pct"))
+        logger.info("sl=%s", final_params.get("sl"))
+        logger.info("tp=%s", final_params.get("tp"))
+        logger.info("step=%s", final_step)
+        logger.info("pending_sl_confirmation=%s", final_pending_sl)
+        logger.info("pending_risk_confirmation=%s", final_pending_risk)
+        logger.info("pending_leverage_confirmation=%s", final_pending_leverage)
+
         # UPDATE solo per id (ownership già verificata); filtro SOLO .eq("id", chat_id)
         update_payload = {
             "config_status": state.get("config_status", "new"),
@@ -2575,7 +2748,12 @@ def save_chat_state(chat_id: str, user_id: str, state: dict):
             "updated_at": now_iso(),
         }
         
-        # Log sintetico del payload che stiamo per salvare (fonte: orchestrator state)
+        # Step nel log = valore riconciliato su config_state finale (mai lo step stale pre-save)
+        payload_step_for_log = (
+            config_state_to_save.get("step")
+            if isinstance(config_state_to_save, dict)
+            else step
+        )
         logger.info(
             "SAVE_PAYLOAD strategy=%s free_strategy_id=%s ema_period=%s rsi_period=%s atr_period=%s step=%s",
             strategy,
@@ -2583,7 +2761,7 @@ def save_chat_state(chat_id: str, user_id: str, state: dict):
             ema_period,
             rsi_period,
             atr_period,
-            step,
+            payload_step_for_log,
         )
         
         try:
@@ -2628,6 +2806,10 @@ def save_chat_state(chat_id: str, user_id: str, state: dict):
         saved_rsi_period = None
         saved_atr_period = None
         
+        saved_operating_mode = None
+        saved_strategy_id = None
+        saved_strategy_params = None
+
         if saved_config_state and isinstance(saved_config_state, dict):
             saved_step = saved_config_state.get("step")
             saved_params = saved_config_state.get("params", {})
@@ -2638,6 +2820,9 @@ def save_chat_state(chat_id: str, user_id: str, state: dict):
                 saved_sl = saved_params.get("sl")
                 saved_tp = saved_params.get("tp")
                 saved_strategy = saved_params.get("strategy")
+                saved_operating_mode = saved_params.get("operating_mode")
+                saved_strategy_id = saved_params.get("strategy_id")
+                saved_strategy_params = saved_params.get("strategy_params")
                 saved_free_strategy_id = saved_params.get("free_strategy_id")
                 saved_ema_period = saved_params.get("ema_period")
                 saved_rsi_period = saved_params.get("rsi_period")
@@ -2659,7 +2844,35 @@ def save_chat_state(chat_id: str, user_id: str, state: dict):
             f"[SAVE_CHAT_STATE] AFTER: chat_id={chat_id}, step={saved_step} (expected={step}), "
             f"timeframe={saved_timeframe} (expected={timeframe}), leverage={saved_leverage} (expected={leverage}), "
             f"risk_pct={saved_risk_pct} (expected={risk_pct}), sl={saved_sl} (expected={sl}), "
-            f"tp={saved_tp} (expected={tp}), strategy={saved_strategy} (expected={strategy})"
+            f"tp={saved_tp} (expected={tp}), strategy={saved_strategy} (expected={strategy}), "
+            f"operating_mode={saved_operating_mode} (expected={params.get('operating_mode') if isinstance(params, dict) else None}), "
+            f"strategy_id={saved_strategy_id} (expected={params.get('strategy_id') if isinstance(params, dict) else None}), "
+            f"strategy_params={saved_strategy_params} (expected={params.get('strategy_params') if isinstance(params, dict) else None})"
+        )
+
+        logger.info("[DB_AFTER_SAVE_CONFIG]")
+        logger.info("market_type=%s", saved_params.get("market_type") if isinstance(saved_params, dict) else None)
+        logger.info("symbol=%s", saved_params.get("symbol") if isinstance(saved_params, dict) else None)
+        logger.info("timeframe=%s", saved_timeframe)
+        logger.info("operating_mode=%s", saved_operating_mode)
+        logger.info("strategy_id=%s", saved_strategy_id)
+        logger.info("strategy_params=%s", saved_strategy_params)
+        logger.info("leverage=%s", saved_leverage)
+        logger.info("risk_pct=%s", saved_risk_pct)
+        logger.info("sl=%s", saved_sl)
+        logger.info("tp=%s", saved_tp)
+        logger.info("step=%s", saved_step)
+        logger.info(
+            "pending_sl_confirmation=%s",
+            saved_config_state.get("pending_sl_confirmation") if isinstance(saved_config_state, dict) else None,
+        )
+        logger.info(
+            "pending_risk_confirmation=%s",
+            saved_config_state.get("pending_risk_confirmation") if isinstance(saved_config_state, dict) else None,
+        )
+        logger.info(
+            "pending_leverage_confirmation=%s",
+            saved_config_state.get("pending_leverage_confirmation") if isinstance(saved_config_state, dict) else None,
         )
         
         return {"ok": True}
@@ -3168,6 +3381,43 @@ def _is_runner_status_question(text: str) -> bool:
         return True
     
     return False
+
+
+def _is_faq_style_bot_start_stop_question(user_text: str) -> bool:
+    """
+    Domande procedurali su avvio/stop del bot (FAQ) non devono essere classificate
+    come comandi runner (/bot start|stop).
+    """
+    if not user_text or not user_text.strip():
+        return False
+    lt = user_text.strip().lower()
+    for accented, unaccented in ACCENT_MAP.items():
+        lt = lt.replace(accented, unaccented)
+
+    is_how_question = (
+        "?" in lt
+        or lt.startswith("come ")
+        or lt.startswith("come faccio")
+        or lt.startswith("come si")
+        or lt.startswith("in che modo")
+        or "cosa devo fare" in lt
+    )
+    if not is_how_question:
+        return False
+
+    topic_markers = (
+        "avvia",
+        "avvio",
+        "far partire",
+        "partire",
+        "start",
+        "ferma",
+        "fermo",
+        "fermare",
+        "stop",
+    )
+    is_bot_start_stop_topic = "bot" in lt and any(x in lt for x in topic_markers)
+    return is_bot_start_stop_topic
 
 
 # Messaggi randomizzati per start/stop bot e stato runner
@@ -5067,6 +5317,17 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                 is_local_cmd = True
                 local_intent_name = intent_result.intent_name
 
+    # Domande FAQ ("come avvio il bot?") non sono comandi runner anche se l'NLR matcha START_BOT/STOP_BOT
+    if (
+        is_runner_cmd
+        and not is_runner_cmd_slash
+        and intent_result
+        and intent_result.intent_name in ("START_BOT", "STOP_BOT")
+        and _is_faq_style_bot_start_stop_question(user_message_content)
+    ):
+        is_runner_cmd = False
+        normalized_command = None
+
     # Messaggi di configurazione trading: non devono finire nel ramo LOCAL (es. "profit" in "take profit")
     if is_local_cmd and not is_runner_cmd_slash:
         _config_local_exclude_keywords = (
@@ -5400,6 +5661,10 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     if orch_res and isinstance(orch_res, dict) and orch_state is not None and isinstance(orch_state, dict):
                         logger.info("[CONFIG_SAVE] saving state for chat_id=%s", chat_id)
                         save_result = save_chat_state(chat_id, user_id, orch_state)
+                        if not save_result.get("ok", False):
+                            reason = save_result.get("reason", "unknown")
+                            logger.error(f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}")
+                            raise HTTPException(status_code=500, detail=f"Save chat state failed: {reason}")
                     else:
                         _skip_reason = (
                             "orch_res invalid" if not (orch_res and isinstance(orch_res, dict))
@@ -5407,10 +5672,6 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             else "orch_state not dict"
                         )
                         logger.info("[CONFIG_SAVE] SKIP save for chat_id=%s: %s", chat_id, _skip_reason)
-                        if not save_result.get("ok", False):
-                            reason = save_result.get("reason", "unknown")
-                            logger.error(f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}")
-                            raise HTTPException(status_code=500, detail=f"Save chat state failed: {reason}")
 
                     if orch_res and isinstance(orch_res, dict) and orch_res.get("reply"):
                         assistant_reply_raw = orch_res["reply"].strip()
@@ -5456,8 +5717,32 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             )
                             state_for_model = orch_state
 
+                        skip_llm = bool(orch_res.get("skip_llm"))
+
+                        force_skip_wrap = False
+                        forced_step = None
+                        try:
+                            forced_step = orch_res.get("state", {}).get("config_state", {}).get("step")
+                            force_skip_wrap = forced_step is not None
+                        except Exception:
+                            force_skip_wrap = False
+
+                        # FAQ deterministiche: mai wrap OpenAI (anche se step=None dopo riconciliazione).
+                        if skip_llm:
+                            assistant_reply = assistant_reply_raw
+                            source = "orchestrator"
+                            mode = "orchestrator_only"
+                            model_used = "orchestrator"
+                            logger.info("[WRAP_SKIP] skip_llm=True (FAQ)")
+                        # Se orchestrator ha config_state.step, usa SEMPRE reply raw (no wrap OpenAI).
+                        elif force_skip_wrap:
+                            assistant_reply = assistant_reply_raw
+                            source = "orchestrator"
+                            mode = "orchestrator_only"
+                            model_used = "orchestrator"
+                            logger.info("[WRAP_SKIP_FORCE] step=%s", forced_step)
                         # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
-                        if not OPENAI_API_KEY:
+                        elif not OPENAI_API_KEY:
                             assistant_reply = assistant_reply_raw
                             source = "orchestrator"
                             mode = "orchestrator_only"

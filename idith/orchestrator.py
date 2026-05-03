@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import copy
 import os
@@ -55,9 +55,80 @@ DEFAULT_PARAMS = {
     "strategy_params": None,
 }
 
+# Snapshot DB dopo "reset configurazione" (__force_full_reset in save_chat_state).
+# Ordine chiavi params allineato al contratto reset globale.
+FORCE_FULL_RESET_CONFIG_STATE_SNAPSHOT: Dict[str, Any] = {
+    "step": "market_type",
+    "params": {
+        "sl": None,
+        "tp": None,
+        "symbol": None,
+        "leverage": None,
+        "risk_pct": None,
+        "strategy": [],
+        "timeframe": None,
+        "market_type": None,
+        "strategy_id": None,
+        "operating_mode": None,
+        "strategy_params": None,
+    },
+    "error_count": {},
+    "suggested_sl": None,
+    "last_greeting_variant": None,
+    "pending_sl_confirmation": None,
+    "pending_risk_confirmation": None,
+    "pending_leverage_confirmation": None,
+}
+
 # Soglie per warning + conferma obbligatoria (BUG3)
 HIGH_LEVERAGE_WARNING_THRESHOLD = 4
 HIGH_RISK_PCT_WARNING_THRESHOLD = 4
+
+
+def _extract_leverage_int_from_text(user_text: str) -> Optional[int]:
+    """
+    Estrae la leva come intero da testo libero.
+    Formati tipici: '2x', '2', '2 X', 'x10', 'leva 5', 'leverage 3'.
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return None
+    lt = text.lower()
+    candidate_num_str: Optional[str] = None
+    num_pattern = r"\d+(?:\.\d+)?"
+    m = re.search(rf"(?:leva|leverag|lev)\s*[:=]?\s*(?:x\s*({num_pattern})|({num_pattern})\s*x?)", lt)
+    if m:
+        candidate_num_str = m.group(1) or m.group(2)
+    if not candidate_num_str:
+        m = re.search(rf"x\s*({num_pattern})", lt)
+        if m:
+            candidate_num_str = m.group(1)
+    if not candidate_num_str:
+        m = re.search(rf"({num_pattern})\s*x\b", lt)
+        if m:
+            candidate_num_str = m.group(1)
+    if not candidate_num_str:
+        all_nums = re.findall(num_pattern, lt)
+        if all_nums:
+            candidate_num_str = all_nums[-1]
+    if not candidate_num_str:
+        return None
+    try:
+        return int(float(candidate_num_str))
+    except Exception:
+        return None
+
+
+def _parse_user_leverage_int(raw: Any) -> Optional[int]:
+    """Normalizza la leva da valore già isolato (int / float / stringa)."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw)
+    return _extract_leverage_int_from_text(str(raw))
+
 
 # Modalità operative supportate nel piano FREE
 OPERATING_MODE_CANONICAL = ["aggressiva", "equilibrata", "selettiva"]
@@ -98,51 +169,27 @@ def _parse_operating_mode(user_text: str) -> Optional[str]:
     """
     Riconosce la modalità operativa dall'input utente.
 
-    Riconosce:
+    Regola: operating_mode viene aggiornato SOLO su match testuale esplicito:
     - "aggressiva", "aggressivo", "aggressive"
     - "equilibrata", "equilibrato", "balanced"
     - "selettiva", "selettivo", "selective"
-    - opzionale: "1/2/3" e "prima/seconda/terza"
-
-    Ritorna il valore canonico: "aggressiva" | "equilibrata" | "selettiva"
-    oppure None se non riconosciuto.
+    Non usa mai deduzioni numeriche/percentuali (es. 1/2/3, sl/tp/risk).
     """
     t = (user_text or "").strip().lower()
     if not t:
+        logger.info("[OPERATING_MODE_EXTRACT] explicit=%s text=%r", None, user_text)
         return None
 
-    # Mapping numerico opzionale: 1 → aggressiva, 2 → equilibrata, 3 → selettiva
-    m = re.search(r"\b([1-3])\b", t)
-    if m:
-        num = m.group(1)
-        if num == "1":
-            return "aggressiva"
-        if num == "2":
-            return "equilibrata"
-        if num == "3":
-            return "selettiva"
+    explicit_mode: Optional[str] = None
+    if re.search(r"\b(aggressiva|aggressivo|aggressive)\b", t, re.I):
+        explicit_mode = "aggressiva"
+    elif re.search(r"\b(equilibrata|equilibrato|balanced)\b", t, re.I):
+        explicit_mode = "equilibrata"
+    elif re.search(r"\b(selettiva|selettivo|selective)\b", t, re.I):
+        explicit_mode = "selettiva"
 
-    # Ordinali: "prima/seconda/terza"
-    if re.search(r"\b(la\s+)?prima(\s+modalita)?\b", t):
-        return "aggressiva"
-    if re.search(r"\b(la\s+)?seconda(\s+modalita)?\b", t):
-        return "equilibrata"
-    if re.search(r"\b(la\s+)?terza(\s+modalita)?\b", t):
-        return "selettiva"
-
-    # Aggressiva
-    if re.search(r"\baggressiv\w*\b", t) or "aggressive" in t:
-        return "aggressiva"
-
-    # Equilibrata
-    if re.search(r"\bequilibrat\w*\b", t) or "balanced" in t:
-        return "equilibrata"
-
-    # Selettiva
-    if re.search(r"\bselettiv\w*\b", t) or "selective" in t:
-        return "selettiva"
-
-    return None
+    logger.info("[OPERATING_MODE_EXTRACT] explicit=%s text=%r", explicit_mode, user_text)
+    return explicit_mode
 
 
 def _apply_operating_mode_preset(params: Dict[str, Any], operating_mode: str) -> Dict[str, Any]:
@@ -525,9 +572,19 @@ def _ensure_state(state: Dict[str, Any]) -> Dict[str, Any]:
     missing = free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
     if missing is not None:
         cs["step"] = missing
+    elif is_config_complete(params):
+        cs["step"] = None
     else:
         cs["step"] = _free_wizard_terminal_step(params)
     state["config_state"] = cs
+
+    # Coerenza: mai restare "complete" se i params non soddisfano is_config_complete (es. reset DB incompleto).
+    if state.get("config_status") == "complete" and not is_config_complete(params):
+        logger.info(
+            "[_ensure_state] Downgrading config_status complete -> in_progress (params incomplete vs is_config_complete)"
+        )
+        state["config_status"] = "in_progress"
+
     return state
 
 
@@ -552,10 +609,21 @@ def _recompute_step(cs: Dict[str, Any]) -> None:
     else:
         cs["step"] = _free_wizard_terminal_step(params)
 
+
+def format_percent(value: Any) -> str:
+    return f"{float(str(value).replace('%', '').replace(',', '.')):.1f}%"
+
+
 def _sync_state(state: Dict[str, Any], cs: Dict[str, Any], params: Dict[str, Any]) -> tuple:
     """Sincronizza params in cs e cs in state. Unico punto per aggiornare cs["params"] e state["config_state"]."""
     # Assicura che params sia sempre un dict valido con tutte le chiavi
     params = _coerce_params(params)
+    for key in ("sl", "tp"):
+        if params.get(key) is not None:
+            try:
+                params[key] = format_percent(params[key])
+            except (TypeError, ValueError):
+                pass
     cs["params"] = params
     state["config_state"] = cs
     return state, cs, params
@@ -689,6 +757,20 @@ def _get_next_step(
     """
     _ = current_step
     return free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
+
+# Campi minimi piano FREE: senza questi non si marca mai config_status="complete".
+REQUIRED_FIELDS = ["market_type", "symbol", "timeframe", "operating_mode"]
+
+
+def is_config_complete(params: Dict[str, Any]) -> bool:
+    """
+    Configurazione FREE considerata completa solo se i campi core sono valorizzati
+    e vale anche il controllo esteso (_all_params_filled).
+    """
+    if not all(params.get(k) is not None for k in REQUIRED_FIELDS):
+        return False
+    return _all_params_filled(params)
+
 
 def _all_params_filled(params: Dict[str, Any]) -> bool:
     """Verifica se tutti i parametri necessari sono compilati."""
@@ -1297,37 +1379,12 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
         # Solo per futures
         if params.get("market_type") == "spot":
             return None
-        # 1) Prova a estrarre dopo la parola "leva"/"leverage"
-        candidate_num_str: Optional[str] = None
-        num_pattern = r"\d+(?:\.\d+)?"
-        m = re.search(rf"(?:leva|leverag|lev)\s*[:=]?\s*(?:x\s*({num_pattern})|({num_pattern})\s*x?)", lt)
-        if m:
-            candidate_num_str = m.group(1) or m.group(2)
-        # 2) Fallback: pattern 'x10' o '10x' (accetta anche 'x10.0' / '10.0x')
-        if not candidate_num_str:
-            m = re.search(rf"x\s*({num_pattern})", lt)
-            if m:
-                candidate_num_str = m.group(1)
-        if not candidate_num_str:
-            m = re.search(rf"({num_pattern})\s*x", lt)
-            if m:
-                candidate_num_str = m.group(1)
-        # 3) Fallback finale: ultimo numero nel testo
-        if not candidate_num_str:
-            all_nums = re.findall(num_pattern, lt)
-            if all_nums:
-                candidate_num_str = all_nums[-1]
-        if candidate_num_str:
-            try:
-                lev_val = float(candidate_num_str)
-                lev_val_int = int(lev_val)
-                extracted_value = lev_val_int
-                logger.info(
-                    f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}"
-                )
-                return lev_val_int
-            except Exception:
-                pass
+        lev_val_int = _extract_leverage_int_from_text(text)
+        if lev_val_int is not None:
+            logger.info(
+                f"[EXTRACT_OUT] step={step} extracted_type=int extracted_value={lev_val_int!r}"
+            )
+            return lev_val_int
         extracted_value = None
         logger.info(f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}")
         return None
@@ -1429,6 +1486,124 @@ def _extract_confirmation(user_text: str) -> Optional[bool]:
     return None
 
 
+def _analyze_pending_resolve_input(
+    user_text: str,
+    merged_params: Dict[str, Any],
+    merged_pending: Dict[str, Any],
+) -> Tuple[Dict[str, Any], set[str], set[str]]:
+    """
+    Rileva modifiche esplicite (sl/tp/leverage/risk_pct) e conferme esplicite per campo (come resolve_input).
+
+    Ritorna anche ``explicit_keys_for_ambiguity``: solo chiavi provenienti da _extract_modification_requests,
+    senza il fallback lev_guess (che può leggere numeri destinati ad altri campi, es. SL 3%).
+    """
+    lt = (user_text or "").strip().lower()
+    extracted = _extract_modification_requests(user_text, merged_params)
+    explicit_updates: Dict[str, Any] = {}
+    for key in ("sl", "tp", "leverage", "risk_pct"):
+        if key in extracted:
+            explicit_updates[key] = extracted[key]
+
+    explicit_keys_for_ambiguity = set(explicit_updates.keys())
+
+    # Nuova leva nel messaggio mentre c'è pending: aggiorna sempre il pending (non ripetere vecchio warning)
+    if (
+        "leverage" in merged_pending
+        and "leverage" not in explicit_updates
+        and merged_params.get("market_type") == "futures"
+    ):
+        lev_guess = _extract_step_value(user_text, "leverage", merged_params)
+        if lev_guess is not None:
+            explicit_updates["leverage"] = lev_guess
+
+    confirmed_fields: set[str] = set()
+    confirmation_patterns = {
+        "leverage": r"\bconferm\w*\s+(?:la\s+)?(?:leva|leverage|lev)\b",
+        "sl": r"\bconferm\w*\s+(?:lo\s+)?(?:sl|stop\s*loss|stoploss)\b",
+        "risk_pct": r"\bconferm\w*\s+(?:il\s+)?(?:rischio|risk)\b",
+        "tp": r"\bconferm\w*\s+(?:il\s+)?(?:tp|take\s*profit|takeprofit)\b",
+    }
+    for field, pattern in confirmation_patterns.items():
+        if re.search(pattern, lt, re.I):
+            confirmed_fields.add(field)
+    return explicit_updates, confirmed_fields, explicit_keys_for_ambiguity
+
+
+def _ambiguous_modify_confirm_clarification(
+    user_text: str,
+    params: Dict[str, Any],
+    pending: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Messaggio misto ambiguo: stesso campo con modifica esplicita e conferma esplicita (es. “metti leva 3x e confermo leva”).
+    Da chiamare prima di resolve_input / commit pending.
+    """
+    merged_params = dict(params or {})
+    merged_pending = dict(pending or {})
+    _, confirmed_fields, explicit_keys_for_ambiguity = _analyze_pending_resolve_input(
+        user_text, merged_params, merged_pending
+    )
+    ambiguous = explicit_keys_for_ambiguity & confirmed_fields
+    if not ambiguous:
+        return None
+    logger.info("[PENDING_AMBIGUITY] fields=%s input=%r", sorted(ambiguous), user_text)
+    order = ("sl", "tp", "leverage", "risk_pct")
+    labels = {
+        "sl": "lo stop loss",
+        "tp": "il take profit",
+        "leverage": "la leva",
+        "risk_pct": "il rischio per trade",
+    }
+    ordered = [f for f in order if f in ambiguous]
+    if len(ordered) == 1:
+        detail = labels[ordered[0]]
+    elif len(ordered) == 2:
+        detail = f"{labels[ordered[0]]} e {labels[ordered[1]]}"
+    else:
+        detail = ", ".join(labels[f] for f in ordered[:-1]) + f" e {labels[ordered[-1]]}"
+    return (
+        f"Nel messaggio chiedi sia di modificare sia di confermare {detail}: non è chiaro cosa preferisci. "
+        "Rispondi con un'unica azione (solo la modifica che vuoi applicare oppure solo la conferma per quel parametro)."
+    )
+
+
+def resolve_input(
+    params: Dict[str, Any],
+    pending: Dict[str, Any],
+    user_text: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Merge deterministico tra modifiche esplicite e pending.
+    Regole:
+    1) applica prima i valori espliciti (sl/tp/leverage/risk_pct)
+    2) applica poi solo le conferme esplicite per campo
+    3) "confermo" generico non accetta nulla
+    4) pulisce pending solo per campi toccati
+    """
+    merged_params: Dict[str, Any] = dict(params or {})
+    merged_pending: Dict[str, Any] = dict(pending or {})
+
+    explicit_updates, confirmed_fields, _ = _analyze_pending_resolve_input(
+        user_text, merged_params, merged_pending
+    )
+
+    touched_fields: set[str] = set()
+
+    for field, value in explicit_updates.items():
+        merged_params[field] = value
+        touched_fields.add(field)
+
+    for field in confirmed_fields:
+        if field in merged_pending:
+            merged_params[field] = merged_pending[field]
+            touched_fields.add(field)
+
+    for field in touched_fields:
+        merged_pending.pop(field, None)
+
+    return merged_params, merged_pending
+
+
 def _flush_all_high_risk_pending_to_params(cs: Dict[str, Any], params: Dict[str, Any]) -> None:
     """
     Scrive in params tutti i valori ancora in pending_leverage_confirmation / pending_risk_confirmation /
@@ -1463,14 +1638,87 @@ def _flush_all_high_risk_pending_to_params(cs: Dict[str, Any], params: Dict[str,
         cs["suggested_sl"] = None
 
 
-def _commit_pending_risk_or_leverage_on_confirm(user_text: str, cs: Dict[str, Any], params: Dict[str, Any]) -> None:
+def _pending_batch_snapshot(cs: Dict[str, Any]) -> Dict[str, Any]:
+    """Snapshot ordinato dei pending conferma ad alto rischio."""
+    pending: Dict[str, Any] = {}
+    if cs.get("pending_sl_confirmation") is not None:
+        pending["sl"] = cs.get("pending_sl_confirmation")
+    if cs.get("pending_risk_confirmation") is not None:
+        pending["risk_pct"] = cs.get("pending_risk_confirmation")
+    if cs.get("pending_leverage_confirmation") is not None:
+        pending["leverage"] = cs.get("pending_leverage_confirmation")
+    return pending
+
+
+def _clear_pending_confirmation_batch(cs: Dict[str, Any]) -> Dict[str, Any]:
+    """Azzera sempre tutti i pending e ritorna lo snapshot precedente."""
+    before = _pending_batch_snapshot(cs)
+    cs["pending_risk_confirmation"] = None
+    cs["pending_leverage_confirmation"] = None
+    cs["pending_sl_confirmation"] = None
+    cs["suggested_sl"] = None
+    logger.info("[PENDING_BATCH_CLEAR] cleared=%s", before)
+    return before
+
+
+def _fmt_pending_percent(value: Any) -> str:
+    try:
+        f = float(str(value).replace("%", "").replace(",", "."))
+    except Exception:
+        return str(value)
+    return str(int(f)) if f.is_integer() else str(f)
+
+
+def _build_pending_batch_confirmation_prompt(cs: Dict[str, Any]) -> str:
+    """Costruisce una sola richiesta di conferma cumulativa."""
+    pending = _pending_batch_snapshot(cs)
+    pieces: List[str] = []
+    if "sl" in pending:
+        pieces.append(f"Stop Loss {_fmt_pending_percent(pending['sl'])}%")
+    if "risk_pct" in pending:
+        pieces.append(f"rischio {_fmt_pending_percent(pending['risk_pct'])}%")
+    if "leverage" in pending:
+        try:
+            lev = int(float(pending["leverage"]))
+        except Exception:
+            lev = pending["leverage"]
+        pieces.append(f"leva {lev}x")
+    if not pieces:
+        return "Confermi i valori proposti?"
+    if len(pieces) == 1:
+        details = pieces[0]
+    elif len(pieces) == 2:
+        details = f"{pieces[0]} e {pieces[1]}"
+    else:
+        details = f"{pieces[0]}, {pieces[1]} e {pieces[2]}"
+    return f"Stai impostando {details}. Confermi?"
+
+
+def _commit_pending_risk_or_leverage_on_confirm(
+    user_text: str, cs: Dict[str, Any], params: Dict[str, Any]
+) -> Optional[str]:
     """
-    BUG3: applica su params i valori in pending_* quando l'utente conferma (stesse regole del blocco dedicato).
-    Ordine: leva prima, poi rischio. Idempotente se non c'è conferma o nessun pending.
+    Applica merge deterministico tra pending e testo utente:
+    - valori espliciti prima
+    - conferme solo per campo menzionato
+    - nessun "accept all pending" su "confermo" generico
+
+    Ritorna messaggio da mostrare all'utente se il merge è bloccato (ambiguità modifica+conferma stesso campo).
     """
-    if _extract_confirmation(user_text) is not True:
-        return
-    _flush_all_high_risk_pending_to_params(cs, params)
+    pending_batch = _pending_batch_snapshot(cs)
+    if not pending_batch:
+        return None
+    amb = _ambiguous_modify_confirm_clarification(user_text, params, pending_batch)
+    if amb:
+        return amb
+    merged_params, merged_pending = resolve_input(params, pending_batch, user_text)
+    params.update(merged_params)
+    cs["pending_sl_confirmation"] = merged_pending.get("sl")
+    cs["pending_risk_confirmation"] = merged_pending.get("risk_pct")
+    cs["pending_leverage_confirmation"] = merged_pending.get("leverage")
+    if "sl" not in merged_pending:
+        cs["suggested_sl"] = None
+    return None
 
 
 def _detect_empathetic_phrase(user_text: str) -> Optional[str]:
@@ -1644,25 +1892,7 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
                 None
             )
         
-        # Parsing robusto: accetta int già normalizzati oppure stringhe tipo "10", "10x", "x10"
-        leverage_int: Optional[int] = None
-        if isinstance(value, int):
-            leverage_int = value
-        else:
-            s = str(value).strip().lower()
-            num_str: Optional[str] = None
-            m = re.search(r"(?:x\s*(\d+)|(\d+)\s*x?)", s)
-            if m:
-                num_str = m.group(1) or m.group(2)
-            if not num_str:
-                digits = re.findall(r"\d+", s)
-                if digits:
-                    num_str = digits[-1]
-            if num_str is not None:
-                try:
-                    leverage_int = int(num_str)
-                except ValueError:
-                    leverage_int = None
+        leverage_int = _parse_user_leverage_int(value)
         if leverage_int is None:
             return (
                 False,
@@ -2137,6 +2367,422 @@ def _is_generic_question(user_text: str) -> bool:
     ]
     return any(pattern in lt for pattern in generic_patterns)
 
+def is_informational_question(text: str) -> bool:
+    """
+    Rileva domande informative durante il wizard.
+
+    Quando True, non si applica patch né si avanza lo step: si risponde (LLM + contesto)
+    e si ripropone la domanda dello step corrente. I comandi diretti restano esclusi
+    (es. "metti futures", "BTCUSDT", "1m", "leva 10x", "sl 3%").
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    lt = raw.lower()
+
+    # Non trattare come domanda informativa input chiaramente operativi.
+    # 1) Ticker "puro" (es. BTCUSDT, ETH/USDT)
+    if re.fullmatch(r"\s*[a-z0-9]{2,12}\s*(?:/|-)?\s*usdt\s*\b", lt, re.I):
+        return False
+    # 2) Timeframe "puro" (es. 1m, 15m, 1h, 4h, 1d)
+    if re.fullmatch(r"\s*\d+\s*[mhdw]\s*\b", lt, re.I) or normalize_timeframe(raw) is not None:
+        return False
+    # 3) Market type diretto
+    if lt in ("spot", "futures", "perpetual"):
+        return False
+    # 4) Comandi espliciti di set
+    if re.search(r"\b(?:metti|imposta|voglio|vorrei|usa|passa|torna|rimetti)\b.*\b(?:spot|futures)\b", lt):
+        return False
+    if re.search(r"(?:\bleva\b|\bleverage\b|\blev\b)\s*[:=]?\s*\d+(?:\.\d+)?\s*x?\b", lt):
+        return False
+    if re.search(r"\b\d+(?:\.\d+)?\s*x\b", lt):
+        return False
+    if re.search(r"\b(?:sl|stop\s*loss|tp|take\s*profit)\b\s*[:=]?\s*\d+(?:\.\d+)?\s*%?\b", lt):
+        return False
+    if re.search(r"\b(?:rischio|risk)\b\s*[:=]?\s*\d+(?:\.\d+)?\s*%?\b", lt):
+        return False
+
+    informational_triggers = [
+        "?",
+        "cosa",
+        "che cosa",
+        "qual è",
+        "differenza",
+        "cambia",
+        "spiegami",
+        "cos'è",
+        "cosa significa",
+        "conviene",
+        "meglio",
+        "perché",
+        "perche",
+        "come funziona",
+        "che coppia",
+        "quale coppia",
+        "coppia mi consigli",
+        "cosa mi consigli",
+        "mi consigli",
+        "non ho capito",
+        "aiutami",
+        "non saprei",
+        "non lo so",
+        "consigliami",
+        "cosa scelgo",
+        "aiutami a scegliere",
+        "consigli",
+    ]
+    if any(trigger in lt for trigger in informational_triggers):
+        return True
+    # Parole corte: word boundary per limitare falsi positivi
+    if re.search(r"\b(?:che|come)\b", lt):
+        return True
+    return False
+
+def _informational_answer_fallback(user_text: str) -> str:
+    """Fallback breve per risposte informative durante il wizard."""
+    lt = (user_text or "").strip().lower()
+    if any(k in lt for k in ["spot", "futures", "differenza", "cosa cambia"]):
+        return (
+            "Spot significa comprare/vendere direttamente la crypto. "
+            "Futures usa contratti e puo includere leva, quindi espone a piu rischio."
+        )
+    if any(k in lt for k in ["leva", "leverage", "cosa significa leva"]):
+        return (
+            "La leva amplifica guadagni e perdite: con 10x, una variazione dell'1% sul prezzo "
+            "vale circa 10% sul margine."
+        )
+    if "timeframe" in lt:
+        return (
+            "In generale timeframe bassi sono piu rapidi ma piu rumorosi, "
+            "timeframe alti sono piu stabili ma meno frequenti."
+        )
+    if any(k in lt for k in ["rischio", "risk", "quanto rischio"]):
+        return (
+            "Per molti profili prudenti si usa spesso un rischio contenuto per trade; "
+            "l'importante e mantenere coerenza con il tuo piano."
+        )
+    return (
+        "Ti aiuto volentieri su questo punto; la spiegazione dettagliata non è disponibile in questo momento. "
+        "Se riformuli la domanda o riprovi tra poco, posso essere più preciso."
+    )
+
+
+def _normalize_faq_input(user_text: str) -> str:
+    t = (user_text or "").strip().lower()
+    for ch in ("\u2019", "\u2018", "`", "\xb4"):
+        t = t.replace(ch, "'")
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _faq_info_complete_guard_response(
+    body: str,
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Stesso criterio dei log [CONFIG_CHECK]: is_config_complete(params).
+    Se la config è già completa, niente wizard/repeat step: solo ask-start-bot.
+    """
+    if not is_config_complete(params):
+        return None
+    cs["step"] = None
+    state["step"] = None
+    state["config_status"] = "complete"
+    logger.info("[FAQ_COMPLETE_GUARD] complete=True step forced None ask_start_bot")
+    reply = (body or "").strip() + "\n\nVuoi avviare il bot adesso?"
+    state, cs, params = _sync_state(state, cs, params)
+    return {"reply": reply, "state": state, "skip_llm": True}
+
+
+def _faq_repeat_suffix(
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+    current_step: str,
+) -> Tuple[str, str, str]:
+    """Testo da appendere dopo la FAQ, label step, tipo di ripetizione (solo log)."""
+    if not _is_step_filled("market_type", params):
+        invite = "Per configurare Idith rispondi alla domanda qui sotto.\n\n"
+        return invite + _step_question("market_type", params), "market_type", "wizard_not_started_invite"
+    step_eff = current_step or "market_type"
+    return _step_question(step_eff, params), step_eff, "repeat_current_step"
+
+
+def _faq_text_has_trading_param_signals(user_text: str) -> bool:
+    """Evita FAQ su frasi che impostano anche SL/TP/leva/timeframe (senza usare _message_looks_like_mixed_config)."""
+    lt = user_text.strip().lower()
+    return bool(
+        re.search(
+            r"%|x\b|leva|leverage|stop|take|rischio|tp\b|sl\b|tf\b|timeframe|futures|spot|capitale",
+            lt,
+        )
+    )
+
+
+def _match_practical_faq(user_text: str) -> Optional[Tuple[str, str]]:
+    """
+    Domande pratiche su runner/API/status: risposta fissa (intent, testo).
+    Ordine delle regole: più specifiche prima.
+    """
+    lt = _normalize_faq_input(user_text)
+    if not lt or len(lt) > 320:
+        return None
+    if _faq_text_has_trading_param_signals(user_text):
+        return None
+    if _is_explicit_modification_request(user_text):
+        return None
+
+    # --- Runner (ordine: problemi → post-install → collegamento → stato → download → avvio → cos'è) ---
+    if "runner" in lt:
+        runner_connect_msg = (
+            "Per collegare il runner: fai doppio clic sull'icona Idith Runner, aspetta circa 5-6 secondi finché appare la finestra con il codice, clicca 'Copia code', torna nella chat di Idith, clicca 'Collega runner' e incolla il codice. Se tutto è corretto, nella tabella a sinistra lo stato del runner passerà da 'non connesso' a 'connesso'."
+        )
+        if (
+            "non connesso" in lt
+            or "non collegato" in lt
+            or "runner non" in lt
+            or ("cosa fare" in lt and "non" in lt)
+        ):
+            return (
+                "faq_runner_not_connected",
+                "Se il runner non risulta connesso, apri il runner sul PC e controlla di averlo collegato con il codice tramite 'Collega runner'.",
+            )
+        # 1) Dopo installazione → passo successivo = collegamento (prima di qualsiasi match generico "runner")
+        if any(
+            p in lt
+            for p in (
+                "ho installato",
+                "installato il runner",
+                "runner installato",
+                "installata",
+                "installazione",
+                "dopo l'install",
+                "dopo install",
+                "dopo aver installato",
+                "dopo aver installato il runner",
+                "appena installato",
+                "appena installata",
+                "finito di installare",
+                "finita l'installazione",
+                "installazione completata",
+                "installazione finita",
+            )
+        ) or (
+            "install" in lt
+            and "runner" in lt
+            and any(
+                w in lt
+                for w in (
+                    "ora cosa",
+                    "cosa faccio",
+                    "che faccio",
+                    "prossimo passo",
+                    "passo successivo",
+                    "adesso cosa",
+                    "e adesso",
+                    "e ora",
+                )
+            )
+        ):
+            return ("faq_runner_post_install", runner_connect_msg)
+        # 2) Collegamento esplicito
+        if any(
+            p in lt
+            for p in (
+                "come collego il runner",
+                "come collego runner",
+                "collegare il runner",
+                "collego il runner",
+                "collega runner",
+                "collego runner",
+                "copia code",
+                "copia il code",
+                "incolla il codice",
+                "incolla il code",
+            )
+        ):
+            return ("faq_runner_connect", runner_connect_msg)
+        # 3) Avvio runner (prima del fallback "cos'è", così "come avvio" non finisce nel definizione)
+        if any(
+            p in lt
+            for p in (
+                "come avvio",
+                "avvio il runner",
+                "avviare il runner",
+                "avvi il runner",
+                "come si avvia",
+                "come faccio ad avviare",
+                "doppio clic",
+            )
+        ):
+            return (
+                "faq_runner_start",
+                "Per avviare il runner fai doppio clic sull'icona Idith Runner sul desktop. In alternativa, se è già installato, puoi controllare anche nella barra di Windows in basso a destra, vicino alle icone di volume o Wi-Fi. Dopo l'avvio aspetta qualche secondo.",
+            )
+        if any(
+            p in lt
+            for p in (
+                "come vedo",
+                "vedo se",
+                "e connesso",
+                "è connesso",
+                "stato runner",
+                "runner connesso",
+                "runner collegato",
+                "tabella",
+            )
+        ):
+            return (
+                "faq_runner_status",
+                "Lo vedi dalla tabella di stato a sinistra: se il runner è connesso, lo stato runner risulta attivo/connesso. Se non è collegato, Idith non può avviare il bot.",
+            )
+        if "scaric" in lt or "download" in lt:
+            return (
+                "faq_runner_download",
+                "Puoi scaricare il runner dal pulsante 'Download runner'. Dopo l'installazione, avvialo sul tuo PC e poi torna su Idith per collegarlo.",
+            )
+        # 4) Fallback stretto: solo definizione "cos'è / che cos'è il runner" (niente match generico runner+?)
+        if re.search(r"(cos['']?\s*[eè]\s+il\s+runner|che\s+cos['']?\s*[eè]\s+il\s+runner|cosa\s+[eè]\s+il\s+runner)", lt) or any(
+            p in lt
+            for p in (
+                "cos'e il runner",
+                "cos'è il runner",
+                "che cos'e il runner",
+                "che cos'è il runner",
+                "cosa e il runner",
+                "cosa è il runner",
+                "cosè il runner",
+            )
+        ):
+            return (
+                "faq_runner_what",
+                "Il runner è il piccolo programma che gira sul tuo PC e permette a Idith di comunicare con Bybit. Serve perché le API restano salvate localmente sul tuo dispositivo: Idith non le memorizza sul server.",
+            )
+
+    # --- API / exchange ---
+    if "api" in lt or "exchange" in lt:
+        if "non valid" in lt or "non valide" in lt or "invalid" in lt:
+            return (
+                "faq_api_invalid",
+                "Se le API non sono valide, crea nuove API su Bybit Testnet e reinseriscile da 'Collega Exchange'. Controlla di usare API Testnet, non API live.",
+            )
+        if ("dove" in lt or "vanno" in lt) and any(x in lt for x in ("salv", "memorizz", "tenut")) and "colleg" not in lt:
+            return (
+                "faq_api_where",
+                "Le API vengono salvate localmente nel runner sul tuo PC. Idith non le memorizza sul server.",
+            )
+        if ("cre" in lt or "gener" in lt) and ("api" in lt or "chiavi" in lt or "chiave" in lt):
+            return (
+                "faq_api_create",
+                "Per creare le API devi entrare su Bybit Testnet, andare nella sezione API/API Management, creare una nuova API Key e copiare API Key e API Secret. Usa solo API Testnet.",
+            )
+        if (
+            ("colleg" in lt or "verifica e salva" in lt)
+            and ("api" in lt or "exchange" in lt)
+            and "runner" not in lt
+        ):
+            return (
+                "faq_api_connect",
+                "Per collegare le API clicca 'Collega Exchange', incolla API Key e API Secret e poi premi 'Verifica e salva'. Le chiavi vengono salvate localmente nel runner sul tuo PC, non su Supabase/server.",
+            )
+
+    # --- Testnet / soldi reali ---
+    if "testnet" in lt and any(x in lt for x in ("cos'", "cos'e", "che ", "signif", "cosa ")):
+        return (
+            "faq_testnet",
+            "La testnet è un ambiente di prova: permette di testare il bot senza usare fondi reali.",
+        )
+    if (
+        any(x in lt for x in ("soldi veri", "soldi reali", "denaro reale", "fondi reali"))
+        or ("soldi" in lt and ("veri" in lt or "reali" in lt))
+        or ("posso usare" in lt and ("reali" in lt or "veri" in lt or "live" in lt))
+    ):
+        return (
+            "faq_real_money",
+            "Nel piano Free Idith usa solo testnet. Non opera con soldi reali.",
+        )
+
+    # --- P/L e ordini ---
+    plish = "p/l" in lt or bool(re.search(r"\bpl\b", lt))
+    if plish and ("realizz" in lt or "realizzato" in lt):
+        return (
+            "faq_pl_realized",
+            "Il P/L realizzato indica il profitto o la perdita già chiusa da operazioni completate.",
+        )
+    if plish and "apert" in lt:
+        return (
+            "faq_pl_open",
+            "Il P/L aperto indica il profitto o la perdita momentanea delle operazioni ancora aperte. Può cambiare finché l'ordine non viene chiuso.",
+        )
+    if "analizz" in lt and ("idith" in lt or "sta analizz" in lt):
+        return (
+            "faq_idith_analyzing",
+            "'Idith sta analizzando' significa che il bot sta controllando il mercato secondo la strategia scelta. Non vuol dire per forza che aprirà subito un ordine.",
+        )
+    if any(
+        p in lt
+        for p in (
+            "come avvio il bot",
+            "come avvio bot",
+            "come faccio ad avviare il bot",
+            "come faccio a avviare il bot",
+            "come si avvia il bot",
+            "come avviare il bot",
+            "come faccio a farlo partire",
+            "come faccio farlo partire",
+            "come faccio partire il bot",
+            "come faccio a far partire il bot",
+            "avvio il bot",
+            "avviare il bot",
+            "far partire il bot",
+            "come fermo il bot",
+            "come fermare il bot",
+            "come faccio a fermare il bot",
+            "fermare il bot",
+        )
+    ):
+        return (
+            "faq_bot_start_stop_chat",
+            "Per avviare il bot non ci sono pulsanti.\n\n"
+            "Devi usare direttamente la chat.\n\n"
+            "Prima assicurati di aver completato questi passaggi:\n\n"
+            '- Hai installato e avviato il runner sul tuo PC\n'
+            '- Hai collegato il runner tramite codice (cliccando "Collega runner")\n'
+            '- Hai inserito le API di Bybit (tramite "Collega Exchange")\n'
+            '- Hai completato la configurazione del bot\n\n'
+            "Se tutto è pronto, per avviare il bot scrivi:\n"
+            "👉 avvia bot\n\n"
+            "Per fermarlo in qualsiasi momento scrivi:\n"
+            "👉 ferma bot\n\n"
+            "Quando il bot è attivo, vedrai lo stato aggiornarsi nella tabella a sinistra.",
+        )
+    if "bot attivo" in lt or (
+        "bot" in lt and "attivo" in lt and any(x in lt for x in ("signif", "cosa ", "che cos", "cos'e", "cos'è"))
+    ):
+        return (
+            "faq_bot_active",
+            "'Bot attivo' significa che la configurazione è stata completata e il runner ha ricevuto il comando per avviare il bot.",
+        )
+    if "ordini complet" in lt or ("completat" in lt and "ordin" in lt):
+        return (
+            "faq_orders_completed",
+            "'Ordini completati' indica quante operazioni sono state chiuse dal bot in quella sessione.",
+        )
+    if (
+        ("non apre" in lt and "ordin" in lt)
+        or ("nessun ordine" in lt)
+        or ("perch" in lt and "ordin" in lt and "non" in lt)
+    ):
+        return (
+            "faq_bot_no_orders",
+            "Il bot apre ordini solo quando la strategia trova condizioni valide. Se il runner è scollegato, le API non sono valide, il saldo è insufficiente o il mercato non dà segnali, potrebbe non aprire nulla.",
+        )
+
+    return None
+
+
 def _is_explicit_modification_request(user_text: str) -> bool:
     """Rileva se l'utente chiede esplicitamente di modificare un parametro."""
     lt = user_text.strip().lower()
@@ -2266,6 +2912,20 @@ def _extract_modification_requests(user_text: str, params: Dict[str, Any], curre
         if tf.endswith("min"):
             tf = tf[:-3] + "m"
         updates["timeframe"] = tf
+    else:
+        # Supporta forme testuali come "5 minuti" / "1 ora"
+        tf_words_match = re.search(
+            r"\b(\d{1,2})\s*(minuto|minuti|ora|ore)\b",
+            lt,
+            re.I,
+        )
+        if tf_words_match:
+            tf_num = tf_words_match.group(1)
+            tf_unit = tf_words_match.group(2).lower()
+            if tf_unit.startswith("minut"):
+                updates["timeframe"] = f"{tf_num}m"
+            elif tf_unit in ("ora", "ore"):
+                updates["timeframe"] = f"{tf_num}h"
     
     # Estrai leverage: pattern (\d+(\.\d+)?)\s*x oppure "leva 3"
     leverage_patterns = [
@@ -2433,11 +3093,564 @@ def _log_final_report(state: Dict[str, Any], context: str = ""):
         f"sl={final_params.get('sl')}, tp={final_params.get('tp')}"
     )
 
+
+def _wizard_seq_missing_required_fields(params: Dict[str, Any]) -> List[str]:
+    missing: List[str] = []
+    required = ["market_type", "symbol", "timeframe", "operating_mode", "sl", "tp", "risk_pct"]
+    for field in required:
+        value = params.get(field)
+        if value is None or value == "":
+            missing.append(field)
+    if params.get("market_type") == "futures" and params.get("leverage") is None:
+        missing.append("leverage")
+    return missing
+
+
+def _wizard_seq_pending_snapshot(cs: Dict[str, Any]) -> Dict[str, Any]:
+    pending: Dict[str, Any] = {}
+    if cs.get("pending_risk_confirmation") is not None:
+        pending["risk_pct"] = cs.get("pending_risk_confirmation")
+    if cs.get("pending_leverage_confirmation") is not None:
+        pending["leverage"] = cs.get("pending_leverage_confirmation")
+    if cs.get("pending_sl_confirmation") is not None:
+        pending["sl"] = cs.get("pending_sl_confirmation")
+    return pending
+
+
+def _wizard_seq_tail_after_save(
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+    current_step: str,
+    *,
+    summary_followup: str,
+) -> Dict[str, Any]:
+    """After a wizard field is persisted: advance or mark configuration complete."""
+    state, cs, params = _sync_state(state, cs, params)
+    next_step = _get_next_step(current_step, params, cs)
+    logger.info("[WIZARD_SEQ_NEXT] from=%s to=%s", current_step, next_step)
+    if next_step is not None:
+        cs["step"] = next_step
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": _step_question(next_step, params), "state": state}
+
+    missing = _wizard_seq_missing_required_fields(params)
+    pending = _wizard_seq_pending_snapshot(cs)
+    if missing or pending:
+        logger.info("[WIZARD_COMPLETE_BLOCKED] missing=%s pending=%s", missing, pending)
+        if missing:
+            cs["step"] = missing[0]
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": _step_question(cs.get("step", current_step), params), "state": state}
+
+    if not is_config_complete(params):
+        logger.warning("[WIZARD_SEQ] refuse complete: is_config_complete=False after wizard tail")
+        mw = free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
+        if mw is not None:
+            cs["step"] = mw
+            state["config_status"] = "in_progress"
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": _step_question(mw, params), "state": state}
+
+    state["config_status"] = "complete"
+    _cleanup_config_state_when_complete(cs)
+    cs["step"] = None
+    state["step"] = None
+    state, cs, params = _sync_state(state, cs, params)
+    return {
+        "reply": "Configurazione completata ✅\n\n" + _build_summary(params) + summary_followup,
+        "state": state,
+    }
+
+
+def _wizard_seq_handle_message(
+    user_text: str,
+    state: Dict[str, Any],
+    history: List[Dict[str, str]],
+    system_prompt: str = "",
+) -> Dict[str, Any]:
+    _ = history
+    _ = system_prompt
+    state = _ensure_state(state)
+    cs = state["config_state"]
+    params = _coerce_params(cs.get("params"))
+    cs["params"] = params
+
+    current_step = cs.get("step") or "market_type"
+    logger.info("[WIZARD_SEQ] step=%s input=%r", current_step, user_text)
+    print("[CONFIG_CHECK]", dict(params), "complete:", is_config_complete(params))
+    logger.info("[CONFIG_CHECK] params=%s complete=%s", dict(params), is_config_complete(params))
+
+    faq_hit = _match_practical_faq(user_text)
+    if faq_hit is not None:
+        intent_id, faq_answer = faq_hit
+        logger.info("[FAQ_MATCH] intent=%s", intent_id)
+        guarded = _faq_info_complete_guard_response(faq_answer, state, cs, params)
+        if guarded is not None:
+            return guarded
+        suffix, reconciled_step, ask_repeat_question = _faq_repeat_suffix(state, cs, params, current_step)
+        logger.info(
+            "[FAQ_REPLY] reconciled_step=%s ask_repeat_question=%s",
+            reconciled_step,
+            ask_repeat_question,
+        )
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": f"{faq_answer}\n\n{suffix}", "state": state, "skip_llm": True}
+
+    # Priorità modifiche dirette su configurazione completa:
+    # Solo se il flag persisted è complete E i params passano il controllo stretto is_config_complete.
+    config_is_complete = _is_configuration_complete(state) and is_config_complete(params)
+    if config_is_complete:
+        pending_batch = _pending_batch_snapshot(cs)
+        if pending_batch:
+            amb = _ambiguous_modify_confirm_clarification(user_text, params, pending_batch)
+            if amb:
+                state, cs, params = _sync_state(state, cs, params)
+                return {"reply": amb, "state": state}
+            merged_params, merged_pending = resolve_input(params, pending_batch, user_text)
+            applied_something = merged_params != params or merged_pending != pending_batch
+            if applied_something:
+                logger.info(
+                    "[PENDING_RESOLVE_APPLY] pending_before=%s pending_after=%s",
+                    pending_batch,
+                    merged_pending,
+                )
+                params = merged_params
+                cs["pending_sl_confirmation"] = merged_pending.get("sl")
+                cs["pending_risk_confirmation"] = merged_pending.get("risk_pct")
+                cs["pending_leverage_confirmation"] = merged_pending.get("leverage")
+                if "sl" not in merged_pending:
+                    cs["suggested_sl"] = None
+
+                params = _sync_strategy_from_periods(params)
+                state, cs, params = _sync_state(state, cs, params)
+                step = cs.get("step")
+                complete_ok = is_config_complete(params)
+                print("[POST_CONFIRM_CHECK]", dict(params), "complete:", complete_ok, "step:", step)
+                logger.info(
+                    "[POST_CONFIRM_CHECK] params=%s complete=%s step=%s",
+                    dict(params),
+                    complete_ok,
+                    step,
+                )
+                if complete_ok:
+                    state["config_status"] = "complete"
+                    _cleanup_config_state_when_complete(cs)
+                    cs["step"] = None
+                    state["step"] = None
+                    state, cs, params = _sync_state(state, cs, params)
+                    return {
+                        "reply": "Configurazione completata ✅\n\n"
+                        + _build_summary(params)
+                        + "\n\nVuoi modificare qualcosa o avviare il bot adesso?",
+                        "state": state,
+                    }
+                state["config_status"] = "in_progress"
+                _recompute_step(cs)
+                state, cs, params = _sync_state(state, cs, params)
+                next_ask = cs.get("step") or free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs) or "market_type"
+                cs["step"] = next_ask
+                state, cs, params = _sync_state(state, cs, params)
+                return {"reply": _step_question(next_ask, params), "state": state}
+            if re.search(r"\bconferm\w*\b", user_text.strip().lower(), re.I):
+                state, cs, params = _sync_state(state, cs, params)
+                return {
+                    "reply": "Mi dici cosa vuoi confermare esattamente? (es. 'confermo leva' o 'confermo sl')",
+                    "state": state,
+                }
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": _build_pending_batch_confirmation_prompt(cs), "state": state}
+
+        updates = _extract_modification_requests(user_text, params, current_step=current_step)
+        is_explicit_modification = _is_explicit_modification_request(user_text)
+        lt_user = user_text.strip().lower()
+
+        # Supporta anche input tipo "metti ethusdt" (senza keyword "coppia/symbol")
+        # quando la richiesta è chiaramente una modifica esplicita.
+        if "symbol" not in updates and is_explicit_modification:
+            symbol_match = SYMBOL_RE.search(user_text.strip())
+            if symbol_match:
+                normalized_symbol = _normalize_symbol(symbol_match.group(1))
+                if normalized_symbol:
+                    updates["symbol"] = normalized_symbol
+
+        if updates:
+            # "aggressiv/equilibrat/selettiv" devono valere come alias espliciti.
+            if "operating_mode" in updates and _parse_operating_mode(lt_user) is None:
+                updates.pop("operating_mode", None)
+
+            allowed_complete_updates = {
+                "symbol",
+                "timeframe",
+                "tp",
+                "sl",
+                "risk_pct",
+                "operating_mode",
+                "market_type",
+                "leverage",
+            }
+            selected_updates = {k: v for k, v in updates.items() if k in allowed_complete_updates}
+            immediate_patch: Dict[str, Any] = {}
+            risky_updates: Dict[str, Any] = {}
+
+            # Regola post-config: sl/risk numerici alti e leva con warning → pending batch.
+            for key, value in selected_updates.items():
+                if key == "leverage":
+                    lev_int = _parse_user_leverage_int(value)
+                    if lev_int is None:
+                        immediate_patch[key] = value
+                        continue
+                    sym = params.get("symbol") or "questa coppia"
+                    req_confirm, _ = _check_leverage_warning(lev_int, sym)
+                    if req_confirm:
+                        risky_updates[key] = float(lev_int)
+                        continue
+                    immediate_patch[key] = lev_int
+                    continue
+                if key in ("sl", "risk_pct"):
+                    try:
+                        numeric_val = float(str(value).replace("%", "").replace(",", "."))
+                    except Exception:
+                        immediate_patch[key] = value
+                        continue
+                    if numeric_val >= 4:
+                        risky_updates[key] = numeric_val
+                        continue
+                immediate_patch[key] = value
+
+            if immediate_patch:
+                patch_result = apply_config_patch(cs, immediate_patch)
+                if not patch_result.get("ok", True):
+                    params = cs.get("params", {})
+                    state, cs, params = _sync_state(state, cs, params)
+                    reply = patch_result.get("message") or "Non sono riuscito ad applicare la modifica richiesta."
+                    return {"reply": reply, "state": state}
+                params = cs.get("params", {})
+
+            if risky_updates:
+                _clear_pending_confirmation_batch(cs)
+                if "sl" in risky_updates:
+                    cs["pending_sl_confirmation"] = float(risky_updates["sl"])
+                if "risk_pct" in risky_updates:
+                    cs["pending_risk_confirmation"] = float(risky_updates["risk_pct"])
+                if "leverage" in risky_updates:
+                    cs["pending_leverage_confirmation"] = int(float(risky_updates["leverage"]))
+                logger.info("[PENDING_BATCH_SET] pending=%s", _pending_batch_snapshot(cs))
+                state["config_status"] = "complete" if is_config_complete(params) else "in_progress"
+                state, cs, params = _sync_state(state, cs, params)
+                return {"reply": _build_pending_batch_confirmation_prompt(cs), "state": state}
+
+            if immediate_patch:
+                if is_config_complete(params):
+                    state["config_status"] = "complete"
+                    _cleanup_config_state_when_complete(cs)
+                    cs["step"] = None
+                    state["step"] = None
+                    state, cs, params = _sync_state(state, cs, params)
+                    reply = "Configurazione completata ✅\n\n" + _build_summary(params) + "\n\nVuoi modificare qualcosa o avviare il bot adesso?"
+                    return {"reply": reply, "state": state}
+                state["config_status"] = "in_progress"
+                _recompute_step(cs)
+                state, cs, params = _sync_state(state, cs, params)
+                next_ask = cs.get("step") or free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs) or "symbol"
+                cs["step"] = next_ask
+                state, cs, params = _sync_state(state, cs, params)
+                return {"reply": _step_question(next_ask, params), "state": state}
+
+    if is_informational_question(user_text):
+        logger.info(
+            "[WIZARD_INFO_Q] step=%s text=%r ai_then_repeat_step=True",
+            current_step,
+            user_text,
+        )
+        step_reply = _step_question(current_step, params)
+        ai_reply = ""
+        try:
+            from . import llm_client
+
+            ai_reply = (llm_client.wizard_config_question_answer(user_text, current_step, params) or "").strip()
+        except Exception as exc:
+            logger.warning("[WIZARD_INFO_Q] llm_failed: %s", exc, exc_info=True)
+        if not ai_reply:
+            ai_reply = _informational_answer_fallback(user_text)
+        guarded = _faq_info_complete_guard_response(ai_reply, state, cs, params)
+        if guarded is not None:
+            return guarded
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": f"{ai_reply}\n\n{step_reply}", "state": state}
+
+    pending_key_map = {
+        "risk_pct": "pending_risk_confirmation",
+        "leverage": "pending_leverage_confirmation",
+        "sl": "pending_sl_confirmation",
+    }
+    pending_key = pending_key_map.get(current_step)
+    if pending_key and cs.get(pending_key) is not None:
+        # Leva: priorità al nuovo valore numerico rispetto a ripetere warning o a "ok/sì" ambigui
+        if current_step == "leverage" and cs.get("pending_leverage_confirmation") is not None:
+            new_lev_value = _extract_step_value(user_text, "leverage", params)
+            if new_lev_value is not None:
+                is_valid, error_msg, _ = _validate_step_value("leverage", new_lev_value, params)
+                if not is_valid:
+                    logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+                    state, cs, params = _sync_state(state, cs, params)
+                    return {"reply": (error_msg or _step_question(current_step, params)), "state": state}
+                lev_int = int(new_lev_value)
+                sym = params.get("symbol") or "questa coppia"
+                cs["pending_leverage_confirmation"] = lev_int
+                requires_confirm, warning_msg = _check_leverage_warning(lev_int, sym)
+                if requires_confirm:
+                    state, cs, params = _sync_state(state, cs, params)
+                    return {"reply": warning_msg or _step_question(current_step, params), "state": state}
+                params["leverage"] = lev_int
+                cs["pending_leverage_confirmation"] = None
+                params = _sync_strategy_from_periods(params)
+                state, cs, params = _sync_state(state, cs, params)
+                return _wizard_seq_tail_after_save(
+                    state,
+                    cs,
+                    params,
+                    current_step,
+                    summary_followup="\n\nVuoi avviare il bot adesso?",
+                )
+
+        if current_step == "risk_pct" and cs.get("pending_risk_confirmation") is not None:
+            new_risk_value = _extract_step_value(user_text, "risk_pct", params)
+            if new_risk_value is not None:
+                is_valid, error_msg, _ = _validate_step_value("risk_pct", new_risk_value, params)
+                if not is_valid:
+                    logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+                    state, cs, params = _sync_state(state, cs, params)
+                    return {"reply": (error_msg or _step_question(current_step, params)), "state": state}
+                risk_value = float(str(new_risk_value).replace("%", "").replace(",", "."))
+                requires_confirm, warning_msg = _check_risk_warning(
+                    risk_value, params.get("market_type", "futures")
+                )
+                if requires_confirm:
+                    cs["pending_risk_confirmation"] = risk_value
+                    state, cs, params = _sync_state(state, cs, params)
+                    return {"reply": warning_msg or _step_question(current_step, params), "state": state}
+                params["risk_pct"] = risk_value
+                cs["pending_risk_confirmation"] = None
+                params = _sync_strategy_from_periods(params)
+                state, cs, params = _sync_state(state, cs, params)
+                return _wizard_seq_tail_after_save(
+                    state,
+                    cs,
+                    params,
+                    current_step,
+                    summary_followup="\n\nVuoi avviare il bot adesso?",
+                )
+
+        if current_step == "sl" and cs.get("pending_sl_confirmation") is not None:
+            new_sl_value = _extract_step_value(user_text, "sl", params)
+            if new_sl_value is None:
+                lt_pending = user_text.strip().lower()
+                if re.search(r"\d+(?:\.\d+)?\s*%", user_text):
+                    has_other_param_context = any(
+                        token in lt_pending
+                        for token in ["take profit", "tp", "rischio", "risk", "leva", "leverage"]
+                    )
+                    if not has_other_param_context:
+                        m_pct = re.search(r"(\d+(?:\.\d+)?)\s*%", user_text)
+                        if m_pct:
+                            new_sl_value = f"{m_pct.group(1)}%"
+            if new_sl_value is not None:
+                sl_val = float(str(new_sl_value).replace("%", "").replace(",", "."))
+                is_valid, error_msg, _ = _validate_step_value("sl", new_sl_value, params)
+                if not is_valid:
+                    logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+                    state, cs, params = _sync_state(state, cs, params)
+                    return {"reply": (error_msg or _step_question(current_step, params)), "state": state}
+                requires_confirm, warning_msg, suggested_sl = _check_sl_warning(sl_val)
+                if requires_confirm:
+                    cs["pending_sl_confirmation"] = sl_val
+                    cs["suggested_sl"] = suggested_sl
+                    state, cs, params = _sync_state(state, cs, params)
+                    return {"reply": warning_msg or _step_question(current_step, params), "state": state}
+                params["sl"] = f"{sl_val}%"
+                cs["pending_sl_confirmation"] = None
+                cs["suggested_sl"] = None
+                params = _sync_strategy_from_periods(params)
+                state, cs, params = _sync_state(state, cs, params)
+                return _wizard_seq_tail_after_save(
+                    state,
+                    cs,
+                    params,
+                    current_step,
+                    summary_followup="\n\nVuoi avviare il bot adesso?",
+                )
+
+        confirmation = _extract_confirmation(user_text)
+        if confirmation is True:
+            pending_value = cs.get(pending_key)
+            logger.info("[WIZARD_SEQ_SAVE] step=%s value=%r", current_step, pending_value)
+            if current_step == "risk_pct":
+                params["risk_pct"] = float(str(pending_value).replace("%", "").replace(",", "."))
+                cs["pending_risk_confirmation"] = None
+            elif current_step == "leverage":
+                params["leverage"] = int(float(pending_value))
+                cs["pending_leverage_confirmation"] = None
+            elif current_step == "sl":
+                sl_val = float(str(pending_value).replace("%", "").replace(",", "."))
+                params["sl"] = f"{sl_val}%"
+                cs["pending_sl_confirmation"] = None
+                cs["suggested_sl"] = None
+            params = _sync_strategy_from_periods(params)
+            state, cs, params = _sync_state(state, cs, params)
+            step = cs.get("step")
+            print(
+                "[POST_CONFIRM_CHECK]",
+                dict(params),
+                "complete:",
+                is_config_complete(params),
+                "step:",
+                step,
+            )
+            logger.info(
+                "[POST_CONFIRM_CHECK] params=%s complete=%s step=%s",
+                dict(params),
+                is_config_complete(params),
+                step,
+            )
+            return _wizard_seq_tail_after_save(
+                state,
+                cs,
+                params,
+                current_step,
+                summary_followup="\n\nVuoi avviare il bot adesso?",
+            )
+        elif confirmation is False:
+            cs[pending_key] = None
+            if current_step == "sl":
+                cs["suggested_sl"] = None
+            logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": _step_question(current_step, params), "state": state}
+        else:
+            if current_step == "risk_pct":
+                _, warning_msg = _check_risk_warning(float(cs.get("pending_risk_confirmation")), params.get("market_type", "futures"))
+            elif current_step == "leverage":
+                _, warning_msg = _check_leverage_warning(int(float(cs.get("pending_leverage_confirmation"))), params.get("symbol") or "questa coppia")
+            else:
+                _, warning_msg, _ = _check_sl_warning(float(cs.get("pending_sl_confirmation")))
+            logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": warning_msg or _step_question(current_step, params), "state": state}
+
+    extracted_value = _extract_step_value(user_text, current_step, params)
+    if extracted_value is None:
+        logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": _step_question(current_step, params), "state": state}
+
+    is_valid, error_msg, _warning_msg = _validate_step_value(current_step, extracted_value, params)
+    if not is_valid:
+        logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": (error_msg or _step_question(current_step, params)), "state": state}
+
+    if current_step == "risk_pct":
+        risk_value = float(str(extracted_value).replace("%", "").replace(",", "."))
+        requires_confirm, warning_msg = _check_risk_warning(risk_value, params.get("market_type", "futures"))
+        if requires_confirm:
+            cs["pending_risk_confirmation"] = risk_value
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": warning_msg or _step_question(current_step, params), "state": state}
+        params["risk_pct"] = risk_value
+    elif current_step == "leverage":
+        lev_int = int(float(extracted_value))
+        requires_confirm, warning_msg = _check_leverage_warning(lev_int, params.get("symbol") or "questa coppia")
+        if requires_confirm:
+            cs["pending_leverage_confirmation"] = lev_int
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": warning_msg or _step_question(current_step, params), "state": state}
+        params["leverage"] = lev_int
+    elif current_step == "sl":
+        sl_val = float(str(extracted_value).replace("%", "").replace(",", "."))
+        requires_confirm, warning_msg, suggested_sl = _check_sl_warning(sl_val)
+        if requires_confirm:
+            cs["pending_sl_confirmation"] = sl_val
+            cs["suggested_sl"] = suggested_sl
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": warning_msg or _step_question(current_step, params), "state": state}
+        params["sl"] = f"{sl_val}%"
+        cs["pending_sl_confirmation"] = None
+        cs["suggested_sl"] = None
+    elif current_step == "tp":
+        patch_result = apply_config_patch(cs, {"tp": extracted_value})
+        if not patch_result.get("ok", True):
+            logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": patch_result.get("message", _step_question(current_step, params)), "state": state}
+        params = cs["params"].copy()
+    elif current_step == "symbol":
+        patch_result = apply_config_patch(cs, {"symbol": extracted_value})
+        if not patch_result.get("ok", True):
+            logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": patch_result.get("message", _step_question(current_step, params)), "state": state}
+        params = cs["params"].copy()
+    elif current_step == "timeframe":
+        patch_result = apply_config_patch(cs, {"timeframe": extracted_value})
+        if not patch_result.get("ok", True):
+            logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": patch_result.get("message", _step_question(current_step, params)), "state": state}
+        params = cs["params"].copy()
+    elif current_step == "operating_mode":
+        params = _apply_operating_mode_preset(params, str(extracted_value))
+    elif current_step == "market_type":
+        params["market_type"] = extracted_value
+        if extracted_value == "spot":
+            params["leverage"] = None
+            cs["pending_leverage_confirmation"] = None
+    else:
+        params[current_step] = extracted_value
+
+    logger.info("[WIZARD_SEQ_SAVE] step=%s value=%r", current_step, extracted_value)
+    state, cs, params = _sync_state(state, cs, params)
+
+    return _wizard_seq_tail_after_save(
+        state,
+        cs,
+        params,
+        current_step,
+        summary_followup="\n\nVuoi avviare il bot adesso?",
+    )
+
 def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str, str]], system_prompt: str = "") -> Dict[str, Any]:
     """
     FSM sequenziale: garantisce SEMPRE la stessa sequenza e UNA domanda alla volta.
     Sequenza: market_type → symbol → timeframe → operating_mode → sl → tp → risk_pct → leverage (solo futures)
     """
+    user_lower_global = user_text.strip().lower()
+    global_reset_commands = {
+        "resetta",
+        "reset",
+        "resetta configurazione",
+        "reset configurazione",
+        "ricomincia",
+        "nuova configurazione",
+    }
+    if user_lower_global in global_reset_commands or "reset configurazione" in user_lower_global:
+        state = _ensure_state(state)
+        state["config_status"] = "in_progress"
+        state["config_state"] = {
+            "step": "market_type",
+            "params": copy.deepcopy(DEFAULT_PARAMS),
+            "error_count": {},
+            "pending_risk_confirmation": None,
+            "pending_leverage_confirmation": None,
+            "pending_sl_confirmation": None,
+            "suggested_sl": None,
+        }
+        state.pop("params", None)
+        return {
+            "reply": _step_question("market_type", {}),
+            "state": state,
+        }
+    return _wizard_seq_handle_message(user_text, state, history, system_prompt)
     reply = ""
     orch_error_code: Optional[str] = None
     wizard_parallel_errors: Dict[str, str] = {}
@@ -2970,11 +4183,11 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
 
             # 2) Registra TUTTI i parametri rischiosi in pending (nessun return nel loop).
             if requires_confirmation_list:
-                reply_parts: List[str] = []
+                _clear_pending_confirmation_batch(cs)
                 for param_name in list(updates.keys()):
                     if param_name not in requires_confirmation_list:
                         continue
-                    confirmation_msg, suggested_value, new_value = requires_confirmation_list[param_name]
+                    _, suggested_value, new_value = requires_confirmation_list[param_name]
                     if param_name == "risk_pct":
                         try:
                             cs["pending_risk_confirmation"] = float(
@@ -2989,15 +4202,11 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     elif param_name == "sl":
                         cs["pending_sl_confirmation"] = float(str(new_value).replace("%", "").replace(",", "."))
                         cs["suggested_sl"] = suggested_value
-                    if confirmation_msg:
-                        reply_parts.append(confirmation_msg)
+
+                logger.info("[PENDING_BATCH_SET] pending=%s", _pending_batch_snapshot(cs))
 
                 state, cs, params = _sync_state(state, cs, params)
-                reply = (
-                    "\n\n".join(reply_parts)
-                    if reply_parts
-                    else "Conferma i valori proposti prima di procedere."
-                )
+                reply = _build_pending_batch_confirmation_prompt(cs)
                 if errors:
                     reply += "\n\nNon ho potuto applicare:\n" + "\n".join(
                         f"• {err}" for err in errors.values()
@@ -3227,6 +4436,80 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
     
     # Priorità pending conferma: prima del ramo CONFIG COMPLETE (evita che "sì confermo" finisca nel riepilogo generico)
     empathetic_response = _detect_empathetic_phrase(user_text)
+    pending_batch = _pending_batch_snapshot(cs)
+    if pending_batch:
+        amb = _ambiguous_modify_confirm_clarification(user_text, params, pending_batch)
+        if amb:
+            state, cs, params = _sync_state(state, cs, params)
+            reply = amb
+            if empathetic_response:
+                reply = empathetic_response + " " + reply
+            return {"reply": reply, "state": state}
+        merged_params, merged_pending = resolve_input(params, pending_batch, user_text)
+        applied_something = merged_params != params or merged_pending != pending_batch
+        if applied_something:
+            logger.info(
+                "[PENDING_RESOLVE_APPLY] pending_before=%s pending_after=%s",
+                pending_batch,
+                merged_pending,
+            )
+            params = merged_params
+            cs["pending_sl_confirmation"] = merged_pending.get("sl")
+            cs["pending_risk_confirmation"] = merged_pending.get("risk_pct")
+            cs["pending_leverage_confirmation"] = merged_pending.get("leverage")
+            if "sl" not in merged_pending:
+                cs["suggested_sl"] = None
+
+            params = _sync_strategy_from_periods(params)
+            cs["params"] = params
+            step = cs.get("step")
+            complete_ok = is_config_complete(params)
+            print("[POST_CONFIRM_CHECK]", dict(params), "complete:", complete_ok, "step:", step)
+            logger.info(
+                "[POST_CONFIRM_CHECK] params=%s complete=%s step=%s",
+                dict(params),
+                complete_ok,
+                step,
+            )
+            if complete_ok:
+                state["config_status"] = "complete"
+                _cleanup_config_state_when_complete(cs)
+                cs["step"] = None
+                state["step"] = None
+                state, cs, params = _sync_state(state, cs, params)
+                return {
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params) + "\n\nVuoi avviare il bot adesso?",
+                    "state": state,
+                }
+            next_step = _get_next_step(current_step, params, cs)
+            if next_step is None:
+                state["config_status"] = "complete"
+                _cleanup_config_state_when_complete(cs)
+                cs["step"] = None
+                state["step"] = None
+                state, cs, params = _sync_state(state, cs, params)
+                return {
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params) + "\n\nVuoi avviare il bot adesso?",
+                    "state": state,
+                }
+            cs["step"] = next_step
+            state, cs, params = _sync_state(state, cs, params)
+            reply = _step_question(next_step, params)
+            if empathetic_response:
+                reply = empathetic_response + " " + reply
+            return {"reply": reply, "state": state}
+        if re.search(r"\bconferm\w*\b", user_text.strip().lower(), re.I):
+            state, cs, params = _sync_state(state, cs, params)
+            reply = "Mi dici cosa vuoi confermare esattamente? (es. 'confermo leva' o 'confermo sl')"
+            if empathetic_response:
+                reply = empathetic_response + " " + reply
+            return {"reply": reply, "state": state}
+        if len(pending_batch) > 1:
+            state, cs, params = _sync_state(state, cs, params)
+            reply = _build_pending_batch_confirmation_prompt(cs)
+            if empathetic_response and empathetic_response.lower() not in reply.lower():
+                reply = empathetic_response + " " + reply
+            return {"reply": reply, "state": state}
 
     # Leva prima del rischio: input tipo "7x" (BUG3) non deve restare bloccato da pending_risk stale
     # Spot: nessun flusso leva (né pending né domanda)
@@ -3280,7 +4563,11 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         confirmation = _extract_confirmation(user_text)
 
         if confirmation is True:
-            _flush_all_high_risk_pending_to_params(cs, params)
+            try:
+                params["leverage"] = int(float(pending_lev))
+            except (TypeError, ValueError):
+                params["leverage"] = pending_lev
+            cs["pending_leverage_confirmation"] = None
             next_step = _get_next_step(current_step, params, cs)
             if next_step is None:
                 state["config_status"] = "complete"
@@ -3414,7 +4701,16 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         confirmation = _extract_confirmation(user_text)
 
         if confirmation is True:
-            _flush_all_high_risk_pending_to_params(cs, params)
+            try:
+                params["risk_pct"] = float(pending_risk)
+            except (TypeError, ValueError):
+                params["risk_pct"] = pending_risk
+            cs["pending_risk_confirmation"] = None
+            _ec = cs.get("error_count")
+            if isinstance(_ec, dict):
+                _ec2 = dict(_ec)
+                _ec2.pop("risk_pct", None)
+                cs["error_count"] = _ec2
             next_step = _get_next_step(current_step, params, cs)
             if next_step is None:
                 state["config_status"] = "complete"
@@ -3566,12 +4862,9 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         pending_str = str(int(pending_sl)) if pending_sl == int(pending_sl) else str(pending_sl)
         confirm_extreme = any(phrase in lt for phrase in ["confermo", "lascialo così", "mantieni", "tieni", f"confermo {pending_str}", f"{pending_str}%"])
         if confirm_extreme or _extract_confirmation(user_text) is True:
-            if _extract_confirmation(user_text) is True:
-                _flush_all_high_risk_pending_to_params(cs, params)
-            else:
-                params["sl"] = f"{pending_sl}%"
-                cs["pending_sl_confirmation"] = None
-                cs["suggested_sl"] = None
+            params["sl"] = f"{pending_sl}%"
+            cs["pending_sl_confirmation"] = None
+            cs["suggested_sl"] = None
             next_step = _get_next_step(current_step, params, cs)
             if next_step is None:
                 state["config_status"] = "complete"
@@ -3654,7 +4947,10 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         # Se non è una richiesta di modifica riconosciuta, ma la configurazione è completa,
         # mostra il riepilogo e chiedi se vuole modificare o avviare
         # NON dire mai "non posso modificare" o "devi crearne una nuova"
-        _commit_pending_risk_or_leverage_on_confirm(user_text, cs, params)
+        amb_commit = _commit_pending_risk_or_leverage_on_confirm(user_text, cs, params)
+        if amb_commit:
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": amb_commit, "state": state}
         params = _sync_strategy_from_periods(params)
         state, cs, params = _sync_state(state, cs, params)
         return {
@@ -3711,7 +5007,10 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
     # Controlla se tutti i parametri sono compilati
     if _all_params_filled(params):
         # BUG3: commit pending rischio/leva prima di cleanup (evita pending azzerati senza scrivere params)
-        _commit_pending_risk_or_leverage_on_confirm(user_text, cs, params)
+        amb_commit = _commit_pending_risk_or_leverage_on_confirm(user_text, cs, params)
+        if amb_commit:
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": amb_commit, "state": state}
         state, cs, params = _sync_state(state, cs, params)
         # Marca la configurazione come COMPLETA (stato finale, non modificabile automaticamente)
         if state.get("config_status") != "complete":
@@ -3758,6 +5057,13 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             user_text, current_step, state, cs, params
         )
         state, cs, params = _sync_state(state, cs, params)
+
+    if current_step == "timeframe" and timeframe_pre_extracted_value is None:
+        # Caso richiesto: input non interpretabile come timeframe (es. "aggressiva").
+        # Non avanzare il wizard, mantieni step timeframe e ripeti solo la domanda timeframe.
+        cs["step"] = "timeframe"
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": _step_question("timeframe", params), "state": state}
 
     if current_step not in ("strategy", "strategy_params"):
         mw_extract = free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
@@ -4480,6 +5786,19 @@ def run(payload, state=None, history=None, system_prompt: str = ""):
             # Se è un oggetto, prova attributo message
             user_text = getattr(payload, "message", None) or getattr(payload, "user_input", None) or getattr(payload, "text", None)
     user_text = (user_text or "").strip()
+
+    # Guard globale ad alta priorita': reset configurazione da qualsiasi step.
+    if "reset configurazione" in user_text.lower():
+        base_state = copy.deepcopy(state) if isinstance(state, dict) else {}
+        config_state = copy.deepcopy(FORCE_FULL_RESET_CONFIG_STATE_SNAPSHOT)
+        config_state["__force_full_reset"] = True
+        base_state["config_state"] = config_state
+        base_state["config_status"] = "in_progress"
+        logger.info("[GLOBAL_RESET] reset configurazione intercettato in run(): __force_full_reset=True")
+        return {
+            "reply": "Configurazione resettata. Partiamo da capo: vuoi operare in Spot o in Futures?",
+            "state": base_state,
+        }
 
     result = handle_message(
         user_text=user_text,

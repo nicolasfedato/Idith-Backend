@@ -702,7 +702,7 @@ def validate_leverage_full(symbol: str, leverage: float, market_type: str) -> Tu
             # Avviso per 51-100
             warning = None
             if 51 <= leverage_int <= 100:
-                warning = f"Attenzione: stai usando una leva alta ({leverage_int}x). Assicurati di comprendere i rischi."
+                warning = f"⚠️ Attenzione: stai usando una leva alta ({leverage_int}x). Assicurati di comprendere i rischi."
             
             return (True, None, warning)
         except (ValueError, TypeError):
@@ -728,7 +728,7 @@ def validate_leverage_full(symbol: str, leverage: float, market_type: str) -> Tu
         
         if 51 <= leverage_int <= 100:
             warning = (
-                f"Attenzione: stai usando una leva alta ({leverage_int}x) per {symbol_normalized}. "
+                f"⚠️ Attenzione: stai usando una leva alta ({leverage_int}x) per {symbol_normalized}. "
                 "Le leve elevate aumentano significativamente il rischio. "
                 "Assicurati di comprendere i rischi prima di procedere."
             )
