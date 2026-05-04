@@ -632,7 +632,7 @@ def validate_stop_loss(value: Any) -> Tuple[bool, Optional[str]]:
     if val <= 0:
         return (False, "Lo stop loss deve essere maggiore di 0%.")
     if val > 100:
-        return (False, "Lo stop loss deve essere minore o uguale a 100%.")
+        return (False, "Stop loss non valido. Deve essere minore o uguale a 100%.")
     return (True, None)
 
 
