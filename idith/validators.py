@@ -569,25 +569,45 @@ def normalize_timeframe(tf: str) -> Optional[str]:
     return s
 
 
-def validate_timeframe(tf: str, valid_set: Optional[set[str]] = None) -> Tuple[bool, Optional[str]]:
+def validate_timeframe(value: str, valid_set: Optional[set[str]] = None) -> Tuple[bool, Optional[str]]:
     """
     Valida che il timeframe sia supportato da Bybit.
     Usa normalize_timeframe per alias (es. "60", "1h", "giornaliero") poi verifica contro allowed.
     Valori non in whitelist (es. "7m", "17m") vengono rifiutati.
     """
-    if not tf:
+    if not value:
         return (False, "Il timeframe non può essere vuoto.")
     valid_tfs = valid_set if valid_set is not None else VALID_TIMEFRAMES
-    tf_normalized = normalize_timeframe(tf)
+    tf_normalized = normalize_timeframe(value)
     if tf_normalized is None:
-        tf_normalized = tf.strip().lower()
+        tf_normalized = value.strip().lower()
     if not any(tf_normalized.endswith(unit) for unit in ["m", "h", "d", "w"]):
         examples_str = ", ".join(sorted(valid_tfs, key=lambda x: (int(x[:-1]) if x[:-1].isdigit() else 999, x[-1])))
-        return (False, f"Il timeframe '{tf}' non è nel formato corretto. Valori supportati: {examples_str}. Inserisci uno di questi valori.")
+        return (False, f"Il timeframe '{value}' non è nel formato corretto. Valori supportati: {examples_str}. Inserisci uno di questi valori.")
     if tf_normalized not in valid_tfs:
         examples_str = ", ".join(sorted(valid_tfs, key=lambda x: (int(x[:-1]) if x[:-1].isdigit() else 999, x[-1])))
-        return (False, f"Il timeframe '{tf}' non esiste su Bybit. Timeframe validi: {examples_str}. Inserisci uno di questi valori esatti.")
+        return (False, f"Il timeframe '{value}' non esiste su Bybit. Timeframe validi: {examples_str}. Inserisci uno di questi valori esatti.")
     return (True, None)
+
+
+def validate_stop_loss(value: Any) -> Tuple[bool, Optional[str]]:
+    try:
+        val = float(str(value).replace("%", ""))
+        if val <= 0:
+            return (False, "Lo stop loss deve essere un numero positivo.")
+        return (True, None)
+    except (ValueError, TypeError):
+        return (False, "Lo stop loss deve essere un numero.")
+
+
+def validate_take_profit(value: Any) -> Tuple[bool, Optional[str]]:
+    try:
+        val = float(str(value).replace("%", ""))
+        if val <= 0:
+            return (False, "Il take profit deve essere un numero positivo.")
+        return (True, None)
+    except (ValueError, TypeError):
+        return (False, "Il take profit deve essere un numero.")
 
 
 def parse_positive_int(raw: str, field_name: str, min_v: int, max_v: int) -> int:
@@ -632,7 +652,7 @@ def validate_leverage_range(leverage: int, max_leverage: int) -> None:
         )
 
 
-def validate_leverage(lev: float, minLev: float, maxLev: float) -> Tuple[bool, Optional[str]]:
+def _validate_leverage_min_max(lev: float, minLev: float, maxLev: float) -> Tuple[bool, Optional[str]]:
     """
     Valida la leva rispetto ai limiti min/max.
     
@@ -701,6 +721,47 @@ def validate_leverage(lev: float, minLev: float, maxLev: float) -> Tuple[bool, O
     
     # Valido (anche se alto, è consentito)
     return (True, None)
+
+
+def validate_leverage(*args: Any) -> Tuple[bool, Optional[str]]:
+    """
+    - Legacy: validate_leverage(lev, minLev, maxLev) — tre argomenti numerici.
+    - Wizard/orchestrator: validate_leverage(value, market_type, min_lev, max_lev) con market_type 'futures'.
+    - validate_leverage(value, market_type) oppure validate_leverage(value): controllo generico 1–100x (futures).
+    """
+    if len(args) == 3:
+        return _validate_leverage_min_max(float(args[0]), float(args[1]), float(args[2]))
+    if len(args) == 4:
+        value, market_type, min_lev, max_lev = args[0], args[1], args[2], args[3]
+        if market_type != "futures":
+            return (
+                False,
+                "La leva non è disponibile per il trading spot. La leva è disponibile solo per futures.",
+            )
+        try:
+            lev_f = float(value)
+        except (ValueError, TypeError):
+            return (False, "La leva deve essere un numero.")
+        return _validate_leverage_min_max(lev_f, float(min_lev), float(max_lev))
+    if len(args) == 2:
+        value, market_type = args[0], args[1]
+        if market_type == "spot":
+            return (
+                False,
+                "La leva non è disponibile per il trading spot. La leva è disponibile solo per futures.",
+            )
+        try:
+            lev_f = float(value)
+        except (ValueError, TypeError):
+            return (False, "La leva deve essere un numero.")
+        return _validate_leverage_min_max(lev_f, 1.0, 100.0)
+    if len(args) == 1:
+        try:
+            lev_f = float(args[0])
+        except (ValueError, TypeError):
+            return (False, "La leva deve essere un numero.")
+        return _validate_leverage_min_max(lev_f, 1.0, 100.0)
+    return (False, "Argomenti non validi per la validazione della leva.")
 
 
 def validate_indicator_period(indicator: str, period: int) -> Tuple[bool, Optional[str]]:
@@ -912,7 +973,7 @@ def validate_leverage_full(symbol: str, leverage: float, market_type: str) -> Tu
             )
     
     # Valida usando limiti
-    is_valid, error_msg = validate_leverage(leverage, minLev, maxLev)
+    is_valid, error_msg = _validate_leverage_min_max(leverage, minLev, maxLev)
     if not is_valid:
         return (False, error_msg, None)
     
