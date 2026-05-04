@@ -590,24 +590,61 @@ def validate_timeframe(value: str, valid_set: Optional[set[str]] = None) -> Tupl
     return (True, None)
 
 
-def validate_stop_loss(value: Any) -> Tuple[bool, Optional[str]]:
+_LEVERAGE_INVALID_MSG = "Leva non valida. Inserisci un valore tra 1x e 50x."
+
+
+def _parse_sl_tp_percent(value: Any) -> Optional[float]:
+    """Estrae una percentuale come float da input tipo 2, 2%, 2.5, 2,5%."""
+    if value is None:
+        return None
+    s = str(value).strip().replace("%", "").replace(",", ".")
+    if not s:
+        return None
     try:
-        val = float(str(value).replace("%", ""))
-        if val <= 0:
-            return (False, "Lo stop loss deve essere un numero positivo.")
-        return (True, None)
+        return float(s)
     except (ValueError, TypeError):
-        return (False, "Lo stop loss deve essere un numero.")
+        return None
+
+
+def _parse_futures_leverage_int(value: Any) -> Optional[int]:
+    """Normalizza leva futures: 10, 10x, 5x → intero; None se non valido."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.lower().endswith("x"):
+        s = s[:-1].strip()
+    s = s.replace(",", ".")
+    try:
+        f = float(s)
+    except (ValueError, TypeError):
+        return None
+    if f != int(f):
+        return None
+    return int(f)
+
+
+def validate_stop_loss(value: Any) -> Tuple[bool, Optional[str]]:
+    val = _parse_sl_tp_percent(value)
+    if val is None:
+        return (False, "Stop loss non valido. Inserisci una percentuale valida.")
+    if val <= 0:
+        return (False, "Lo stop loss deve essere maggiore di 0%.")
+    if val > 100:
+        return (False, "Lo stop loss deve essere minore o uguale a 100%.")
+    return (True, None)
 
 
 def validate_take_profit(value: Any) -> Tuple[bool, Optional[str]]:
-    try:
-        val = float(str(value).replace("%", ""))
-        if val <= 0:
-            return (False, "Il take profit deve essere un numero positivo.")
-        return (True, None)
-    except (ValueError, TypeError):
-        return (False, "Il take profit deve essere un numero.")
+    val = _parse_sl_tp_percent(value)
+    if val is None:
+        return (False, "Take profit non valido. Inserisci una percentuale valida.")
+    if val <= 0:
+        return (False, "Il take profit deve essere maggiore di 0%.")
+    if val > 100:
+        return (False, "Il take profit deve essere minore o uguale a 100%.")
+    return (True, None)
 
 
 def parse_positive_int(raw: str, field_name: str, min_v: int, max_v: int) -> int:
@@ -668,41 +705,21 @@ def _validate_leverage_min_max(lev: float, minLev: float, maxLev: float) -> Tupl
     
     REGOLE STRICT PER FUTURES:
     - La leva DEVE essere un numero intero
-    - Range consentito: minimo 1, massimo 100
-    - Se > 100 → INVALIDO (non accettare, non chiedere conferma)
-    - Se 51-100 → valido ma warning (gestito separatamente)
-    - Se 1-50 → valido senza warning
+    - Range consentito globalmente: 1–50x
+    - Verifica aggiuntiva rispetto ai limiti min/max del simbolo
     """
     try:
         leverage_float = float(lev)
     except (ValueError, TypeError):
-        return (
-            False,
-            f"La leva deve essere un numero."
-        )
+        return (False, _LEVERAGE_INVALID_MSG)
     
-    # Verifica che sia un intero
     if leverage_float != int(leverage_float):
-        return (
-            False,
-            f"La leva deve essere un numero intero."
-        )
+        return (False, _LEVERAGE_INVALID_MSG)
     
     leverage_int = int(leverage_float)
     
-    if leverage_int <= 0:
-        return (
-            False,
-            f"La leva deve essere un numero positivo."
-        )
-    
-    # REGOLA RIGIDA: Bybit Futures consente massimo 100x
-    if leverage_int > 100:
-        return (
-            False,
-            f"La leva {leverage_int}x supera il massimo consentito su Bybit Futures (100x). "
-            f"Bybit non consente leve superiori a 100. Inserisci un valore tra 1x e 100x."
-        )
+    if leverage_int <= 0 or leverage_int > 50:
+        return (False, _LEVERAGE_INVALID_MSG)
     
     # Verifica rispetto ai limiti del simbolo (se disponibili)
     if leverage_int < minLev:
@@ -727,10 +744,13 @@ def validate_leverage(*args: Any) -> Tuple[bool, Optional[str]]:
     """
     - Legacy: validate_leverage(lev, minLev, maxLev) — tre argomenti numerici.
     - Wizard/orchestrator: validate_leverage(value, market_type, min_lev, max_lev) con market_type 'futures'.
-    - validate_leverage(value, market_type) oppure validate_leverage(value): controllo generico 1–100x (futures).
+    - validate_leverage(value, market_type) oppure validate_leverage(value): controllo generico 1–50x (futures).
     """
     if len(args) == 3:
-        return _validate_leverage_min_max(float(args[0]), float(args[1]), float(args[2]))
+        lev_int = _parse_futures_leverage_int(args[0])
+        if lev_int is None or lev_int <= 0 or lev_int > 50:
+            return (False, _LEVERAGE_INVALID_MSG)
+        return _validate_leverage_min_max(float(lev_int), float(args[1]), float(args[2]))
     if len(args) == 4:
         value, market_type, min_lev, max_lev = args[0], args[1], args[2], args[3]
         if market_type != "futures":
@@ -738,29 +758,23 @@ def validate_leverage(*args: Any) -> Tuple[bool, Optional[str]]:
                 False,
                 "La leva non è disponibile per il trading spot. La leva è disponibile solo per futures.",
             )
-        try:
-            lev_f = float(value)
-        except (ValueError, TypeError):
-            return (False, "La leva deve essere un numero.")
-        return _validate_leverage_min_max(lev_f, float(min_lev), float(max_lev))
+        lev_int = _parse_futures_leverage_int(value)
+        if lev_int is None or lev_int <= 0 or lev_int > 50:
+            return (False, _LEVERAGE_INVALID_MSG)
+        return _validate_leverage_min_max(float(lev_int), float(min_lev), float(max_lev))
     if len(args) == 2:
         value, market_type = args[0], args[1]
         if market_type == "spot":
-            return (
-                False,
-                "La leva non è disponibile per il trading spot. La leva è disponibile solo per futures.",
-            )
-        try:
-            lev_f = float(value)
-        except (ValueError, TypeError):
-            return (False, "La leva deve essere un numero.")
-        return _validate_leverage_min_max(lev_f, 1.0, 100.0)
+            return (True, None)
+        lev_int = _parse_futures_leverage_int(value)
+        if lev_int is None or lev_int <= 0 or lev_int > 50:
+            return (False, _LEVERAGE_INVALID_MSG)
+        return _validate_leverage_min_max(float(lev_int), 1.0, 50.0)
     if len(args) == 1:
-        try:
-            lev_f = float(args[0])
-        except (ValueError, TypeError):
-            return (False, "La leva deve essere un numero.")
-        return _validate_leverage_min_max(lev_f, 1.0, 100.0)
+        lev_int = _parse_futures_leverage_int(args[0])
+        if lev_int is None or lev_int <= 0 or lev_int > 50:
+            return (False, _LEVERAGE_INVALID_MSG)
+        return _validate_leverage_min_max(float(lev_int), 1.0, 50.0)
     return (False, "Argomenti non validi per la validazione della leva.")
 
 
