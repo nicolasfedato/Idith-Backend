@@ -10,7 +10,9 @@ import os
 import re
 import json
 import logging
-from typing import Optional, Tuple, Dict, Any
+import tempfile
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Any, FrozenSet
 from urllib import request, error
 from urllib.parse import urlencode
 from dotenv import load_dotenv
@@ -77,6 +79,225 @@ _symbol_cache: Dict[str, set] = {
 
 _leverage_cache: Dict[str, Optional[Tuple[float, float]]] = {}  # symbol -> (min_leverage, max_leverage)
 
+# Whitelist minima se Bybit non risponde e non c'è cache su disco (es. Railway + 403 CloudFront)
+_SYMBOL_WHITELIST_USDT: FrozenSet[str] = frozenset(
+    {
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "XRPUSDT",
+        "ADAUSDT",
+        "DOGEUSDT",
+        "AVAXUSDT",
+        "LINKUSDT",
+        "LTCUSDT",
+        "TRXUSDT",
+    }
+)
+
+_INVALID_PAIR_USER_MSG = (
+    "Coppia non valida. Inserisci una coppia USDT valida, ad esempio BTCUSDT o SOLUSDT."
+)
+
+_SYMBOLS_CACHE_PATH = Path(__file__).resolve().parent / "bybit_symbols_cache.json"
+
+
+def _try_fetch_bybit_instruments(market_type: str) -> Optional[set]:
+    """
+    Scarica la lista reale da Bybit mainnet (public REST).
+    Ritorna simboli TRADING *USDT, oppure None se la richiesta fallisce (403, timeout, rete, payload invalido).
+    """
+    if market_type not in ("spot", "futures"):
+        return None
+
+    valid_symbols: set[str] = set()
+    category = "spot" if market_type == "spot" else "linear"
+    cursor = ""
+
+    try:
+        while True:
+            params: Dict[str, str] = {"category": category, "limit": "1000"}
+            if cursor:
+                params["cursor"] = cursor
+            api_url = (
+                "https://api.bybit.com/v5/market/instruments-info?"
+                + urlencode(params)
+            )
+            req = request.Request(
+                api_url,
+                headers={
+                    "User-Agent": "Idith/1.0 (symbol-validation; +https://api.bybit.com)",
+                    "Accept": "application/json",
+                },
+                method="GET",
+            )
+            with request.urlopen(req, timeout=15) as resp:
+                http_status = getattr(resp, "status", None) or resp.getcode()
+                payload = resp.read().decode("utf-8")
+            response = json.loads(payload)
+            ret_code = response.get("retCode")
+            ret_msg = response.get("retMsg")
+            preview = payload[:300].replace("\n", " ")
+
+            if ret_code not in (0, None, "0"):
+                logger.warning(
+                    "[BYBIT_SYMBOL_FETCH] unexpected retCode market_type=%s retCode=%s retMsg=%s",
+                    market_type,
+                    ret_code,
+                    ret_msg,
+                )
+                return None
+
+            result = response.get("result", {})
+            if not isinstance(result, dict):
+                return None
+
+            instruments = result.get("list", [])
+            if not isinstance(instruments, list):
+                return None
+
+            page_n = len(instruments)
+
+            for inst in instruments:
+                if not isinstance(inst, dict):
+                    continue
+                sym = inst.get("symbol", "").upper()
+                if sym.endswith("USDT") and sym:
+                    status = inst.get("status", "").upper()
+                    if status == "TRADING":
+                        valid_symbols.add(sym)
+
+            logger.info(
+                "[BYBIT_SYMBOL_FETCH] market_type=%s url=%s http_status=%s retCode=%s retMsg=%s "
+                "response_head_300=%r page_instruments=%s cumulative_trading_usdt=%s",
+                market_type,
+                api_url,
+                http_status,
+                ret_code,
+                ret_msg,
+                preview,
+                page_n,
+                len(valid_symbols),
+            )
+
+            cursor = (result.get("nextPageCursor") or "").strip()
+            if not cursor:
+                break
+
+        logger.info(
+            "[BYBIT_SYMBOL_FETCH] done market_type=%s total_trading_usdt_symbols=%s",
+            market_type,
+            len(valid_symbols),
+        )
+        return valid_symbols
+
+    except Exception as e:
+        logger.warning(
+            "[BYBIT_SYMBOL_FETCH] FAILED market_type=%s err_type=%s err=%r",
+            market_type,
+            type(e).__name__,
+            e,
+        )
+        if isinstance(e, error.HTTPError):
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                err_body = "<unreadable>"
+            logger.warning(
+                "[BYBIT_SYMBOL_FETCH] HTTPError code=%s body_head_300=%r",
+                e.code,
+                err_body,
+            )
+        return None
+
+
+def _load_symbols_from_disk_cache(market_type: str) -> Optional[set]:
+    """Legge bybit_symbols_cache.json per il mercato richiesto."""
+    path = _SYMBOLS_CACHE_PATH
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("[BYBIT_SYMBOL_CACHE] read failed path=%s err=%r", path, e)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    key = "spot" if market_type == "spot" else "futures"
+    lst = raw.get(key)
+    if not isinstance(lst, list) or not lst:
+        return None
+    out: set[str] = set()
+    for x in lst:
+        if isinstance(x, str):
+            s = x.strip().upper()
+            if s.endswith("USDT"):
+                out.add(s)
+    return out or None
+
+
+def _persist_symbols_to_disk(market_type: str, symbols: set[str]) -> None:
+    """Aggiorna JSON locale unendo con l'altro mercato già in file o in memoria."""
+    path = _SYMBOLS_CACHE_PATH
+    existing_spot: set[str] = set()
+    existing_futures: set[str] = set()
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for x in raw.get("spot", []) or []:
+                    if isinstance(x, str) and x.strip().upper().endswith("USDT"):
+                        existing_spot.add(x.strip().upper())
+                for x in raw.get("futures", []) or []:
+                    if isinstance(x, str) and x.strip().upper().endswith("USDT"):
+                        existing_futures.add(x.strip().upper())
+        except Exception as e:
+            logger.warning("[BYBIT_SYMBOL_CACHE] merge read failed err=%r", e)
+
+    if market_type == "spot":
+        merged_spot = set(symbols)
+        merged_futures = existing_futures or set(_symbol_cache.get("futures") or ())
+    else:
+        merged_futures = set(symbols)
+        merged_spot = existing_spot or set(_symbol_cache.get("spot") or ())
+
+    payload: Dict[str, Any] = {}
+    if merged_spot:
+        payload["spot"] = sorted(merged_spot)
+    if merged_futures:
+        payload["futures"] = sorted(merged_futures)
+    if not payload:
+        return
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            suffix=".json",
+            prefix="bybit_symbols_",
+            dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        logger.info(
+            "[BYBIT_SYMBOL_CACHE] saved path=%s spot=%s futures=%s",
+            path,
+            len(merged_spot),
+            len(merged_futures),
+        )
+    except Exception as e:
+        logger.warning("[BYBIT_SYMBOL_CACHE] save failed path=%s err=%r", path, e)
+
 
 def fetch_valid_symbols(market_type: str) -> set:
     """
@@ -89,105 +310,37 @@ def fetch_valid_symbols(market_type: str) -> set:
 
 def _fetch_valid_symbols_internal(market_type: str) -> set:
     """
-    Recupera i simboli validi da Bybit per il market_type specificato.
-    Usa cache per evitare troppe chiamate API.
+    Prova Bybit mainnet pubblico; se fallisce usa cache JSON locale; se assente whitelist minima.
+    Non solleva: il wizard non si blocca per 403/timeout se esiste fallback.
     """
     if market_type not in ["spot", "futures"]:
         return set()
-    
-    # Se cache è vuota, popola
-    if not _symbol_cache[market_type]:
-        try:
-            # Validazione simboli: usa SEMPRE endpoint pubblico MAINNET senza API key.
-            # Questa regola vale anche quando BYBIT_ENV=testnet.
-            valid_symbols = set()
-            category = "spot" if market_type == "spot" else "linear"
-            cursor = ""
-            while True:
-                params: Dict[str, str] = {"category": category, "limit": "1000"}
-                if cursor:
-                    params["cursor"] = cursor
-                api_url = (
-                    "https://api.bybit.com/v5/market/instruments-info?"
-                    + urlencode(params)
-                )
-                req = request.Request(
-                    api_url,
-                    headers={
-                        # Evita 403 da WAF che blocca il default User-Agent di Python-urllib.
-                        "User-Agent": "Idith/1.0 (symbol-validation; +https://api.bybit.com)",
-                        "Accept": "application/json",
-                    },
-                    method="GET",
-                )
-                with request.urlopen(req, timeout=15) as resp:
-                    http_status = getattr(resp, "status", None) or resp.getcode()
-                    payload = resp.read().decode("utf-8")
-                response = json.loads(payload)
-                ret_code = response.get("retCode")
-                ret_msg = response.get("retMsg")
-                preview = payload[:300].replace("\n", " ")
 
-                result = response.get("result", {})
-                instruments = result.get("list", [])
-                page_n = len(instruments)
+    if _symbol_cache[market_type]:
+        return _symbol_cache[market_type]
 
-                for inst in instruments:
-                    symbol = inst.get("symbol", "").upper()
-                    # Filtra solo coppie USDT
-                    if symbol.endswith("USDT") and symbol:
-                        # Verifica che lo strumento sia disponibile per il trading
-                        status = inst.get("status", "").upper()
-                        if status == "TRADING":
-                            valid_symbols.add(symbol)
+    live = _try_fetch_bybit_instruments(market_type)
+    if live:
+        _symbol_cache[market_type] = live
+        _persist_symbols_to_disk(market_type, live)
+        return live
 
-                logger.info(
-                    "[BYBIT_SYMBOL_FETCH] market_type=%s url=%s http_status=%s retCode=%s retMsg=%s "
-                    "response_head_300=%r page_instruments=%s cumulative_trading_usdt=%s",
-                    market_type,
-                    api_url,
-                    http_status,
-                    ret_code,
-                    ret_msg,
-                    preview,
-                    page_n,
-                    len(valid_symbols),
-                )
+    from_disk = _load_symbols_from_disk_cache(market_type)
+    if from_disk:
+        _symbol_cache[market_type] = from_disk
+        logger.info(
+            "[BYBIT_SYMBOL_RESOLVE] using disk cache market_type=%s count=%s",
+            market_type,
+            len(from_disk),
+        )
+        return from_disk
 
-                cursor = (result.get("nextPageCursor") or "").strip()
-                if not cursor:
-                    break
-
-            logger.info(
-                "[BYBIT_SYMBOL_FETCH] done market_type=%s total_trading_usdt_symbols=%s",
-                market_type,
-                len(valid_symbols),
-            )
-            _symbol_cache[market_type] = valid_symbols
-
-        except Exception as e:
-            # Log completo in terminale / log collector; messaggio utente resta generico.
-            logger.exception(
-                "[BYBIT_SYMBOL_FETCH] FAILED market_type=%s err_type=%s err=%r",
-                market_type,
-                type(e).__name__,
-                e,
-            )
-            if isinstance(e, error.HTTPError):
-                try:
-                    err_body = e.read().decode("utf-8", errors="replace")[:300]
-                except Exception:
-                    err_body = "<unreadable>"
-                logger.error(
-                    "[BYBIT_SYMBOL_FETCH] HTTPError code=%s body_head_300=%r",
-                    e.code,
-                    err_body,
-                )
-            raise RuntimeError(
-                "In questo momento non riesco a verificare i simboli su Bybit. "
-                "Riprova tra poco."
-            ) from e
-    
+    _symbol_cache[market_type] = set(_SYMBOL_WHITELIST_USDT)
+    logger.warning(
+        "[BYBIT_SYMBOL_RESOLVE] using minimal whitelist market_type=%s count=%s",
+        market_type,
+        len(_SYMBOL_WHITELIST_USDT),
+    )
     return _symbol_cache[market_type]
 
 
@@ -384,30 +537,11 @@ def validate_symbol(symbol: str, market_type: str) -> Tuple[bool, Optional[str]]
             f"Tipo di mercato non valido: {market_type}. Deve essere 'spot' o 'futures'."
         )
     
-    # Recupera simboli validi da Bybit
-    try:
-        valid_symbols = _fetch_valid_symbols_internal(market_type)
-    except RuntimeError as e:
-        # Errore nella connessione a Bybit
-        return (False, str(e))
-    
-    # Verifica ESATTA corrispondenza (nessuna interpretazione)
+    valid_symbols = _fetch_valid_symbols_internal(market_type)
+
     if symbol_normalized not in valid_symbols:
-        # Costruisci messaggio di errore umano con esempi REALI (3-6 simboli)
-        import random
-        examples_list = list(valid_symbols)
-        if len(examples_list) > 6:
-            examples = random.sample(examples_list, 6)
-        else:
-            examples = examples_list[:6]
-        examples_str = ", ".join(examples) if examples else "Nessun esempio disponibile"
-        
-        return (
-            False,
-            f"La coppia '{symbol_normalized}' non esiste su Bybit {market_type.capitalize()}. "
-            f"Ricontrolla il simbolo e riprova (esempi validi: {examples_str})."
-        )
-    
+        return (False, _INVALID_PAIR_USER_MSG)
+
     return (True, None)
 
 
