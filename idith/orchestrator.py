@@ -1567,18 +1567,50 @@ def _ambiguous_modify_confirm_clarification(
     )
 
 
+def _append_pending_confirmation_remnant_to_error_reply(base_reply: str, cs: Dict[str, Any]) -> str:
+    """Dopo un errore di validazione, ricorda eventuali conferme ancora in attesa (non sovrascritte)."""
+    extras: List[str] = []
+    if cs.get("pending_sl_confirmation") is not None:
+        p = _fmt_pending_percent(cs["pending_sl_confirmation"])
+        extras.append(
+            f"Rimane in attesa la conferma dello Stop Loss {p}%. "
+            f"Confermi {p}% o vuoi indicare un altro valore valido?"
+        )
+    if cs.get("pending_risk_confirmation") is not None:
+        p = _fmt_pending_percent(cs["pending_risk_confirmation"])
+        extras.append(
+            f"Rimane in attesa la conferma del rischio {p}%. "
+            f"Confermi {p}% o vuoi indicare un altro valore valido?"
+        )
+    if cs.get("pending_leverage_confirmation") is not None:
+        try:
+            lev = int(float(cs["pending_leverage_confirmation"]))
+        except (TypeError, ValueError):
+            lev = cs["pending_leverage_confirmation"]
+        extras.append(
+            f"Rimane in attesa la conferma della leva {lev}x. "
+            f"Confermi {lev}x o vuoi indicare un altro valore valido?"
+        )
+    if not extras:
+        return (base_reply or "").strip()
+    base = (base_reply or "").strip()
+    if base:
+        return f"{base} {' '.join(extras)}".strip()
+    return " ".join(extras).strip()
+
+
 def resolve_input(
     params: Dict[str, Any],
     pending: Dict[str, Any],
     user_text: str,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
     """
     Merge deterministico tra modifiche esplicite e pending.
     Regole:
-    1) applica prima i valori espliciti (sl/tp/leverage/risk_pct)
+    1) applica prima i valori espliciti (sl/tp/leverage/risk_pct) solo se validi per quel campo
     2) applica poi solo le conferme esplicite per campo
     3) "confermo" generico non accetta nulla
-    4) pulisce pending solo per campi toccati
+    4) pulisce pending solo per campi toccati (mai per un explicit update respinto dalla validazione)
     """
     merged_params: Dict[str, Any] = dict(params or {})
     merged_pending: Dict[str, Any] = dict(pending or {})
@@ -1588,8 +1620,16 @@ def resolve_input(
     )
 
     touched_fields: set[str] = set()
+    validation_errors: List[str] = []
 
     for field, value in explicit_updates.items():
+        is_valid, error_msg, _ = _validate_step_value(field, value, merged_params)
+        if not is_valid:
+            if error_msg:
+                validation_errors.append(error_msg)
+            else:
+                validation_errors.append(f"Valore non valido per {field}.")
+            continue
         merged_params[field] = value
         touched_fields.add(field)
 
@@ -1601,7 +1641,7 @@ def resolve_input(
     for field in touched_fields:
         merged_pending.pop(field, None)
 
-    return merged_params, merged_pending
+    return merged_params, merged_pending, validation_errors
 
 
 def _flush_all_high_risk_pending_to_params(cs: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -1711,13 +1751,15 @@ def _commit_pending_risk_or_leverage_on_confirm(
     amb = _ambiguous_modify_confirm_clarification(user_text, params, pending_batch)
     if amb:
         return amb
-    merged_params, merged_pending = resolve_input(params, pending_batch, user_text)
+    merged_params, merged_pending, resolve_errors = resolve_input(params, pending_batch, user_text)
     params.update(merged_params)
     cs["pending_sl_confirmation"] = merged_pending.get("sl")
     cs["pending_risk_confirmation"] = merged_pending.get("risk_pct")
     cs["pending_leverage_confirmation"] = merged_pending.get("leverage")
     if "sl" not in merged_pending:
         cs["suggested_sl"] = None
+    if resolve_errors:
+        return _append_pending_confirmation_remnant_to_error_reply(" ".join(resolve_errors), cs)
     return None
 
 
@@ -3177,8 +3219,19 @@ def _wizard_seq_handle_message(
             if amb:
                 state, cs, params = _sync_state(state, cs, params)
                 return {"reply": amb, "state": state}
-            merged_params, merged_pending = resolve_input(params, pending_batch, user_text)
+            merged_params, merged_pending, resolve_errors = resolve_input(params, pending_batch, user_text)
             applied_something = merged_params != params or merged_pending != pending_batch
+            if resolve_errors:
+                params = merged_params
+                cs["pending_sl_confirmation"] = merged_pending.get("sl")
+                cs["pending_risk_confirmation"] = merged_pending.get("risk_pct")
+                cs["pending_leverage_confirmation"] = merged_pending.get("leverage")
+                if "sl" not in merged_pending:
+                    cs["suggested_sl"] = None
+                params = _sync_strategy_from_periods(params)
+                state, cs, params = _sync_state(state, cs, params)
+                reply = _append_pending_confirmation_remnant_to_error_reply(" ".join(resolve_errors), cs)
+                return {"reply": reply, "state": state}
             if applied_something:
                 logger.info(
                     "[PENDING_RESOLVE_APPLY] pending_before=%s pending_after=%s",
@@ -4112,7 +4165,8 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             # Qualsiasi errore di validazione: nessun apply, nessun pending (evita conferma con valori invalidi).
             if errors:
                 state, cs, params = _sync_state(state, cs, params)
-                return {"reply": " ".join(errors.values()), "state": state}
+                reply = _append_pending_confirmation_remnant_to_error_reply(" ".join(errors.values()), cs)
+                return {"reply": reply, "state": state}
 
             # 1) Applica subito tutti gli update che non richiedono conferma (stesso messaggio).
             patch_dict = {param_name: new_value for param_name, (_, new_value) in applied_updates.items()}
@@ -4412,8 +4466,22 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             if empathetic_response:
                 reply = empathetic_response + " " + reply
             return {"reply": reply, "state": state}
-        merged_params, merged_pending = resolve_input(params, pending_batch, user_text)
+        merged_params, merged_pending, resolve_errors = resolve_input(params, pending_batch, user_text)
         applied_something = merged_params != params or merged_pending != pending_batch
+        if resolve_errors:
+            params = merged_params
+            cs["pending_sl_confirmation"] = merged_pending.get("sl")
+            cs["pending_risk_confirmation"] = merged_pending.get("risk_pct")
+            cs["pending_leverage_confirmation"] = merged_pending.get("leverage")
+            if "sl" not in merged_pending:
+                cs["suggested_sl"] = None
+            params = _sync_strategy_from_periods(params)
+            cs["params"] = params
+            state, cs, params = _sync_state(state, cs, params)
+            reply = _append_pending_confirmation_remnant_to_error_reply(" ".join(resolve_errors), cs)
+            if empathetic_response:
+                reply = empathetic_response + " " + reply
+            return {"reply": reply.strip(), "state": state}
         if applied_something:
             logger.info(
                 "[PENDING_RESOLVE_APPLY] pending_before=%s pending_after=%s",
