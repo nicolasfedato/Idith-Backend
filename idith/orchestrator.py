@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 import os
@@ -1844,11 +1844,8 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
     
     # Validazione timeframe usando lista supportata da Bybit (STRICT)
     elif step == "timeframe":
-        market_type = params.get("market_type", "futures")  # Default a futures se non specificato
-        valid_tfs = validators.get_valid_timeframes(None, market_type)
-
         v = normalize_timeframe(value) or str(value).strip().lower()
-        is_valid, error_msg = validators.validate_timeframe(v, valid_tfs)
+        is_valid, error_msg = validators.validate_timeframe(v)
         if is_valid:
             return (True, None, None)
 
@@ -1868,7 +1865,7 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
             v2 = None
 
         if v2:
-            is_valid2, error_msg2 = validators.validate_timeframe(v2, valid_tfs)
+            is_valid2, error_msg2 = validators.validate_timeframe(v2)
             if is_valid2:
                 return (True, None, None)
             return (False, error_msg2, None)
@@ -1902,15 +1899,10 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
         
         maxLev = _leverage_max_for_params(params)
         minLev = 1
-        is_valid = True
-        error_msg: Optional[str] = None
-        try:
-            is_valid, error_msg = validators.validate_leverage(float(leverage_int), float(minLev), float(maxLev))
-        except Exception:
-            if leverage_int < minLev or leverage_int > maxLev:
-                is_valid = False
-                error_msg = f"La leva deve essere tra {minLev}x e {maxLev}x."
-        
+        is_valid, error_msg = validators.validate_leverage(
+            float(leverage_int), market_type, float(minLev), float(maxLev)
+        )
+
         if not is_valid:
             return (False, error_msg or "Valore di leva non valido.", None)
         
@@ -1945,39 +1937,17 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
     
     # Validazione sl (semplice, non richiede Bybit)
     elif step == "sl":
-        try:
-            val = float(str(value).replace("%", ""))
-            if val <= 0:
-                return (
-                    False,
-                    f"Lo stop loss deve essere un numero positivo.",
-                    None
-                )
-            return (True, None, None)
-        except (ValueError, TypeError):
-            return (
-                False,
-                f"Lo stop loss deve essere un numero.",
-                None
-            )
+        is_valid, error_msg = validators.validate_stop_loss(value)
+        if not is_valid:
+            return (False, error_msg, None)
+        return (True, None, None)
     
     # Validazione tp (semplice, non richiede Bybit)
     elif step == "tp":
-        try:
-            val = float(str(value).replace("%", ""))
-            if val <= 0:
-                return (
-                    False,
-                    f"Il take profit deve essere un numero positivo.",
-                    None
-                )
-            return (True, None, None)
-        except (ValueError, TypeError):
-            return (
-                False,
-                f"Il take profit deve essere un numero.",
-                None
-            )
+        is_valid, error_msg = validators.validate_take_profit(value)
+        if not is_valid:
+            return (False, error_msg, None)
+        return (True, None, None)
     
     return (True, None, None)
 
