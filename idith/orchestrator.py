@@ -1567,6 +1567,52 @@ def _ambiguous_modify_confirm_clarification(
     )
 
 
+def _complete_config_multiparam_field_error_line(field: str, raw_value: Any, err_msg: Optional[str]) -> str:
+    """Messaggio breve in italiano per errori di validazione in un batch multi-parametro (config completa)."""
+    rv = raw_value
+    if field == "timeframe":
+        return f"Il timeframe {rv!s} non è valido."
+    if field == "leverage":
+        return f"La leva {rv!s} non è valida."
+    if field == "symbol":
+        return (err_msg or f"La coppia {rv!s} non è valida.").strip()
+    if field == "risk_pct":
+        return f"Il rischio {rv!s} non è valido."
+    if field == "sl":
+        return f"Lo stop loss {rv!s} non è valido."
+    if field == "tp":
+        return f"Il take profit {rv!s} non è valido."
+    if field == "market_type":
+        return f"Il tipo di mercato {rv!s} non è valido."
+    if field == "operating_mode":
+        return f"La modalità operativa {rv!s} non è valida."
+    return (err_msg or f"Il valore per {field} non è valido.").strip()
+
+
+def _complete_config_multiparam_success_line(field: str, new_value: Any) -> str:
+    """Riga di conferma per un parametro applicato subito (config completa, batch misto)."""
+    if field == "symbol":
+        return f"Coppia aggiornata a {new_value}."
+    if field == "timeframe":
+        return f"Timeframe aggiornato a {new_value}."
+    if field == "leverage":
+        return f"Leva aggiornata a {int(new_value)}x."
+    if field == "sl":
+        nv = new_value
+        if isinstance(nv, (int, float)) and "%" not in str(nv):
+            return f"Stop loss aggiornato a {nv}%."
+        return f"Stop loss aggiornato a {nv}."
+    if field == "tp":
+        return f"Take profit aggiornato a {new_value}."
+    if field == "risk_pct":
+        return f"Rischio aggiornato a {new_value}%."
+    if field == "market_type":
+        return f"Tipo di mercato aggiornato a {new_value}."
+    if field == "operating_mode":
+        return f"Modalità operativa aggiornata a {new_value}."
+    return f"Parametro {field} aggiornato."
+
+
 def _append_pending_confirmation_remnant_to_error_reply(base_reply: str, cs: Dict[str, Any]) -> str:
     """Dopo un errore di validazione, ricorda eventuali conferme ancora in attesa (non sovrascritte)."""
     extras: List[str] = []
@@ -3313,67 +3359,144 @@ def _wizard_seq_handle_message(
                 "leverage",
             }
             selected_updates = {k: v for k, v in updates.items() if k in allowed_complete_updates}
-            immediate_patch: Dict[str, Any] = {}
-            risky_updates: Dict[str, Any] = {}
 
-            # Multi-parametro: validare ogni campo prima di pending / apply (nessun valore invalido in pending).
-            batch_validation_errors: List[str] = []
-            for key, value in selected_updates.items():
-                is_ok, err_msg, _ = _validate_step_value(key, value, params)
-                if not is_ok and err_msg:
-                    batch_validation_errors.append(err_msg)
-            if batch_validation_errors:
-                state, cs, params = _sync_state(state, cs, params)
-                return {"reply": " ".join(batch_validation_errors), "state": state}
-
-            # Regola post-config: sl/risk numerici alti e leva con warning → pending batch.
-            for key, value in selected_updates.items():
+            # Multi-parametro (config completa): valid_updates subito, pending per rischio, errori senza bloccare gli altri.
+            valid_updates: Dict[str, Any] = {}
+            pending_updates: Dict[str, Any] = {}
+            pending_sl_suggested: Optional[float] = None
+            validation_errors: List[str] = []
+            multi_param_order = (
+                "market_type",
+                "symbol",
+                "timeframe",
+                "operating_mode",
+                "tp",
+                "sl",
+                "risk_pct",
+                "leverage",
+            )
+            for key in multi_param_order:
+                if key not in selected_updates:
+                    continue
+                value = selected_updates[key]
+                preview_params = dict(params)
+                preview_params.update(valid_updates)
+                is_ok, err_msg, _warn = _validate_step_value(key, value, preview_params)
+                if not is_ok:
+                    validation_errors.append(_complete_config_multiparam_field_error_line(key, value, err_msg))
+                    continue
                 if key == "leverage":
                     lev_int = _parse_user_leverage_int(value)
                     if lev_int is None:
-                        immediate_patch[key] = value
+                        validation_errors.append(_complete_config_multiparam_field_error_line(key, value, err_msg))
                         continue
-                    sym = params.get("symbol") or "questa coppia"
+                    sym = preview_params.get("symbol") or params.get("symbol") or "questa coppia"
                     req_confirm, _ = _check_leverage_warning(lev_int, sym)
                     if req_confirm:
-                        risky_updates[key] = float(lev_int)
-                        continue
-                    immediate_patch[key] = lev_int
+                        pending_updates["leverage"] = int(lev_int)
+                    else:
+                        valid_updates["leverage"] = lev_int
                     continue
-                if key in ("sl", "risk_pct"):
+                if key == "sl":
                     try:
                         numeric_val = float(str(value).replace("%", "").replace(",", "."))
                     except Exception:
-                        immediate_patch[key] = value
+                        valid_updates[key] = value
                         continue
-                    if numeric_val >= 4:
-                        risky_updates[key] = numeric_val
+                    req_c, _msg, suggested_sl = _check_sl_warning(numeric_val)
+                    if req_c:
+                        pending_updates["sl"] = numeric_val
+                        if suggested_sl is not None:
+                            pending_sl_suggested = float(suggested_sl)
+                    else:
+                        valid_updates[key] = value
+                    continue
+                if key == "risk_pct":
+                    try:
+                        numeric_val = float(str(value).replace("%", "").replace(",", "."))
+                    except Exception:
+                        valid_updates[key] = value
                         continue
-                immediate_patch[key] = value
+                    mt = preview_params.get("market_type", "futures")
+                    req_c, _ = _check_risk_warning(numeric_val, mt)
+                    if req_c:
+                        pending_updates["risk_pct"] = numeric_val
+                    else:
+                        valid_updates["risk_pct"] = numeric_val
+                    continue
+                valid_updates[key] = value
 
-            if immediate_patch:
-                patch_result = apply_config_patch(cs, immediate_patch)
+            reply_lines: List[str] = []
+            patch_result: Dict[str, Any] = {"ok": True, "changed": {}}
+
+            if valid_updates:
+                patch_result = apply_config_patch(cs, valid_updates)
                 if not patch_result.get("ok", True):
                     params = cs.get("params", {})
                     state, cs, params = _sync_state(state, cs, params)
-                    reply = patch_result.get("message") or "Non sono riuscito ad applicare la modifica richiesta."
+                    fail_msg = patch_result.get("message") or "Non sono riuscito ad applicare la modifica richiesta."
+                    reply = _append_pending_confirmation_remnant_to_error_reply(fail_msg, cs)
                     return {"reply": reply, "state": state}
                 params = cs.get("params", {})
+                ch = patch_result.get("changed") or {}
+                for fname, pair in ch.items():
+                    if isinstance(pair, tuple) and len(pair) == 2:
+                        _old_v, new_v = pair
+                        reply_lines.append(_complete_config_multiparam_success_line(fname, new_v))
+                if "leverage" in valid_updates:
+                    cs["pending_leverage_confirmation"] = None
+                if "sl" in valid_updates:
+                    cs["pending_sl_confirmation"] = None
+                    cs["suggested_sl"] = None
+                if "risk_pct" in valid_updates:
+                    cs["pending_risk_confirmation"] = None
+                if valid_updates.get("market_type") == "spot":
+                    cs["pending_leverage_confirmation"] = None
+                params = _sync_strategy_from_periods(params)
 
-            if risky_updates:
-                _clear_pending_confirmation_batch(cs)
-                if "sl" in risky_updates:
-                    cs["pending_sl_confirmation"] = float(risky_updates["sl"])
-                if "risk_pct" in risky_updates:
-                    cs["pending_risk_confirmation"] = float(risky_updates["risk_pct"])
-                if "leverage" in risky_updates:
-                    cs["pending_leverage_confirmation"] = int(float(risky_updates["leverage"]))
+            if pending_updates:
+                if "sl" in pending_updates:
+                    cs["pending_sl_confirmation"] = float(pending_updates["sl"])
+                    cs["suggested_sl"] = pending_sl_suggested
+                if "risk_pct" in pending_updates:
+                    cs["pending_risk_confirmation"] = float(pending_updates["risk_pct"])
+                if "leverage" in pending_updates:
+                    cs["pending_leverage_confirmation"] = int(float(pending_updates["leverage"]))
                 logger.info("[PENDING_BATCH_SET] pending=%s", _pending_batch_snapshot(cs))
-                state["config_status"] = "complete" if is_config_complete(params) else "in_progress"
-                state, cs, params = _sync_state(state, cs, params)
-                return {"reply": _build_pending_batch_confirmation_prompt(cs), "state": state}
+                if "sl" in pending_updates:
+                    psl = _fmt_pending_percent(pending_updates["sl"])
+                    reply_lines.append(f"Lo stop loss {psl}% richiede conferma.")
+                if "risk_pct" in pending_updates:
+                    pr = _fmt_pending_percent(pending_updates["risk_pct"])
+                    reply_lines.append(f"Il rischio {pr}% richiede conferma.")
+                if "leverage" in pending_updates:
+                    lev = int(float(pending_updates["leverage"]))
+                    reply_lines.append(f"La leva {lev}x richiede conferma.")
 
-            if immediate_patch:
+            reply_lines.extend(validation_errors)
+            state["config_status"] = "complete" if is_config_complete(params) else "in_progress"
+
+            if validation_errors or pending_updates:
+                state, cs, params = _sync_state(state, cs, params)
+                if pending_updates and not valid_updates and not validation_errors:
+                    body = _build_pending_batch_confirmation_prompt(cs)
+                else:
+                    body = "\n".join(line for line in reply_lines if line)
+                    if pending_updates:
+                        body = (body + "\n\n" if body else "") + _build_pending_batch_confirmation_prompt(cs)
+                    elif not body.strip() and validation_errors:
+                        body = "\n".join(validation_errors)
+                reply = _append_pending_confirmation_remnant_to_error_reply(body.strip(), cs)
+                if is_config_complete(params):
+                    reply = (
+                        reply
+                        + "\n\n"
+                        + _build_summary(params)
+                        + "\n\nVuoi modificare qualcosa o avviare il bot adesso?"
+                    )
+                return {"reply": reply, "state": state}
+
+            if valid_updates:
                 if is_config_complete(params):
                     state["config_status"] = "complete"
                     _cleanup_config_state_when_complete(cs)
@@ -4067,8 +4190,22 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             applied_updates = {}  # {param_name: (old_value, new_value)}
             old_values = {}  # Per tracciare i valori precedenti
             
-            # Prima passata: valida tutti gli update e raccogli errori/conferme
-            for param_name, new_value in updates.items():
+            # Prima passata: valida tutti gli update e raccogli errori/conferme (ordine stabile: dipendenze es. symbol → leva).
+            _mod_order = (
+                "market_type",
+                "symbol",
+                "timeframe",
+                "operating_mode",
+                "tp",
+                "sl",
+                "risk_pct",
+                "leverage",
+            )
+            _keys_ordered = [k for k in _mod_order if k in updates] + [k for k in updates if k not in _mod_order]
+            working_params: Dict[str, Any] = dict(params or {})
+
+            for param_name in _keys_ordered:
+                new_value = updates[param_name]
                 old_values[param_name] = params.get(param_name)
                 
                 # Gestione rimozione indicatori
@@ -4081,8 +4218,8 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 if param_name in ["ema_period", "rsi_period", "atr_period"]:
                     step_for_validation = param_name
                 
-                # Valida il valore
-                is_valid, error_msg, warning_msg = _validate_step_value(step_for_validation, new_value, params)
+                # Valida il valore (stesso messaggio: params effettivi + anteprima campi già accettati nel batch)
+                is_valid, error_msg, warning_msg = _validate_step_value(step_for_validation, new_value, working_params)
                 
                 if not is_valid:
                     # Costruisci messaggio di errore con alternative valide
@@ -4161,12 +4298,40 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 
                 # Valore VALIDO e non richiede conferma: aggiungi agli update da applicare
                 applied_updates[param_name] = (old_values[param_name], new_value)
+                if param_name == "symbol":
+                    sn = validators.normalize_symbol_strict(str(new_value))
+                    if sn:
+                        working_params["symbol"] = sn
+                elif param_name == "market_type":
+                    working_params["market_type"] = new_value
+                elif param_name == "timeframe":
+                    working_params["timeframe"] = normalize_timeframe(new_value) or new_value
+                elif param_name == "leverage":
+                    try:
+                        working_params["leverage"] = int(float(new_value))
+                    except (TypeError, ValueError):
+                        working_params["leverage"] = new_value
+                elif param_name == "operating_mode":
+                    working_params["operating_mode"] = new_value
+                elif param_name == "tp":
+                    working_params["tp"] = new_value
+                elif param_name == "sl":
+                    working_params["sl"] = new_value
+                elif param_name == "risk_pct":
+                    try:
+                        working_params["risk_pct"] = float(
+                            str(new_value).replace("%", "").replace(",", ".")
+                        )
+                    except (TypeError, ValueError):
+                        working_params["risk_pct"] = new_value
             
-            # Qualsiasi errore di validazione: nessun apply, nessun pending (evita conferma con valori invalidi).
-            if errors:
-                state, cs, params = _sync_state(state, cs, params)
-                reply = _append_pending_confirmation_remnant_to_error_reply(" ".join(errors.values()), cs)
-                return {"reply": reply, "state": state}
+            error_reply_fragment = "\n\n".join(errors.values()).strip() if errors else ""
+
+            def _with_mod_errors(msg: str) -> str:
+                m = (msg or "").strip()
+                if not error_reply_fragment:
+                    return m
+                return f"{error_reply_fragment}\n\n{m}" if m else error_reply_fragment
 
             # 1) Applica subito tutti gli update che non richiedono conferma (stesso messaggio).
             patch_dict = {param_name: new_value for param_name, (_, new_value) in applied_updates.items()}
@@ -4177,8 +4342,11 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 patch_result = apply_config_patch(cs, patch_dict)
                 if not patch_result.get("ok", True):
                     state, cs, params = _sync_state(state, cs, cs["params"])
+                    fail_txt = patch_result.get("message", "Modifica non applicabile.")
+                    if error_reply_fragment:
+                        fail_txt = error_reply_fragment + "\n\n" + fail_txt
                     return {
-                        "reply": patch_result.get("message", "Modifica non applicabile."),
+                        "reply": fail_txt,
                         "state": state
                     }
 
@@ -4213,11 +4381,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
 
             # 2) Registra TUTTI i parametri rischiosi in pending (nessun return nel loop).
             if requires_confirmation_list:
-                _clear_pending_confirmation_batch(cs)
-                for param_name in list(updates.keys()):
-                    if param_name not in requires_confirmation_list:
-                        continue
-                    _, suggested_value, new_value = requires_confirmation_list[param_name]
+                for param_name, (_cm, suggested_value, new_value) in requires_confirmation_list.items():
                     if param_name == "risk_pct":
                         try:
                             cs["pending_risk_confirmation"] = float(
@@ -4236,7 +4400,12 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 logger.info("[PENDING_BATCH_SET] pending=%s", _pending_batch_snapshot(cs))
 
                 state, cs, params = _sync_state(state, cs, params)
-                reply = _build_pending_batch_confirmation_prompt(cs)
+                reply = _with_mod_errors(_build_pending_batch_confirmation_prompt(cs))
+                return {"reply": reply, "state": state}
+
+            if errors and not applied_updates and not requires_confirmation_list:
+                state, cs, params = _sync_state(state, cs, params)
+                reply = _append_pending_confirmation_remnant_to_error_reply(error_reply_fragment, cs)
                 return {"reply": reply, "state": state}
             
             # REGOLA CRITICA: Gestione speciale per cambio market_type
@@ -4249,7 +4418,9 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     if params.get("leverage") is None and cs.get("step") == "leverage":
                         state, cs, params = _sync_state(state, cs, params)
                         return {
-                            "reply": "Ok, passiamo da Spot a Futures 👍\nNei Futures è necessario impostare una leva.\nChe leva vuoi usare?",
+                            "reply": _with_mod_errors(
+                                "Ok, passiamo da Spot a Futures 👍\nNei Futures è necessario impostare una leva.\nChe leva vuoi usare?"
+                            ),
                             "state": state
                         }
                     # Altrimenti step già coerente da _recompute_step, continua flusso normale
@@ -4258,7 +4429,11 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 elif old_market == "futures" and new_market == "spot":
                     # La leva è già stata rimossa sopra
                     if _is_configuration_complete(state):
-                        reply = "Ok, passiamo da Futures a Spot 👍\nIn modalità Spot la leva non si utilizza, quindi la rimuovo.\n\n" + _build_summary(params) + "\n\nVuoi modificare altro o avviare il bot?"
+                        reply = _with_mod_errors(
+                            "Ok, passiamo da Futures a Spot 👍\nIn modalità Spot la leva non si utilizza, quindi la rimuovo.\n\n"
+                            + _build_summary(params)
+                            + "\n\nVuoi modificare altro o avviare il bot?"
+                        )
                         state, cs, params = _sync_state(state, cs, params)
                         return {
                             "reply": reply,
@@ -4274,13 +4449,15 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     sym = params.get("symbol") or "questa coppia"
                     _, warning_msg = _check_leverage_warning(int(pending_lev), sym)
                     state, cs, params = _sync_state(state, cs, params)
-                    return {"reply": warning_msg or "Conferma leva.", "state": state}
+                    return {"reply": _with_mod_errors(warning_msg or "Conferma leva."), "state": state}
                 # REGOLA: Se Futures senza leva, NON mostrare riepilogo, chiedi leva
                 if params.get("market_type") == "futures" and params.get("leverage") is None:
                     cs["step"] = "leverage"
                     state, cs, params = _sync_state(state, cs, params)
                     return {
-                        "reply": "Nei Futures è necessario impostare una leva.\nChe leva vuoi usare?",
+                        "reply": _with_mod_errors(
+                            "Nei Futures è necessario impostare una leva.\nChe leva vuoi usare?"
+                        ),
                         "state": state
                     }
                 
@@ -4343,7 +4520,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     reply = "Perfetto 👍 Ho aggiornato la configurazione.\n\n" + _build_summary(params) + "\n\nVuoi modificare altro o avviare il bot?"
                 state, cs, params = _sync_state(state, cs, params)
                 return {
-                    "reply": reply,
+                    "reply": _with_mod_errors(reply),
                     "state": state
                 }
             else:
@@ -4353,7 +4530,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     sym = params.get("symbol") or "questa coppia"
                     _, warning_msg = _check_leverage_warning(int(pending_lev), sym)
                     state, cs, params = _sync_state(state, cs, params)
-                    return {"reply": warning_msg or "Conferma leva.", "state": state}
+                    return {"reply": _with_mod_errors(warning_msg or "Conferma leva."), "state": state}
                 # Configurazione in corso: conferma modifiche e riprendi dal punto in cui eri
                 # Non cambiare current_step, continua con la domanda corrente
                 state, cs, params = _sync_state(state, cs, params)
@@ -4367,7 +4544,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 next_question = _step_question(current_step, params)
                 reply_text = f"{confirmation} {next_question}"
                 return {
-                    "reply": reply_text,
+                    "reply": _with_mod_errors(reply_text),
                     "state": state
                 }
         else:
