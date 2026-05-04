@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from typing import Optional, Tuple, Dict, Any
+from urllib import request, error
 from dotenv import load_dotenv
 
 # Carica .env
@@ -92,35 +94,43 @@ def _fetch_valid_symbols_internal(market_type: str) -> set:
     # Se cache è vuota, popola
     if not _symbol_cache[market_type]:
         try:
-            session = _get_bybit_session()
-            
-            if market_type == "spot":
-                # Per spot, usa get_instruments_info con category="spot"
-                response = session.get_instruments_info(category="spot")
-            else:  # futures
-                # Per futures, usa get_instruments_info con category="linear" (USDT perpetual)
-                response = session.get_instruments_info(category="linear")
-            
-            result = response.get("result", {})
-            instruments = result.get("list", [])
-            
+            # Validazione simboli: usa SEMPRE endpoint pubblico MAINNET senza API key.
+            # Questa regola vale anche quando BYBIT_ENV=testnet.
             valid_symbols = set()
-            for inst in instruments:
-                symbol = inst.get("symbol", "").upper()
-                # Filtra solo coppie USDT
-                if symbol.endswith("USDT") and symbol:
-                    # Verifica che lo strumento sia disponibile per il trading
-                    status = inst.get("status", "").upper()
-                    if status == "TRADING":
-                        valid_symbols.add(symbol)
+            category = "spot" if market_type == "spot" else "linear"
+            cursor = ""
+            while True:
+                api_url = (
+                    f"https://api.bybit.com/v5/market/instruments-info?category={category}&limit=1000"
+                    + (f"&cursor={cursor}" if cursor else "")
+                )
+                with request.urlopen(api_url, timeout=10) as resp:
+                    payload = resp.read().decode("utf-8")
+                response = json.loads(payload)
+
+                result = response.get("result", {})
+                instruments = result.get("list", [])
+
+                for inst in instruments:
+                    symbol = inst.get("symbol", "").upper()
+                    # Filtra solo coppie USDT
+                    if symbol.endswith("USDT") and symbol:
+                        # Verifica che lo strumento sia disponibile per il trading
+                        status = inst.get("status", "").upper()
+                        if status == "TRADING":
+                            valid_symbols.add(symbol)
+
+                cursor = (result.get("nextPageCursor") or "").strip()
+                if not cursor:
+                    break
             
             _symbol_cache[market_type] = valid_symbols
-            
-        except Exception as e:
-            # Se fallisce, solleva errore esplicito
+
+        except (error.URLError, error.HTTPError, TimeoutError, ValueError, json.JSONDecodeError):
+            # Messaggio utente semplice, senza dettagli tecnici o setup locale.
             raise RuntimeError(
-                f"Impossibile recuperare i simboli da Bybit {market_type}: {str(e)}. "
-                "Verifica le API key e la connessione."
+                "In questo momento non riesco a verificare i simboli su Bybit. "
+                "Riprova tra poco."
             )
     
     return _symbol_cache[market_type]
