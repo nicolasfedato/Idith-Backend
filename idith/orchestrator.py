@@ -1772,6 +1772,18 @@ def _build_pending_batch_confirmation_prompt(cs: Dict[str, Any]) -> str:
     if not pieces:
         return "Confermi i valori proposti?"
     if len(pieces) == 1:
+        if "sl" in pending:
+            p = _fmt_pending_percent(pending["sl"])
+            return f"Stai impostando Stop Loss {p}%. Confermi {p}% o vuoi indicare un altro valore valido?"
+        if "risk_pct" in pending:
+            p = _fmt_pending_percent(pending["risk_pct"])
+            return f"Stai impostando rischio {p}%. Confermi {p}% o vuoi indicare un altro valore valido?"
+        if "leverage" in pending:
+            try:
+                lev = int(float(pending["leverage"]))
+            except Exception:
+                lev = pending["leverage"]
+            return f"Stai impostando leva {lev}x. Confermi {lev}x o vuoi indicare un altro valore valido?"
         details = pieces[0]
     elif len(pieces) == 2:
         details = f"{pieces[0]} e {pieces[1]}"
@@ -2549,7 +2561,11 @@ def _faq_info_complete_guard_response(
     state["step"] = None
     state["config_status"] = "complete"
     logger.info("[FAQ_COMPLETE_GUARD] complete=True step forced None ask_start_bot")
-    reply = (body or "").strip() + "\n\nVuoi avviare il bot adesso?"
+    body_stripped = (body or "").strip()
+    if _has_pending_high_risk_confirmation(cs):
+        reply = body_stripped + "\n\n" + _build_pending_batch_confirmation_prompt(cs)
+    else:
+        reply = body_stripped + "\n\nVuoi avviare il bot adesso?"
     state, cs, params = _sync_state(state, cs, params)
     return {"reply": reply, "state": state, "skip_llm": True}
 
@@ -3175,6 +3191,19 @@ def _wizard_seq_pending_snapshot(cs: Dict[str, Any]) -> Dict[str, Any]:
     return pending
 
 
+def _has_pending_high_risk_confirmation(cs: Optional[Dict[str, Any]]) -> bool:
+    """True se resta una conferma utente per SL / rischio / leva (params può essere già 'completo')."""
+    if not isinstance(cs, dict):
+        return False
+    return any(
+        [
+            cs.get("pending_sl_confirmation") is not None,
+            cs.get("pending_risk_confirmation") is not None,
+            cs.get("pending_leverage_confirmation") is not None,
+        ]
+    )
+
+
 def _wizard_seq_tail_after_save(
     state: Dict[str, Any],
     cs: Dict[str, Any],
@@ -3209,6 +3238,13 @@ def _wizard_seq_tail_after_save(
             state["config_status"] = "in_progress"
             state, cs, params = _sync_state(state, cs, params)
             return {"reply": _step_question(mw, params), "state": state}
+
+    if _has_pending_high_risk_confirmation(cs):
+        state["config_status"] = "complete"
+        cs["step"] = None
+        state["step"] = None
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": _build_pending_batch_confirmation_prompt(cs), "state": state}
 
     state["config_status"] = "complete"
     _cleanup_config_state_when_complete(cs)
@@ -3303,6 +3339,15 @@ def _wizard_seq_handle_message(
                     step,
                 )
                 if complete_ok:
+                    if _has_pending_high_risk_confirmation(cs):
+                        state["config_status"] = "complete"
+                        cs["step"] = None
+                        state["step"] = None
+                        state, cs, params = _sync_state(state, cs, params)
+                        return {
+                            "reply": _build_pending_batch_confirmation_prompt(cs),
+                            "state": state,
+                        }
                     state["config_status"] = "complete"
                     _cleanup_config_state_when_complete(cs)
                     cs["step"] = None
@@ -3487,7 +3532,7 @@ def _wizard_seq_handle_message(
                     elif not body.strip() and validation_errors:
                         body = "\n".join(validation_errors)
                 reply = _append_pending_confirmation_remnant_to_error_reply(body.strip(), cs)
-                if is_config_complete(params):
+                if is_config_complete(params) and not _has_pending_high_risk_confirmation(cs):
                     reply = (
                         reply
                         + "\n\n"
@@ -3498,6 +3543,15 @@ def _wizard_seq_handle_message(
 
             if valid_updates:
                 if is_config_complete(params):
+                    if _has_pending_high_risk_confirmation(cs):
+                        state["config_status"] = "complete"
+                        state, cs, params = _sync_state(state, cs, params)
+                        reply = "\n".join(line for line in reply_lines if line).strip()
+                        if not reply:
+                            reply = _build_pending_batch_confirmation_prompt(cs)
+                        else:
+                            reply = reply + "\n\n" + _build_pending_batch_confirmation_prompt(cs)
+                        return {"reply": reply, "state": state}
                     state["config_status"] = "complete"
                     _cleanup_config_state_when_complete(cs)
                     cs["step"] = None
@@ -4684,6 +4738,15 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 step,
             )
             if complete_ok:
+                if _has_pending_high_risk_confirmation(cs):
+                    state["config_status"] = "complete"
+                    cs["step"] = None
+                    state["step"] = None
+                    state, cs, params = _sync_state(state, cs, params)
+                    reply = _build_pending_batch_confirmation_prompt(cs)
+                    if empathetic_response:
+                        reply = empathetic_response + " " + reply
+                    return {"reply": reply, "state": state}
                 state["config_status"] = "complete"
                 _cleanup_config_state_when_complete(cs)
                 cs["step"] = None
@@ -4695,6 +4758,15 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 }
             next_step = _get_next_step(current_step, params, cs)
             if next_step is None:
+                if _has_pending_high_risk_confirmation(cs):
+                    state["config_status"] = "complete"
+                    cs["step"] = None
+                    state["step"] = None
+                    state, cs, params = _sync_state(state, cs, params)
+                    reply = _build_pending_batch_confirmation_prompt(cs)
+                    if empathetic_response:
+                        reply = empathetic_response + " " + reply
+                    return {"reply": reply, "state": state}
                 state["config_status"] = "complete"
                 _cleanup_config_state_when_complete(cs)
                 cs["step"] = None
@@ -5165,6 +5237,11 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             return {"reply": amb_commit, "state": state}
         params = _sync_strategy_from_periods(params)
         state, cs, params = _sync_state(state, cs, params)
+        if _has_pending_high_risk_confirmation(cs):
+            return {
+                "reply": _build_pending_batch_confirmation_prompt(cs),
+                "state": state,
+            }
         return {
             "reply": "Configurazione completata ✅\n\n" + _build_summary(params) + "\n\nVuoi modificare qualcosa o avviare il bot adesso?",
             "state": state
@@ -5182,6 +5259,11 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
     if current_step == "market_type" and _is_greeting(user_text):
         if _is_configuration_complete(state):
             state, cs, params = _sync_state(state, cs, params)
+            if _has_pending_high_risk_confirmation(cs):
+                return {
+                    "reply": "Ciao! " + _build_pending_batch_confirmation_prompt(cs),
+                    "state": state,
+                }
             return {
                 "reply": "Ciao! La configurazione è già pronta. Vuoi modificare qualcosa o avviare il bot?",
                 "state": state
@@ -5224,6 +5306,13 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             state, cs, params = _sync_state(state, cs, params)
             return {"reply": amb_commit, "state": state}
         state, cs, params = _sync_state(state, cs, params)
+        if _has_pending_high_risk_confirmation(cs):
+            params = _sync_strategy_from_periods(params)
+            state, cs, params = _sync_state(state, cs, params)
+            return {
+                "reply": _build_pending_batch_confirmation_prompt(cs),
+                "state": state,
+            }
         # Marca la configurazione come COMPLETA (stato finale, non modificabile automaticamente)
         if state.get("config_status") != "complete":
             state["config_status"] = "complete"
