@@ -9,9 +9,13 @@ from __future__ import annotations
 import os
 import re
 import json
+import logging
 from typing import Optional, Tuple, Dict, Any
 from urllib import request, error
+from urllib.parse import urlencode
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Carica .env
 load_dotenv()
@@ -100,16 +104,33 @@ def _fetch_valid_symbols_internal(market_type: str) -> set:
             category = "spot" if market_type == "spot" else "linear"
             cursor = ""
             while True:
+                params: Dict[str, str] = {"category": category, "limit": "1000"}
+                if cursor:
+                    params["cursor"] = cursor
                 api_url = (
-                    f"https://api.bybit.com/v5/market/instruments-info?category={category}&limit=1000"
-                    + (f"&cursor={cursor}" if cursor else "")
+                    "https://api.bybit.com/v5/market/instruments-info?"
+                    + urlencode(params)
                 )
-                with request.urlopen(api_url, timeout=10) as resp:
+                req = request.Request(
+                    api_url,
+                    headers={
+                        # Evita 403 da WAF che blocca il default User-Agent di Python-urllib.
+                        "User-Agent": "Idith/1.0 (symbol-validation; +https://api.bybit.com)",
+                        "Accept": "application/json",
+                    },
+                    method="GET",
+                )
+                with request.urlopen(req, timeout=15) as resp:
+                    http_status = getattr(resp, "status", None) or resp.getcode()
                     payload = resp.read().decode("utf-8")
                 response = json.loads(payload)
+                ret_code = response.get("retCode")
+                ret_msg = response.get("retMsg")
+                preview = payload[:300].replace("\n", " ")
 
                 result = response.get("result", {})
                 instruments = result.get("list", [])
+                page_n = len(instruments)
 
                 for inst in instruments:
                     symbol = inst.get("symbol", "").upper()
@@ -120,18 +141,52 @@ def _fetch_valid_symbols_internal(market_type: str) -> set:
                         if status == "TRADING":
                             valid_symbols.add(symbol)
 
+                logger.info(
+                    "[BYBIT_SYMBOL_FETCH] market_type=%s url=%s http_status=%s retCode=%s retMsg=%s "
+                    "response_head_300=%r page_instruments=%s cumulative_trading_usdt=%s",
+                    market_type,
+                    api_url,
+                    http_status,
+                    ret_code,
+                    ret_msg,
+                    preview,
+                    page_n,
+                    len(valid_symbols),
+                )
+
                 cursor = (result.get("nextPageCursor") or "").strip()
                 if not cursor:
                     break
-            
+
+            logger.info(
+                "[BYBIT_SYMBOL_FETCH] done market_type=%s total_trading_usdt_symbols=%s",
+                market_type,
+                len(valid_symbols),
+            )
             _symbol_cache[market_type] = valid_symbols
 
-        except (error.URLError, error.HTTPError, TimeoutError, ValueError, json.JSONDecodeError):
-            # Messaggio utente semplice, senza dettagli tecnici o setup locale.
+        except Exception as e:
+            # Log completo in terminale / log collector; messaggio utente resta generico.
+            logger.exception(
+                "[BYBIT_SYMBOL_FETCH] FAILED market_type=%s err_type=%s err=%r",
+                market_type,
+                type(e).__name__,
+                e,
+            )
+            if isinstance(e, error.HTTPError):
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")[:300]
+                except Exception:
+                    err_body = "<unreadable>"
+                logger.error(
+                    "[BYBIT_SYMBOL_FETCH] HTTPError code=%s body_head_300=%r",
+                    e.code,
+                    err_body,
+                )
             raise RuntimeError(
                 "In questo momento non riesco a verificare i simboli su Bybit. "
                 "Riprova tra poco."
-            )
+            ) from e
     
     return _symbol_cache[market_type]
 
