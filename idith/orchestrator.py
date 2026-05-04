@@ -3263,6 +3263,16 @@ def _wizard_seq_handle_message(
             immediate_patch: Dict[str, Any] = {}
             risky_updates: Dict[str, Any] = {}
 
+            # Multi-parametro: validare ogni campo prima di pending / apply (nessun valore invalido in pending).
+            batch_validation_errors: List[str] = []
+            for key, value in selected_updates.items():
+                is_ok, err_msg, _ = _validate_step_value(key, value, params)
+                if not is_ok and err_msg:
+                    batch_validation_errors.append(err_msg)
+            if batch_validation_errors:
+                state, cs, params = _sync_state(state, cs, params)
+                return {"reply": " ".join(batch_validation_errors), "state": state}
+
             # Regola post-config: sl/risk numerici alti e leva con warning → pending batch.
             for key, value in selected_updates.items():
                 if key == "leverage":
@@ -4099,14 +4109,10 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 # Valore VALIDO e non richiede conferma: aggiungi agli update da applicare
                 applied_updates[param_name] = (old_values[param_name], new_value)
             
-            # Errore bloccante solo se non c'è nulla da applicare né in immediato né in pending
-            if errors and not applied_updates and not requires_confirmation_list:
-                first_error_param = list(errors.keys())[0]
+            # Qualsiasi errore di validazione: nessun apply, nessun pending (evita conferma con valori invalidi).
+            if errors:
                 state, cs, params = _sync_state(state, cs, params)
-                return {
-                    "reply": errors[first_error_param],
-                    "state": state
-                }
+                return {"reply": " ".join(errors.values()), "state": state}
 
             # 1) Applica subito tutti gli update che non richiedono conferma (stesso messaggio).
             patch_dict = {param_name: new_value for param_name, (_, new_value) in applied_updates.items()}
@@ -4177,10 +4183,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
 
                 state, cs, params = _sync_state(state, cs, params)
                 reply = _build_pending_batch_confirmation_prompt(cs)
-                if errors:
-                    reply += "\n\nNon ho potuto applicare:\n" + "\n".join(
-                        f"• {err}" for err in errors.values()
-                    )
                 return {"reply": reply, "state": state}
             
             # REGOLA CRITICA: Gestione speciale per cambio market_type
@@ -4285,9 +4287,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     reply = "Ok, aggiorno:\n" + "\n".join(f"• {mod}" for mod in modifications_list) + "\n\n" + _build_summary(params) + "\n\nVuoi modificare altro o avviare il bot?"
                 else:
                     reply = "Perfetto 👍 Ho aggiornato la configurazione.\n\n" + _build_summary(params) + "\n\nVuoi modificare altro o avviare il bot?"
-                # Se ci sono errori (parametri non applicati), includili nella reply
-                if errors:
-                    reply += "\n\nNon ho potuto applicare:\n" + "\n".join(f"• {err}" for err in errors.values())
                 state, cs, params = _sync_state(state, cs, params)
                 return {
                     "reply": reply,
@@ -4313,8 +4312,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     confirmation = f"Ok 👍 Ho aggiornato {len(applied_updates)} parametri."
                 next_question = _step_question(current_step, params)
                 reply_text = f"{confirmation} {next_question}"
-                if errors:
-                    reply_text += "\n\nNon ho potuto applicare:\n" + "\n".join(f"• {err}" for err in errors.values())
                 return {
                     "reply": reply_text,
                     "state": state
