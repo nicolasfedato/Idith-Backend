@@ -9,15 +9,12 @@ from __future__ import annotations
 import os
 import re
 import json
-import logging
-import tempfile
+from typing import Optional, Tuple, Dict, Any
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, FrozenSet
-from urllib import request, error
-from urllib.parse import urlencode
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 from dotenv import load_dotenv
-
-logger = logging.getLogger(__name__)
 
 # Carica .env
 load_dotenv()
@@ -79,224 +76,75 @@ _symbol_cache: Dict[str, set] = {
 
 _leverage_cache: Dict[str, Optional[Tuple[float, float]]] = {}  # symbol -> (min_leverage, max_leverage)
 
-# Whitelist minima se Bybit non risponde e non c'è cache su disco (es. Railway + 403 CloudFront)
-_SYMBOL_WHITELIST_USDT: FrozenSet[str] = frozenset(
-    {
-        "BTCUSDT",
-        "ETHUSDT",
-        "SOLUSDT",
-        "BNBUSDT",
-        "XRPUSDT",
-        "ADAUSDT",
-        "DOGEUSDT",
-        "AVAXUSDT",
-        "LINKUSDT",
-        "LTCUSDT",
-        "TRXUSDT",
-    }
-)
+_MINIMUM_SYMBOL_WHITELIST = {
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "ADAUSDT",
+    "DOGEUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+    "TRXUSDT",
+}
 
-_INVALID_PAIR_USER_MSG = (
-    "Coppia non valida. Inserisci una coppia USDT valida, ad esempio BTCUSDT o SOLUSDT."
-)
-
-_SYMBOLS_CACHE_PATH = Path(__file__).resolve().parent / "bybit_symbols_cache.json"
+_BYBIT_PUBLIC_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
+_SYMBOLS_CACHE_FILE = Path(__file__).with_name("bybit_symbols_cache.json")
 
 
-def _try_fetch_bybit_instruments(market_type: str) -> Optional[set]:
-    """
-    Scarica la lista reale da Bybit mainnet (public REST).
-    Ritorna simboli TRADING *USDT, oppure None se la richiesta fallisce (403, timeout, rete, payload invalido).
-    """
-    if market_type not in ("spot", "futures"):
-        return None
-
-    valid_symbols: set[str] = set()
-    category = "spot" if market_type == "spot" else "linear"
-    cursor = ""
-
+def _load_symbols_from_cache_file(market_type: str) -> set[str]:
+    """Carica simboli da file cache locale se presente e valido."""
+    if not _SYMBOLS_CACHE_FILE.exists():
+        return set()
     try:
-        while True:
-            params: Dict[str, str] = {"category": category, "limit": "1000"}
-            if cursor:
-                params["cursor"] = cursor
-            api_url = (
-                "https://api.bybit.com/v5/market/instruments-info?"
-                + urlencode(params)
-            )
-            req = request.Request(
-                api_url,
-                headers={
-                    "User-Agent": "Idith/1.0 (symbol-validation; +https://api.bybit.com)",
-                    "Accept": "application/json",
-                },
-                method="GET",
-            )
-            with request.urlopen(req, timeout=15) as resp:
-                http_status = getattr(resp, "status", None) or resp.getcode()
-                payload = resp.read().decode("utf-8")
-            response = json.loads(payload)
-            ret_code = response.get("retCode")
-            ret_msg = response.get("retMsg")
-            preview = payload[:300].replace("\n", " ")
+        raw = json.loads(_SYMBOLS_CACHE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return set()
 
-            if ret_code not in (0, None, "0"):
-                logger.warning(
-                    "[BYBIT_SYMBOL_FETCH] unexpected retCode market_type=%s retCode=%s retMsg=%s",
-                    market_type,
-                    ret_code,
-                    ret_msg,
-                )
-                return None
-
-            result = response.get("result", {})
-            if not isinstance(result, dict):
-                return None
-
-            instruments = result.get("list", [])
-            if not isinstance(instruments, list):
-                return None
-
-            page_n = len(instruments)
-
-            for inst in instruments:
-                if not isinstance(inst, dict):
-                    continue
-                sym = inst.get("symbol", "").upper()
-                if sym.endswith("USDT") and sym:
-                    status = inst.get("status", "").upper()
-                    if status == "TRADING":
-                        valid_symbols.add(sym)
-
-            logger.info(
-                "[BYBIT_SYMBOL_FETCH] market_type=%s url=%s http_status=%s retCode=%s retMsg=%s "
-                "response_head_300=%r page_instruments=%s cumulative_trading_usdt=%s",
-                market_type,
-                api_url,
-                http_status,
-                ret_code,
-                ret_msg,
-                preview,
-                page_n,
-                len(valid_symbols),
-            )
-
-            cursor = (result.get("nextPageCursor") or "").strip()
-            if not cursor:
-                break
-
-        logger.info(
-            "[BYBIT_SYMBOL_FETCH] done market_type=%s total_trading_usdt_symbols=%s",
-            market_type,
-            len(valid_symbols),
-        )
-        return valid_symbols
-
-    except Exception as e:
-        logger.warning(
-            "[BYBIT_SYMBOL_FETCH] FAILED market_type=%s err_type=%s err=%r",
-            market_type,
-            type(e).__name__,
-            e,
-        )
-        if isinstance(e, error.HTTPError):
-            try:
-                err_body = e.read().decode("utf-8", errors="replace")[:300]
-            except Exception:
-                err_body = "<unreadable>"
-            logger.warning(
-                "[BYBIT_SYMBOL_FETCH] HTTPError code=%s body_head_300=%r",
-                e.code,
-                err_body,
-            )
-        return None
-
-
-def _load_symbols_from_disk_cache(market_type: str) -> Optional[set]:
-    """Legge bybit_symbols_cache.json per il mercato richiesto."""
-    path = _SYMBOLS_CACHE_PATH
-    if not path.is_file():
-        return None
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning("[BYBIT_SYMBOL_CACHE] read failed path=%s err=%r", path, e)
-        return None
-    if not isinstance(raw, dict):
-        return None
-    key = "spot" if market_type == "spot" else "futures"
-    lst = raw.get(key)
-    if not isinstance(lst, list) or not lst:
-        return None
-    out: set[str] = set()
-    for x in lst:
-        if isinstance(x, str):
-            s = x.strip().upper()
-            if s.endswith("USDT"):
-                out.add(s)
-    return out or None
-
-
-def _persist_symbols_to_disk(market_type: str, symbols: set[str]) -> None:
-    """Aggiorna JSON locale unendo con l'altro mercato già in file o in memoria."""
-    path = _SYMBOLS_CACHE_PATH
-    existing_spot: set[str] = set()
-    existing_futures: set[str] = set()
-    if path.is_file():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                for x in raw.get("spot", []) or []:
-                    if isinstance(x, str) and x.strip().upper().endswith("USDT"):
-                        existing_spot.add(x.strip().upper())
-                for x in raw.get("futures", []) or []:
-                    if isinstance(x, str) and x.strip().upper().endswith("USDT"):
-                        existing_futures.add(x.strip().upper())
-        except Exception as e:
-            logger.warning("[BYBIT_SYMBOL_CACHE] merge read failed err=%r", e)
-
-    if market_type == "spot":
-        merged_spot = set(symbols)
-        merged_futures = existing_futures or set(_symbol_cache.get("futures") or ())
+    if isinstance(raw, dict):
+        data = raw.get(market_type, [])
     else:
-        merged_futures = set(symbols)
-        merged_spot = existing_spot or set(_symbol_cache.get("spot") or ())
+        data = raw
 
-    payload: Dict[str, Any] = {}
-    if merged_spot:
-        payload["spot"] = sorted(merged_spot)
-    if merged_futures:
-        payload["futures"] = sorted(merged_futures)
-    if not payload:
-        return
+    if not isinstance(data, list):
+        return set()
 
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            suffix=".json",
-            prefix="bybit_symbols_",
-            dir=str(path.parent),
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        logger.info(
-            "[BYBIT_SYMBOL_CACHE] saved path=%s spot=%s futures=%s",
-            path,
-            len(merged_spot),
-            len(merged_futures),
-        )
-    except Exception as e:
-        logger.warning("[BYBIT_SYMBOL_CACHE] save failed path=%s err=%r", path, e)
+    result = set()
+    for symbol in data:
+        if not isinstance(symbol, str):
+            continue
+        normalized = normalize_symbol_strict(symbol)
+        if normalized and normalized.endswith("USDT"):
+            result.add(normalized)
+    return result
+
+
+def _fetch_symbols_from_bybit_public(market_type: str) -> set[str]:
+    """Recupera simboli da endpoint pubblico Bybit mainnet."""
+    category = "spot" if market_type == "spot" else "linear"
+    params = urllib_parse.urlencode({"category": category, "limit": "1000"})
+    url = f"{_BYBIT_PUBLIC_INSTRUMENTS_URL}?{params}"
+
+    req = urllib_request.Request(
+        url=url,
+        method="GET",
+        headers={"User-Agent": "idith-validator/1.0"},
+    )
+    with urllib_request.urlopen(req, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if payload.get("retCode") != 0:
+        raise RuntimeError(f"Bybit retCode={payload.get('retCode')}")
+
+    instruments = payload.get("result", {}).get("list", [])
+    valid_symbols = set()
+    for inst in instruments:
+        symbol = str(inst.get("symbol", "")).strip().upper()
+        status = str(inst.get("status", "")).strip().upper()
+        if status == "TRADING" and symbol.endswith("USDT"):
+            valid_symbols.add(symbol)
+    return valid_symbols
 
 
 def fetch_valid_symbols(market_type: str) -> set:
@@ -310,37 +158,34 @@ def fetch_valid_symbols(market_type: str) -> set:
 
 def _fetch_valid_symbols_internal(market_type: str) -> set:
     """
-    Prova Bybit mainnet pubblico; se fallisce usa cache JSON locale; se assente whitelist minima.
-    Non solleva: il wizard non si blocca per 403/timeout se esiste fallback.
+    Recupera i simboli validi da Bybit per il market_type specificato.
+    Usa cache per evitare troppe chiamate API.
     """
     if market_type not in ["spot", "futures"]:
         return set()
+    
+    # Se cache è vuota, popola
+    if not _symbol_cache[market_type]:
+        valid_symbols: set[str] = set()
 
-    if _symbol_cache[market_type]:
-        return _symbol_cache[market_type]
+        # 1) Bybit public endpoint mainnet
+        try:
+            valid_symbols = _fetch_symbols_from_bybit_public(market_type)
+        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, RuntimeError):
+            valid_symbols = set()
+        except Exception:
+            valid_symbols = set()
 
-    live = _try_fetch_bybit_instruments(market_type)
-    if live:
-        _symbol_cache[market_type] = live
-        _persist_symbols_to_disk(market_type, live)
-        return live
+        # 2) Fallback cache locale
+        if not valid_symbols:
+            valid_symbols = _load_symbols_from_cache_file(market_type)
 
-    from_disk = _load_symbols_from_disk_cache(market_type)
-    if from_disk:
-        _symbol_cache[market_type] = from_disk
-        logger.info(
-            "[BYBIT_SYMBOL_RESOLVE] using disk cache market_type=%s count=%s",
-            market_type,
-            len(from_disk),
-        )
-        return from_disk
+        # 3) Fallback whitelist minima
+        if not valid_symbols:
+            valid_symbols = _MINIMUM_SYMBOL_WHITELIST.copy()
 
-    _symbol_cache[market_type] = set(_SYMBOL_WHITELIST_USDT)
-    logger.warning(
-        "[BYBIT_SYMBOL_RESOLVE] using minimal whitelist market_type=%s count=%s",
-        market_type,
-        len(_SYMBOL_WHITELIST_USDT),
-    )
+        _symbol_cache[market_type] = valid_symbols
+    
     return _symbol_cache[market_type]
 
 
@@ -537,11 +382,30 @@ def validate_symbol(symbol: str, market_type: str) -> Tuple[bool, Optional[str]]
             f"Tipo di mercato non valido: {market_type}. Deve essere 'spot' o 'futures'."
         )
     
-    valid_symbols = _fetch_valid_symbols_internal(market_type)
-
+    # Recupera simboli validi da Bybit
+    try:
+        valid_symbols = _fetch_valid_symbols_internal(market_type)
+    except RuntimeError as e:
+        # Errore nella connessione a Bybit
+        return (False, str(e))
+    
+    # Verifica ESATTA corrispondenza (nessuna interpretazione)
     if symbol_normalized not in valid_symbols:
-        return (False, _INVALID_PAIR_USER_MSG)
-
+        # Costruisci messaggio di errore umano con esempi REALI (3-6 simboli)
+        import random
+        examples_list = list(valid_symbols)
+        if len(examples_list) > 6:
+            examples = random.sample(examples_list, 6)
+        else:
+            examples = examples_list[:6]
+        examples_str = ", ".join(examples) if examples else "Nessun esempio disponibile"
+        
+        return (
+            False,
+            f"La coppia '{symbol_normalized}' non esiste su Bybit {market_type.capitalize()}. "
+            f"Ricontrolla il simbolo e riprova (esempi validi: {examples_str})."
+        )
+    
     return (True, None)
 
 
@@ -550,7 +414,21 @@ def validate_symbol(symbol: str, market_type: str) -> Tuple[bool, Optional[str]]
 VALID_TIMEFRAMES = {
     "1m", "3m", "5m", "15m", "30m",
     "1h", "2h", "4h", "6h", "12h",
-    "1d", "1w"
+    "1d"
+}
+
+TIMEFRAME_ALIASES = {
+    "1 minuto": "1m",
+    "3 minuti": "3m",
+    "5 minuti": "5m",
+    "15 minuti": "15m",
+    "30 minuti": "30m",
+    "1 ora": "1h",
+    "2 ore": "2h",
+    "4 ore": "4h",
+    "6 ore": "6h",
+    "12 ore": "12h",
+    "1 giorno": "1d",
 }
 
 
@@ -565,85 +443,30 @@ def normalize_timeframe(tf: str) -> Optional[str]:
     """
     if tf is None:
         return None
-    s = str(tf).strip().lower().replace(" ", "")
-    return s
+    s = str(tf).strip().lower()
+    if s in TIMEFRAME_ALIASES:
+        return TIMEFRAME_ALIASES[s]
+    return s.replace(" ", "")
 
 
-def validate_timeframe(value: str, valid_set: Optional[set[str]] = None) -> Tuple[bool, Optional[str]]:
+def validate_timeframe(tf: str, valid_set: Optional[set[str]] = None) -> Tuple[bool, Optional[str]]:
     """
     Valida che il timeframe sia supportato da Bybit.
     Usa normalize_timeframe per alias (es. "60", "1h", "giornaliero") poi verifica contro allowed.
     Valori non in whitelist (es. "7m", "17m") vengono rifiutati.
     """
-    if not value:
+    if not tf:
         return (False, "Il timeframe non può essere vuoto.")
     valid_tfs = valid_set if valid_set is not None else VALID_TIMEFRAMES
-    tf_normalized = normalize_timeframe(value)
+    tf_normalized = normalize_timeframe(tf)
     if tf_normalized is None:
-        tf_normalized = value.strip().lower()
-    if not any(tf_normalized.endswith(unit) for unit in ["m", "h", "d", "w"]):
+        tf_normalized = tf.strip().lower()
+    if not any(tf_normalized.endswith(unit) for unit in ["m", "h", "d"]):
         examples_str = ", ".join(sorted(valid_tfs, key=lambda x: (int(x[:-1]) if x[:-1].isdigit() else 999, x[-1])))
-        return (False, f"Il timeframe '{value}' non è nel formato corretto. Valori supportati: {examples_str}. Inserisci uno di questi valori.")
+        return (False, f"Il timeframe '{tf}' non è nel formato corretto. Valori supportati: {examples_str}. Inserisci uno di questi valori.")
     if tf_normalized not in valid_tfs:
         examples_str = ", ".join(sorted(valid_tfs, key=lambda x: (int(x[:-1]) if x[:-1].isdigit() else 999, x[-1])))
-        return (False, f"Il timeframe '{value}' non esiste su Bybit. Timeframe validi: {examples_str}. Inserisci uno di questi valori esatti.")
-    return (True, None)
-
-
-_LEVERAGE_INVALID_MSG = "Leva non valida. Inserisci un valore tra 1x e 50x."
-
-
-def _parse_sl_tp_percent(value: Any) -> Optional[float]:
-    """Estrae una percentuale come float da input tipo 2, 2%, 2.5, 2,5%."""
-    if value is None:
-        return None
-    s = str(value).strip().replace("%", "").replace(",", ".")
-    if not s:
-        return None
-    try:
-        return float(s)
-    except (ValueError, TypeError):
-        return None
-
-
-def _parse_futures_leverage_int(value: Any) -> Optional[int]:
-    """Normalizza leva futures: 10, 10x, 5x → intero; None se non valido."""
-    if value is None:
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
-    if s.lower().endswith("x"):
-        s = s[:-1].strip()
-    s = s.replace(",", ".")
-    try:
-        f = float(s)
-    except (ValueError, TypeError):
-        return None
-    if f != int(f):
-        return None
-    return int(f)
-
-
-def validate_stop_loss(value: Any) -> Tuple[bool, Optional[str]]:
-    val = _parse_sl_tp_percent(value)
-    if val is None:
-        return (False, "Stop loss non valido. Inserisci una percentuale valida.")
-    if val <= 0:
-        return (False, "Lo stop loss deve essere maggiore di 0%.")
-    if val > 100:
-        return (False, "Stop loss non valido. Deve essere minore o uguale a 100%.")
-    return (True, None)
-
-
-def validate_take_profit(value: Any) -> Tuple[bool, Optional[str]]:
-    val = _parse_sl_tp_percent(value)
-    if val is None:
-        return (False, "Take profit non valido. Inserisci una percentuale valida.")
-    if val <= 0:
-        return (False, "Il take profit deve essere maggiore di 0%.")
-    if val > 100:
-        return (False, "Il take profit deve essere minore o uguale a 100%.")
+        return (False, f"Il timeframe '{tf}' non esiste su Bybit. Timeframe validi: {examples_str}. Inserisci uno di questi valori esatti.")
     return (True, None)
 
 
@@ -689,7 +512,7 @@ def validate_leverage_range(leverage: int, max_leverage: int) -> None:
         )
 
 
-def _validate_leverage_min_max(lev: float, minLev: float, maxLev: float) -> Tuple[bool, Optional[str]]:
+def validate_leverage(lev: float, minLev: float, maxLev: float) -> Tuple[bool, Optional[str]]:
     """
     Valida la leva rispetto ai limiti min/max.
     
@@ -705,21 +528,41 @@ def _validate_leverage_min_max(lev: float, minLev: float, maxLev: float) -> Tupl
     
     REGOLE STRICT PER FUTURES:
     - La leva DEVE essere un numero intero
-    - Range consentito globalmente: 1–50x
-    - Verifica aggiuntiva rispetto ai limiti min/max del simbolo
+    - Range consentito: minimo 1, massimo 100
+    - Se > 100 → INVALIDO (non accettare, non chiedere conferma)
+    - Se 51-100 → valido ma warning (gestito separatamente)
+    - Se 1-50 → valido senza warning
     """
     try:
         leverage_float = float(lev)
     except (ValueError, TypeError):
-        return (False, _LEVERAGE_INVALID_MSG)
+        return (
+            False,
+            f"La leva deve essere un numero."
+        )
     
+    # Verifica che sia un intero
     if leverage_float != int(leverage_float):
-        return (False, _LEVERAGE_INVALID_MSG)
+        return (
+            False,
+            f"La leva deve essere un numero intero."
+        )
     
     leverage_int = int(leverage_float)
     
-    if leverage_int <= 0 or leverage_int > 50:
-        return (False, _LEVERAGE_INVALID_MSG)
+    if leverage_int <= 0:
+        return (
+            False,
+            f"La leva deve essere un numero positivo."
+        )
+    
+    # REGOLA RIGIDA: Bybit Futures consente massimo 100x
+    if leverage_int > 100:
+        return (
+            False,
+            f"La leva {leverage_int}x supera il massimo consentito su Bybit Futures (100x). "
+            f"Bybit non consente leve superiori a 100. Inserisci un valore tra 1x e 100x."
+        )
     
     # Verifica rispetto ai limiti del simbolo (se disponibili)
     if leverage_int < minLev:
@@ -740,42 +583,119 @@ def _validate_leverage_min_max(lev: float, minLev: float, maxLev: float) -> Tupl
     return (True, None)
 
 
-def validate_leverage(*args: Any) -> Tuple[bool, Optional[str]]:
+def _parse_numeric_percentage(value: Any) -> Optional[float]:
+    """Parsa valori come 2, 2%, 2,5% in float."""
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    raw = raw.replace("%", "").replace(",", ".").strip()
+    if not raw:
+        return None
+    if not re.fullmatch(r"[+-]?\d+(\.\d+)?", raw):
+        return None
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def validate_stop_loss(value: Any) -> Tuple[bool, Optional[float], Optional[str], bool]:
+    parsed = _parse_numeric_percentage(value)
+    if parsed is None or parsed <= 0 or parsed >= 100:
+        return (
+            False,
+            None,
+            "Stop loss non valido. Inserisci un valore maggiore di 0 e minore di 100.",
+            False,
+        )
+    return (True, parsed, None, parsed >= 4)
+
+
+def validate_take_profit(value: Any) -> Tuple[bool, Optional[float], Optional[str], bool]:
+    parsed = _parse_numeric_percentage(value)
+    if parsed is None or parsed <= 0:
+        return (
+            False,
+            None,
+            "Take profit non valido. Inserisci un valore maggiore di 0.",
+            False,
+        )
+    return (True, parsed, None, False)
+
+
+def validate_risk_pct(value: Any) -> Tuple[bool, Optional[float], Optional[str], bool]:
+    parsed = _parse_numeric_percentage(value)
+    if parsed is None or parsed <= 0 or parsed > 100:
+        return (
+            False,
+            None,
+            "Rischio non valido. Inserisci un valore maggiore di 0 e minore o uguale a 100.",
+            False,
+        )
+    return (True, parsed, None, parsed >= 4)
+
+
+def validate_leverage(value: Any, market_type: Optional[str] = None, legacy_max: Optional[float] = None):
     """
-    - Legacy: validate_leverage(lev, minLev, maxLev) — tre argomenti numerici.
-    - Wizard/orchestrator: validate_leverage(value, market_type, min_lev, max_lev) con market_type 'futures'.
-    - validate_leverage(value, market_type) oppure validate_leverage(value): controllo generico 1–50x (futures).
+    Nuova validazione leva come source of truth:
+    - spot => valido con normalized=None
+    - futures => intero 1..100, conferma se >=10
+
+    Compatibilità legacy:
+    - chiamata validate_leverage(lev, minLev, maxLev) ritorna (bool, error)
     """
-    if len(args) == 3:
-        lev_int = _parse_futures_leverage_int(args[0])
-        if lev_int is None or lev_int <= 0 or lev_int > 50:
-            return (False, _LEVERAGE_INVALID_MSG)
-        return _validate_leverage_min_max(float(lev_int), float(args[1]), float(args[2]))
-    if len(args) == 4:
-        value, market_type, min_lev, max_lev = args[0], args[1], args[2], args[3]
-        if market_type != "futures":
+    legacy_mode = isinstance(market_type, (int, float)) and isinstance(legacy_max, (int, float))
+    if legacy_mode:
+        lev = value
+        minLev = float(market_type)
+        maxLev = float(legacy_max)
+        try:
+            leverage_float = float(lev)
+        except (ValueError, TypeError):
+            return (False, "La leva deve essere un numero.")
+        if leverage_float != int(leverage_float):
+            return (False, "La leva deve essere un numero intero.")
+        leverage_int = int(leverage_float)
+        if leverage_int <= 0:
+            return (False, "La leva deve essere un numero positivo.")
+        if leverage_int > 100:
             return (
                 False,
-                "La leva non è disponibile per il trading spot. La leva è disponibile solo per futures.",
+                f"La leva {leverage_int}x supera il massimo consentito su Bybit Futures (100x). "
+                f"Bybit non consente leve superiori a 100. Inserisci un valore tra 1x e 100x.",
             )
-        lev_int = _parse_futures_leverage_int(value)
-        if lev_int is None or lev_int <= 0 or lev_int > 50:
-            return (False, _LEVERAGE_INVALID_MSG)
-        return _validate_leverage_min_max(float(lev_int), float(min_lev), float(max_lev))
-    if len(args) == 2:
-        value, market_type = args[0], args[1]
-        if market_type == "spot":
-            return (True, None)
-        lev_int = _parse_futures_leverage_int(value)
-        if lev_int is None or lev_int <= 0 or lev_int > 50:
-            return (False, _LEVERAGE_INVALID_MSG)
-        return _validate_leverage_min_max(float(lev_int), 1.0, 50.0)
-    if len(args) == 1:
-        lev_int = _parse_futures_leverage_int(args[0])
-        if lev_int is None or lev_int <= 0 or lev_int > 50:
-            return (False, _LEVERAGE_INVALID_MSG)
-        return _validate_leverage_min_max(float(lev_int), 1.0, 50.0)
-    return (False, "Argomenti non validi per la validazione della leva.")
+        if leverage_int < minLev:
+            return (
+                False,
+                f"La leva {leverage_int}x è inferiore al minimo consentito per questo simbolo ({int(minLev)}x). "
+                f"Inserisci un valore tra {int(minLev)}x e {int(maxLev)}x.",
+            )
+        if leverage_int > maxLev:
+            return (
+                False,
+                f"La leva {leverage_int}x supera il massimo consentito per questo simbolo ({int(maxLev)}x). "
+                f"Inserisci un valore tra {int(minLev)}x e {int(maxLev)}x.",
+            )
+        return (True, None)
+
+    if str(market_type or "").strip().lower() == "spot":
+        return (True, None, None, False)
+
+    raw = str(value).strip().lower().replace("x", "")
+    if not raw or not re.fullmatch(r"[+-]?\d+(\.\d+)?", raw):
+        return (False, None, "Leva non valida. Inserisci un valore tra 1x e 100x.", False)
+    try:
+        lev_float = float(raw)
+    except (ValueError, TypeError):
+        return (False, None, "Leva non valida. Inserisci un valore tra 1x e 100x.", False)
+    if lev_float != int(lev_float):
+        return (False, None, "Leva non valida. Inserisci un valore tra 1x e 100x.", False)
+    lev_int = int(lev_float)
+    if lev_int < 1 or lev_int > 100:
+        return (False, None, "Leva non valida. Inserisci un valore tra 1x e 100x.", False)
+    return (True, lev_int, None, lev_int >= 10)
 
 
 def validate_indicator_period(indicator: str, period: int) -> Tuple[bool, Optional[str]]:
@@ -987,7 +907,7 @@ def validate_leverage_full(symbol: str, leverage: float, market_type: str) -> Tu
             )
     
     # Valida usando limiti
-    is_valid, error_msg = _validate_leverage_min_max(leverage, minLev, maxLev)
+    is_valid, error_msg = validate_leverage(leverage, minLev, maxLev)
     if not is_valid:
         return (False, error_msg, None)
     
