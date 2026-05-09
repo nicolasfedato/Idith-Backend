@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import copy
 import os
@@ -808,8 +808,33 @@ def _all_params_filled(params: Dict[str, Any]) -> bool:
 # Parsing helpers - estrae SOLO il valore dello step corrente
 # -----------------------
 
-SYMBOL_RE = re.compile(r"\b([A-Z]{2,10}(?:USDT|/USDT|-USDT))\b", re.I)
 TF_RE = re.compile(r"\b(\d{1,2}\s*[mhMd])\b", re.I)
+
+# Coppia USDT: prefisso flessibile (lettere, cifre, # _ - / .) + USDT o /USDT o -USDT
+_USDT_PAIR_RAW_RE = re.compile(
+    r"\b([A-Za-z0-9_/#.\-]{1,24}(?:USDT|/USDT|-USDT))\b",
+    re.I,
+)
+
+
+def _first_usdt_pair_raw_match(text: str) -> Optional[str]:
+    """Primo token che termina con USDT (grezzo); nessun log."""
+    if not text or not isinstance(text, str):
+        return None
+    m = _USDT_PAIR_RAW_RE.search(text.strip())
+    return m.group(1).strip() if m else None
+
+
+def _extract_first_usdt_pair_raw(text: str) -> Optional[str]:
+    """
+    Estrae il primo candidato coppia USDT dal testo (grezzo).
+    La normalizzazione e la validazione Bybit avvengono solo in apply_config_patch.
+    """
+    raw = _first_usdt_pair_raw_match(text)
+    if raw:
+        logger.info("[SYMBOL_CANDIDATE_EXTRACT] raw=%s", raw)
+    return raw
+
 
 # Usa normalize_symbol_strict da validators (STRICT, nessuna interpretazione)
 def _normalize_symbol(raw: str) -> Optional[str]:
@@ -1082,9 +1107,15 @@ def apply_config_patch(config_state: Dict[str, Any], patch_dict: Dict[str, Any])
             if current_market_type not in ["spot", "futures"]:
                 current_market_type = "futures"
             
+            kept_symbol = params.get("symbol")
             # Normalizza symbol
             symbol_normalized = validators.normalize_symbol_strict(str(new_value))
             if symbol_normalized is None:
+                logger.info(
+                    "[SYMBOL_VALIDATE] raw=%r normalized=None valid=False applied=False kept_symbol=%r",
+                    new_value,
+                    kept_symbol,
+                )
                 error_msg = f"Il simbolo '{new_value}' non è nel formato corretto. Deve essere una coppia USDT (es. BTCUSDT, ETHUSDT)."
                 logger.warning(f"[CONFIG_PATCH] {error_msg}")
                 logger.info(f"[PATCH] keys={list(patch_dict.keys())} ok=False step={config_state.get('step')}")
@@ -1092,11 +1123,23 @@ def apply_config_patch(config_state: Dict[str, Any], patch_dict: Dict[str, Any])
             
             # Verifica se è listato
             if not validators.is_symbol_listed(None, current_market_type, symbol_normalized):
+                logger.info(
+                    "[SYMBOL_VALIDATE] raw=%r normalized=%r valid=False applied=False kept_symbol=%r",
+                    new_value,
+                    symbol_normalized,
+                    kept_symbol,
+                )
                 error_msg = f"La coppia '{symbol_normalized}' non esiste su Bybit {current_market_type.capitalize()}. Ricontrolla il simbolo e riprova."
                 logger.warning(f"[CONFIG_PATCH] {error_msg}")
                 logger.info(f"[PATCH] keys={list(patch_dict.keys())} ok=False step={config_state.get('step')}")
                 return {"ok": False, "message": error_msg, "changed": changed, "warnings": warnings}
             
+            logger.info(
+                "[SYMBOL_VALIDATE] raw=%r normalized=%r valid=True applied=True kept_symbol=%r",
+                new_value,
+                symbol_normalized,
+                symbol_normalized,
+            )
             # Symbol valido, usa il valore normalizzato
             normalized_value = symbol_normalized
         
@@ -1351,14 +1394,11 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
         return mode
     
     if step == "symbol":
-        m = SYMBOL_RE.search(text)
-        if m:
-            normalized = _normalize_symbol(m.group(1))
-            # STRICT: se normalize_symbol_strict ritorna None, il formato è invalido
-            # NON procedere con autocorrezione
-            extracted_value = normalized
+        raw_sym = _extract_first_usdt_pair_raw(text)
+        if raw_sym:
+            extracted_value = raw_sym
             logger.info(f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}")
-            return normalized
+            return raw_sym
         extracted_value = None
         logger.info(f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}")
         return None
@@ -2977,7 +3017,7 @@ def _extract_modification_requests(user_text: str, params: Dict[str, Any], curre
     IMPORTANTE: symbol viene estratto se:
     - current_step == "symbol" (flusso normale FSM), oppure
     - modifica esplicita (es. "cambia symbol a BTCUSDT"), oppure
-    - è presente nel testo un ticker USDT che matcha SYMBOL_RE (anche senza keyword).
+    - è presente nel testo un candidato coppia USDT (_USDT_PAIR_RAW_RE, anche senza keyword).
     La validazione listing/formato avviene downstream (apply_config_patch / validators).
     
     Args:
@@ -3055,21 +3095,19 @@ def _extract_modification_requests(user_text: str, params: Dict[str, Any], curre
                 break
         # BUG1 FIX: "coppia X" / "symbol X" in messaggi misti (es. "metti sl 5%, tp 5%, coppia bbbusdt")
         # Se c'è un ticker nel testo E parole coppia/symbol/pair/simbolo, estrai per validare e includere eventuali errori
-        if not should_extract_symbol and SYMBOL_RE.search(text):
+        if not should_extract_symbol and _first_usdt_pair_raw_match(text):
             if any(re.search(r"\b" + re.escape(p) + r"\b", lt) for p in ["coppia", "symbol", "pair", "simbolo"]):
                 should_extract_symbol = True
 
-    # Free-text: qualunque ticker che matcha SYMBOL_RE → estrai sempre (anche senza "metti"/"coppia")
-    if SYMBOL_RE.search(text):
+    # Free-text: qualunque candidato USDT nel testo → estrai sempre (anche senza "metti"/"coppia")
+    if _first_usdt_pair_raw_match(text):
         should_extract_symbol = True
 
     if should_extract_symbol:
-        symbol_match = SYMBOL_RE.search(text)
-        if symbol_match:
-            normalized = _normalize_symbol(symbol_match.group(1))
-            if normalized:
-                updates["symbol"] = normalized
-                logger.info("[SYMBOL_EXTRACT] detected=%s source=free_text", normalized)
+        raw_sym = _extract_first_usdt_pair_raw(text)
+        if raw_sym:
+            updates["symbol"] = raw_sym
+            logger.info("[SYMBOL_EXTRACT] detected=%s source=free_text", raw_sym)
     
     # Estrai timeframe (primo match ok)
     tf_match = TF_RE.search(text)
@@ -3478,11 +3516,9 @@ def _wizard_seq_handle_message(
         # Supporta anche input tipo "metti ethusdt" (senza keyword "coppia/symbol")
         # quando la richiesta è chiaramente una modifica esplicita.
         if "symbol" not in updates and is_explicit_modification:
-            symbol_match = SYMBOL_RE.search(user_text.strip())
-            if symbol_match:
-                normalized_symbol = _normalize_symbol(symbol_match.group(1))
-                if normalized_symbol:
-                    updates["symbol"] = normalized_symbol
+            raw_sym = _extract_first_usdt_pair_raw(user_text.strip())
+            if raw_sym:
+                updates["symbol"] = raw_sym
 
         if updates:
             # "aggressiv/equilibrat/selettiv" devono valere come alias espliciti.

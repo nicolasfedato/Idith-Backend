@@ -5462,11 +5462,23 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             _wrap_cs = orch_state.get("config_state")
                             if isinstance(_wrap_cs, dict):
                                 _wrap_cfg_step = _wrap_cs.get("step")
+                        _orch_summary_or_invalids = (
+                            "Configurazione completata ✅" in assistant_reply_raw
+                            or "Non ho applicato questi valori" in assistant_reply_raw
+                        )
                         _wrap_bypass = bool(orch_res.get("skip_llm")) or bool(
                             _wrap_cfg_step is not None and str(_wrap_cfg_step).strip() != ""
-                        )
+                        ) or _orch_summary_or_invalids
+                        if _orch_summary_or_invalids:
+                            logger.info("[WRAP_BYPASS] reason=config_summary_or_invalids")
                         if _wrap_bypass:
-                            _wrap_reason = "skip_llm" if orch_res.get("skip_llm") else "wizard_step_repeat"
+                            _wrap_reason = (
+                                "skip_llm"
+                                if orch_res.get("skip_llm")
+                                else "config_summary_or_invalids"
+                                if _orch_summary_or_invalids
+                                else "wizard_step_repeat"
+                            )
                             logger.info(
                                 "[CHAT_WRAP_BYPASS] reason=%s step=%s",
                                 _wrap_reason,
