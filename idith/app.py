@@ -243,12 +243,6 @@ def retry_with_backoff(func, max_attempts=3, base_delay=0.15, max_delay=2.0):
 # ----------------------------------------
 app = FastAPI(title="Idith Backend", version="1.2")
 
-
-@app.on_event("startup")
-async def _deploy_version_marker() -> None:
-    print("IDITH ONLINE VERSION TEST 16-05-2026")
-
-
 # PUBLIC PATHS: NON DEVONO RICHIEDERE TOKEN
 PUBLIC_PATHS = ["/api/ping", "/api/runner/register", "/api/runner/heartbeat", "/docs", "/openapi.json", "/redoc"]
 
