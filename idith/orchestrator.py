@@ -949,6 +949,10 @@ def normalize_timeframe(value: Any) -> Optional[str]:
     
     if not isinstance(value, str):
         value = str(value)
+
+    nl_tf = validators.normalize_timeframe_input(value)
+    if nl_tf:
+        return nl_tf
     
     raw_value = value.strip().lower()
 
@@ -1313,6 +1317,35 @@ def _wizard_normalize_amp_suffix_as_percent(text: str) -> str:
     return re.sub(r"\s*&\s*$", "%", (text or "").strip())
 
 
+_PERCENT_INPUT_FILLERS = re.compile(
+    r"\b(?:metti|imposta|voglio|scelgo|usa|vorrei|preferisco|a|da|su|il|lo|la|per|con)\b",
+    re.I,
+)
+
+
+def extract_percentage_value(text: str) -> Optional[str]:
+    """
+    Primo valore percentuale nel testo (wizard sl/tp/risk_pct).
+    Restituisce stringa numerica normalizzata con punto decimale (es. "4", "4.5").
+    """
+    if not text or not str(text).strip():
+        return None
+    raw = _wizard_normalize_amp_suffix_as_percent(text)
+    if re.fullmatch(r"\s*(\d+(?:[.,]\d+)?)\s*%?\s*", raw):
+        return re.match(r"\s*(\d+(?:[.,]\d+)?)\s*%?\s*", raw).group(1).replace(",", ".")
+    cleaned = _PERCENT_INPUT_FILLERS.sub(" ", raw.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    for pattern in (
+        r"(\d+(?:[.,]\d+)?)\s*(?:%|percento|percenti|per\s*cento)\b",
+        r"(\d+(?:[.,]\d+)?)\s*%",
+        r"\b(\d+(?:[.,]\d+)?)\b",
+    ):
+        m = re.search(pattern, cleaned)
+        if m:
+            return m.group(1).replace(",", ".")
+    return None
+
+
 def _wizard_try_minimal_numeric_percent_value(user_text: str, field: str) -> Optional[float]:
     """
     Input 'nudo' per step percentuali: solo numero, opzionale % o & finale.
@@ -1417,6 +1450,12 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
         return None
     
     elif step == "timeframe":
+        nl_tf = validators.normalize_timeframe_input(text)
+        if nl_tf:
+            logger.info(
+                f"[EXTRACT_OUT] step={step} extracted_type=str extracted_value={nl_tf!r} (nl)"
+            )
+            return nl_tf
         m = TF_RE.search(text)
         if m:
             tf = m.group(1).lower().replace(" ", "")
@@ -1485,13 +1524,9 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
         v_min = _wizard_try_minimal_numeric_percent_value(text, "risk_pct")
         if v_min is not None:
             return v_min
-        # Cerca numeri con o senza % (frasi più lunghe)
-        m = re.search(r"(\d+(?:[.,]\d+)?)\s*%?", text)
-        if m:
-            try:
-                return float(m.group(1).replace(",", "."))
-            except Exception:
-                pass
+        pct_raw = extract_percentage_value(text)
+        if pct_raw is not None:
+            return float(pct_raw)
         return None
     
     elif step == "sl":
@@ -1509,6 +1544,9 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
         v_min = _wizard_try_minimal_numeric_percent_value(text, "sl")
         if v_min is not None:
             return _wizard_format_sl_tp_string(v_min)
+        pct_raw = extract_percentage_value(text)
+        if pct_raw is not None:
+            return _wizard_format_sl_tp_string(float(pct_raw))
         return None
     
     elif step == "tp":
@@ -1525,6 +1563,9 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
         v_min = _wizard_try_minimal_numeric_percent_value(text, "tp")
         if v_min is not None:
             return _wizard_format_sl_tp_string(v_min)
+        pct_raw = extract_percentage_value(text)
+        if pct_raw is not None:
+            return _wizard_format_sl_tp_string(float(pct_raw))
         return None
     
     # ============================================================
@@ -1999,7 +2040,8 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
         market_type = params.get("market_type", "futures")  # Default a futures se non specificato
         valid_tfs = validators.get_valid_timeframes(None, market_type)
 
-        v = normalize_timeframe(value) or str(value).strip().lower()
+        nl_v = validators.normalize_timeframe_input(str(value))
+        v = nl_v or normalize_timeframe(value) or str(value).strip().lower()
         is_valid, error_msg = validators.validate_timeframe(v, valid_tfs)
         if is_valid:
             return (True, None, None)
@@ -3932,10 +3974,19 @@ def _wizard_seq_handle_message(
             return {"reply": warning_msg or _step_question(current_step, params), "state": state}
 
     extracted_value = _extract_step_value(user_text, current_step, params)
+    if current_step == "timeframe":
+        nl_tf = validators.normalize_timeframe_input(user_text)
+        if nl_tf:
+            extracted_value = nl_tf
     if extracted_value is None:
         logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
         state, cs, params = _sync_state(state, cs, params)
         return {"reply": _step_question(current_step, params), "state": state}
+
+    if current_step == "timeframe":
+        nl_tf = validators.normalize_timeframe_input(str(extracted_value))
+        if nl_tf:
+            extracted_value = nl_tf
 
     is_valid, error_msg, _warning_msg = _validate_step_value(current_step, extracted_value, params)
     if not is_valid:
