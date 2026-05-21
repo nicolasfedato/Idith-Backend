@@ -599,7 +599,7 @@ def validate_symbol(symbol: str, market_type: str) -> Tuple[bool, Optional[str]]
 VALID_TIMEFRAMES = {
     "1m", "3m", "5m", "15m", "30m",
     "1h", "2h", "4h", "6h", "12h",
-    "1d"
+    "1d", "1w", "1M",
 }
 
 TIMEFRAME_ALIASES = {
@@ -616,6 +616,44 @@ TIMEFRAME_ALIASES = {
     "1 giorno": "1d",
 }
 
+_TF_INPUT_FILLERS = re.compile(
+    r"\b(?:metti|usa|imposta|setta|scegli|scelgo|voglio|vorrei|timeframe|tf|a|da|su)\b",
+    re.I,
+)
+
+
+def normalize_timeframe_input(text: str) -> Optional[str]:
+    """
+    Linguaggio naturale (casi fissi) → timeframe tecnico.
+    Va usata prima di validate_timeframe / normalize_timeframe.
+    """
+    if not text or not str(text).strip():
+        return None
+    s = _TF_INPUT_FILLERS.sub(" ", str(text).strip().lower())
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return None
+    if s in TIMEFRAME_ALIASES:
+        return TIMEFRAME_ALIASES[s]
+    if re.search(r"\b(?:giornalier\w*|daily)\b", s):
+        return "1d"
+    if re.search(r"\b(?:una?\s+)?settiman[ae]\b", s) or s in ("1 settimana", "una settimana"):
+        return "1w"
+    if re.search(r"\b(?:un\s+)?mese\b", s) or s in ("1 mese", "un mese"):
+        return "1M"
+    if re.search(r"\bun['\u2019]?ora\b", s) or s in ("1 ora", "un ora", "un'ora"):
+        return "1h"
+    if re.search(r"\b(?:60|sessanta)\s*second[oi]", s):
+        return "1m"
+    min_m = re.search(r"\b(\d+)\s*minut[oi]", s)
+    if min_m:
+        n = int(min_m.group(1))
+        return "1h" if n == 60 else f"{n}m"
+    hour_m = re.search(r"\b(\d+)\s*(?:ora|ore)\b", s)
+    if hour_m:
+        return f"{int(hour_m.group(1))}h"
+    return None
+
 
 def normalize_timeframe(tf: str) -> Optional[str]:
     """
@@ -628,10 +666,13 @@ def normalize_timeframe(tf: str) -> Optional[str]:
     """
     if tf is None:
         return None
-    s = str(tf).strip().lower()
-    if s in TIMEFRAME_ALIASES:
-        return TIMEFRAME_ALIASES[s]
-    return s.replace(" ", "")
+    raw = str(tf).strip()
+    raw_l = raw.lower()
+    if raw_l in TIMEFRAME_ALIASES:
+        return TIMEFRAME_ALIASES[raw_l]
+    if raw == "1M":
+        return "1M"
+    return raw_l.replace(" ", "")
 
 
 def validate_timeframe(tf: str, valid_set: Optional[set[str]] = None) -> Tuple[bool, Optional[str]]:
@@ -643,10 +684,18 @@ def validate_timeframe(tf: str, valid_set: Optional[set[str]] = None) -> Tuple[b
     if not tf:
         return (False, "Il timeframe non può essere vuoto.")
     valid_tfs = valid_set if valid_set is not None else VALID_TIMEFRAMES
+    tf_nl = normalize_timeframe_input(tf)
+    if tf_nl:
+        tf = tf_nl
     tf_normalized = normalize_timeframe(tf)
     if tf_normalized is None:
         tf_normalized = tf.strip().lower()
-    if not any(tf_normalized.endswith(unit) for unit in ["m", "h", "d"]):
+    if tf_normalized in valid_tfs:
+        return (True, None)
+    if not any(
+        tf_normalized.endswith(unit)
+        for unit in ("m", "h", "d", "w")
+    ) and tf_normalized != "1M":
         examples_str = ", ".join(sorted(valid_tfs, key=lambda x: (int(x[:-1]) if x[:-1].isdigit() else 999, x[-1])))
         return (False, f"Il timeframe '{tf}' non è nel formato corretto. Valori supportati: {examples_str}. Inserisci uno di questi valori.")
     if tf_normalized not in valid_tfs:
