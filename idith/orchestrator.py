@@ -2527,6 +2527,15 @@ def _summary_disp_pct(val: Any) -> str:
         return s if s else "—"
 
 
+_CONFIG_COMPLETE_FOLLOWUP = (
+    "\n\nPuoi:\n"
+    "• avviare il bot\n"
+    "• modificare la configurazione\n"
+    "• richiedere una preview storica\n\n"
+    "Cosa vuoi fare?"
+)
+
+
 def _build_summary(params: Dict[str, Any], *, full_config: bool = False) -> str:
     """Costruisce il riepilogo ordinato della configurazione."""
     params = _coerce_params(params)
@@ -3472,7 +3481,7 @@ def _wizard_seq_handle_message(
             return {
                 "reply": "Configurazione completata ✅\n\n"
                 + _build_summary(params, full_config=True)
-                + "\n\nVuoi modificare qualcosa o avviare il bot adesso?",
+                + _CONFIG_COMPLETE_FOLLOWUP,
                 "state": state,
             }
         state["config_status"] = "in_progress"
@@ -3532,7 +3541,7 @@ def _wizard_seq_handle_message(
                     return {
                         "reply": "Configurazione completata ✅\n\n"
                         + _build_summary(params, full_config=True)
-                        + "\n\nVuoi modificare qualcosa o avviare il bot adesso?",
+                        + _CONFIG_COMPLETE_FOLLOWUP,
                         "state": state,
                     }
                 state["config_status"] = "in_progress"
@@ -3681,7 +3690,7 @@ def _wizard_seq_handle_message(
                             [f"- {msg}" for msg in invalid_messages]
                         )
                         reply = f"{reply}\n\n{invalid_block}"
-                    reply += "\n\nVuoi modificare qualcosa o avviare il bot adesso?"
+                    reply += _CONFIG_COMPLETE_FOLLOWUP
                     return {"reply": reply, "state": state}
                 state["config_status"] = "in_progress"
                 _recompute_step(cs)
@@ -3759,7 +3768,7 @@ def _wizard_seq_handle_message(
                     cs,
                     params,
                     current_step,
-                    summary_followup="\n\nVuoi avviare il bot adesso?",
+                    summary_followup=_CONFIG_COMPLETE_FOLLOWUP,
                 )
 
         if current_step == "risk_pct" and cs.get("pending_risk_confirmation") is not None:
@@ -3787,7 +3796,7 @@ def _wizard_seq_handle_message(
                     cs,
                     params,
                     current_step,
-                    summary_followup="\n\nVuoi avviare il bot adesso?",
+                    summary_followup=_CONFIG_COMPLETE_FOLLOWUP,
                 )
 
         if current_step == "sl" and cs.get("pending_sl_confirmation") is not None:
@@ -3829,7 +3838,7 @@ def _wizard_seq_handle_message(
                         cs,
                         params,
                         current_step,
-                        summary_followup="\n\nVuoi avviare il bot adesso?",
+                        summary_followup=_CONFIG_COMPLETE_FOLLOWUP,
                     )
             new_sl_value = _extract_step_value(user_text, "sl", params)
             if new_sl_value is None:
@@ -3870,7 +3879,7 @@ def _wizard_seq_handle_message(
                     cs,
                     params,
                     current_step,
-                    summary_followup="\n\nVuoi avviare il bot adesso?",
+                    summary_followup=_CONFIG_COMPLETE_FOLLOWUP,
                 )
 
         confirmation = _extract_confirmation(user_text)
@@ -3926,7 +3935,7 @@ def _wizard_seq_handle_message(
                 cs,
                 params,
                 current_step,
-                summary_followup="\n\nVuoi avviare il bot adesso?",
+                summary_followup=_CONFIG_COMPLETE_FOLLOWUP,
             )
         elif confirmation is False:
             cs[pending_key] = None
@@ -4078,7 +4087,7 @@ def _wizard_seq_handle_message(
         cs,
         params,
         current_step,
-        summary_followup="\n\nVuoi avviare il bot adesso?",
+        summary_followup=_CONFIG_COMPLETE_FOLLOWUP,
     )
 
 def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str, str]], system_prompt: str = "") -> Dict[str, Any]:
@@ -4940,7 +4949,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 state["step"] = None
                 state, cs, params = _sync_state(state, cs, params)
                 return {
-                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                     "state": state,
                 }
             next_step = _get_next_step(current_step, params, cs)
@@ -4951,7 +4960,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 state["step"] = None
                 state, cs, params = _sync_state(state, cs, params)
                 return {
-                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                     "state": state,
                 }
             cs["step"] = next_step
@@ -5011,7 +5020,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 params = _sync_strategy_from_periods(params)
                 state, cs, params = _sync_state(state, cs, params)
                 return {
-                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                     "state": state,
                 }
             cs["step"] = next_step
@@ -5037,7 +5046,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 params = _sync_strategy_from_periods(params)
                 state, cs, params = _sync_state(state, cs, params)
                 return {
-                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                     "state": state,
                 }
             cs["step"] = next_step
@@ -5137,7 +5146,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     ((state.get("config_state") or {}).get("params") or {}).get("risk_pct"),
                 )
                 return {
-                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                     "state": state,
                 }
             cs["step"] = next_step
@@ -5180,7 +5189,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 params = _sync_strategy_from_periods(params)
                 state, cs, params = _sync_state(state, cs, params)
                 return {
-                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                     "state": state,
                 }
             cs["step"] = next_step
@@ -5253,7 +5262,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     params = _sync_strategy_from_periods(params)
                     state, cs, params = _sync_state(state, cs, params)
                     return {
-                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                         "state": state,
                     }
                 cs["step"] = next_step
@@ -5286,7 +5295,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     params = _sync_strategy_from_periods(params)
                     state, cs, params = _sync_state(state, cs, params)
                     return {
-                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                         "state": state,
                     }
                 cs["step"] = next_step
@@ -5310,7 +5319,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     params = _sync_strategy_from_periods(params)
                     state, cs, params = _sync_state(state, cs, params)
                     return {
-                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                         "state": state,
                     }
                 cs["step"] = next_step
@@ -5334,7 +5343,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 params = _sync_strategy_from_periods(params)
                 state, cs, params = _sync_state(state, cs, params)
                 return {
-                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                     "state": state,
                 }
             cs["step"] = next_step
@@ -5416,7 +5425,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         params = _sync_strategy_from_periods(params)
         state, cs, params = _sync_state(state, cs, params)
         return {
-            "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi modificare qualcosa o avviare il bot adesso?",
+            "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
             "state": state
         }
     
@@ -5495,7 +5504,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             params = _sync_strategy_from_periods(params)
             state, cs, params = _sync_state(state, cs, params)
             return {
-                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                 "state": state
             }
     
@@ -5664,7 +5673,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     state, cs, params = _sync_state(state, cs, params)
                     _log_final_report(state, "PERIODI_COMPLETE")
                     return {
-                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                         "state": state
                     }
                 
@@ -5693,7 +5702,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 params = _sync_strategy_from_periods(params)
                 state, cs, params = _sync_state(state, cs, params)
                 return {
-                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                    "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                     "state": state
                 }
             cs["step"] = next_step
@@ -5750,7 +5759,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             _cleanup_config_state_when_complete(cs)
             state, cs, params = _sync_state(state, cs, params)
             return {
-                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                 "state": state
             }
         
@@ -5802,7 +5811,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             params = _sync_strategy_from_periods(params)
             state, cs, params = _sync_state(state, cs, params)
             return {
-                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                 "state": state
             }
         cs["step"] = next_step
@@ -5846,7 +5855,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             state["config_status"] = "complete"
             _cleanup_config_state_when_complete(cs)
             state, cs, params = _sync_state(state, cs, params)
-            return {"reply": "Configurazione completata.\n\n" + _build_summary(params, full_config=True), "state": state}
+            return {"reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP, "state": state}
         elif current_step == "symbol":
             # Salva symbol solo dopo validazione ok usando apply_config_patch per normalizzazione coerente
             patch_result = apply_config_patch(cs, {"symbol": extracted_value})
@@ -5949,7 +5958,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                             params = recompute_strategy_from_periods(params)
                             state, cs, params = _sync_state(state, cs, params)
                             return {
-                                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                                 "state": state
                             }
                         cs["step"] = next_step
@@ -6035,7 +6044,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     _cleanup_config_state_when_complete(cs)
                     state, cs, params = _sync_state(state, cs, params)
                     return {
-                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                        "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                         "state": state
                     }
                 cs["step"] = next_step
@@ -6095,7 +6104,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             params = _sync_strategy_from_periods(params)
             state, cs, params = _sync_state(state, cs, params)
             return {
-                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + "\n\nVuoi avviare il bot adesso?",
+                "reply": "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True) + _CONFIG_COMPLETE_FOLLOWUP,
                 "state": state
             }
         
