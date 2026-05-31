@@ -114,6 +114,22 @@ except Exception as e1:
                 )
                 supabase_queue = None
 
+# Backtest preview helper (detection + payload)
+runner_backtest_mod = None
+try:
+    from . import runner_backtest as runner_backtest_mod
+except Exception:
+    try:
+        import idith.runner_backtest as runner_backtest_mod
+    except Exception:
+        try:
+            from idith import runner_backtest as runner_backtest_mod
+        except Exception:
+            try:
+                import runner_backtest as runner_backtest_mod
+            except Exception:
+                runner_backtest_mod = None
+
 # ----------------------------------------
 # ENV
 # ----------------------------------------
@@ -3229,10 +3245,11 @@ INTENT_DEFINITIONS = {
     "START_BOT": {
         "type": "RUNNER",
         "command": "/bot start",
-        "keywords": ["avvia", "parti", "start", "inizia", "attiva", "fai partire"],
-        "required_context": ["bot", "config", "trading", "setup", "configurazione"],
+        "keywords": ["avvia", "parti", "start", "inizia", "attiva", "accendi", "avvialo", "fai partire"],
+        "required_context": ["bot", "config", "trading", "setup", "configurazione", "runner"],
         "candidate_phrases": [
-            "avvia bot", "fai partire il bot", "start bot", "inizia bot",
+            "avvia bot", "avvia il bot", "avvialo", "avvialo subito", "start bot",
+            "accendi il bot", "attiva il bot", "fai partire il bot", "inizia bot",
             "avvia configurazione", "inizia configurazione", "avvia setup",
             "parti con la configurazione", "avvia tutto", "fai partire tutto"
         ]
@@ -3240,11 +3257,13 @@ INTENT_DEFINITIONS = {
     "STOP_BOT": {
         "type": "RUNNER",
         "command": "/bot stop",
-        "keywords": ["ferma", "stop", "blocca", "stoppa", "arresta", "termina"],
-        "required_context": ["bot", "trading"],
+        "keywords": ["ferma", "fermalo", "stop", "blocca", "stoppa", "arresta", "termina"],
+        "required_context": ["bot", "trading", "runner"],
         "candidate_phrases": [
-            "ferma bot", "stop bot", "blocca bot",
+            "ferma bot", "ferma il bot", "fermalo", "fermalo subito",
+            "stop bot", "stoppa bot", "blocca bot", "blocca il bot",
             "ferma tutto", "blocca tutto", "stoppa tutto",
+            "arresta il bot", "termina il bot",
             "chiudi posizioni e ferma"
         ]
     },
@@ -3294,6 +3313,139 @@ INTENT_DEFINITIONS = {
 # Soglia per fuzzy matching (0.82 come suggerito)
 FUZZY_MATCH_THRESHOLD = 0.82
 
+# START_BOT / STOP_BOT: contesto runner e soglie fuzzy dedicate
+BOT_RUNNER_CONTEXT = ("bot", "trading", "runner")
+BOT_VERB_FUZZY_THRESHOLD = 0.75
+BOT_PHRASE_FUZZY_THRESHOLD = 0.75
+BOT_STANDALONE_FUZZY_THRESHOLD = 0.85
+
+STOP_VERBS = ("ferma", "fermalo", "stop", "blocca", "stoppa", "arresta", "termina")
+START_VERBS = ("avvia", "avvialo", "parti", "start", "inizia", "attiva", "accendi")
+
+STOP_STANDALONE_PHRASES = (
+    "fermalo", "fermalo subito", "ferma tutto", "blocca tutto", "stoppa tutto",
+)
+START_STANDALONE_PHRASES = (
+    "avvialo", "avvialo subito", "avvia tutto", "fai partire tutto",
+)
+
+STOP_BOT_PHRASES = (
+    "ferma bot", "ferma il bot", "fermalo", "fermalo subito",
+    "stop bot", "stoppa bot", "blocca bot", "blocca il bot", "blocca tutto",
+    "arresta il bot", "termina il bot", "ferma tutto", "stoppa tutto",
+    "chiudi posizioni e ferma",
+)
+START_BOT_PHRASES = (
+    "avvia bot", "avvia il bot", "avvialo", "avvialo subito",
+    "start bot", "accendi il bot", "attiva il bot", "avvia tutto",
+    "fai partire il bot", "inizia bot", "fai partire tutto",
+)
+
+
+def _fuzzy_ratio(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _best_fuzzy_against_list(text: str, candidates: tuple) -> tuple[float, str]:
+    best_ratio = 0.0
+    best_match = ""
+    for candidate in candidates:
+        ratio = _fuzzy_ratio(text, candidate)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_match = candidate
+    return best_ratio, best_match
+
+
+def _best_token_verb_fuzzy(tokens: list, verbs: tuple) -> tuple[float, str, str]:
+    best_ratio = 0.0
+    best_verb = ""
+    best_token = ""
+    for token in tokens:
+        if not token:
+            continue
+        for verb in verbs:
+            ratio = _fuzzy_ratio(token, verb)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_verb = verb
+                best_token = token
+    return best_ratio, best_verb, best_token
+
+
+def _classify_start_stop_bot_intent(normalized_text: str) -> IntentResult | None:
+    """
+    Classificatore dedicato START_BOT / STOP_BOT con typo e linguaggio naturale.
+    Ritorna IntentResult se il messaggio è chiaramente avvio/stop bot, altrimenti None.
+    """
+    text = normalized_text.strip()
+    if not text:
+        return None
+
+    tokens = text.split()
+    stop_score = 0.0
+    start_score = 0.0
+    stop_reason = ""
+    start_reason = ""
+
+    stop_standalone_ratio, stop_standalone_match = _best_fuzzy_against_list(text, STOP_STANDALONE_PHRASES)
+    if text in STOP_STANDALONE_PHRASES or stop_standalone_ratio >= BOT_STANDALONE_FUZZY_THRESHOLD:
+        stop_score = max(stop_score, 0.9 if text in STOP_STANDALONE_PHRASES else stop_standalone_ratio)
+        stop_reason = f"standalone:{stop_standalone_match}"
+
+    start_standalone_ratio, start_standalone_match = _best_fuzzy_against_list(text, START_STANDALONE_PHRASES)
+    if text in START_STANDALONE_PHRASES or start_standalone_ratio >= BOT_STANDALONE_FUZZY_THRESHOLD:
+        start_score = max(start_score, 0.9 if text in START_STANDALONE_PHRASES else start_standalone_ratio)
+        start_reason = f"standalone:{start_standalone_match}"
+
+    has_context = any(ctx in text for ctx in BOT_RUNNER_CONTEXT)
+    if has_context:
+        for phrase in STOP_BOT_PHRASES:
+            if phrase in text:
+                stop_score = max(stop_score, 0.9)
+                stop_reason = stop_reason or f"phrase_contains:{phrase}"
+                break
+
+        for phrase in START_BOT_PHRASES:
+            if phrase in text:
+                start_score = max(start_score, 0.9)
+                start_reason = start_reason or f"phrase_contains:{phrase}"
+                break
+
+        stop_phrase_ratio, stop_phrase_match = _best_fuzzy_against_list(text, STOP_BOT_PHRASES)
+        if stop_phrase_ratio >= BOT_PHRASE_FUZZY_THRESHOLD:
+            stop_score = max(stop_score, stop_phrase_ratio)
+            stop_reason = stop_reason or f"phrase_fuzzy:{stop_phrase_match}:{stop_phrase_ratio:.3f}"
+
+        start_phrase_ratio, start_phrase_match = _best_fuzzy_against_list(text, START_BOT_PHRASES)
+        if start_phrase_ratio >= BOT_PHRASE_FUZZY_THRESHOLD:
+            start_score = max(start_score, start_phrase_ratio)
+            start_reason = start_reason or f"phrase_fuzzy:{start_phrase_match}:{start_phrase_ratio:.3f}"
+
+        stop_verb_ratio, stop_verb, stop_token = _best_token_verb_fuzzy(tokens, STOP_VERBS)
+        if stop_verb_ratio >= BOT_VERB_FUZZY_THRESHOLD:
+            stop_score = max(stop_score, stop_verb_ratio)
+            stop_reason = stop_reason or f"verb_fuzzy:{stop_token}->{stop_verb}:{stop_verb_ratio:.3f}"
+
+        start_verb_ratio, start_verb, start_token = _best_token_verb_fuzzy(tokens, START_VERBS)
+        if start_verb_ratio >= BOT_VERB_FUZZY_THRESHOLD:
+            start_score = max(start_score, start_verb_ratio)
+            start_reason = start_reason or f"verb_fuzzy:{start_token}->{start_verb}:{start_verb_ratio:.3f}"
+
+    if stop_score >= BOT_VERB_FUZZY_THRESHOLD and stop_score >= start_score:
+        return IntentResult(
+            "STOP_BOT",
+            min(stop_score, 1.0),
+            {"match_reason": stop_reason, "normalized_command": "/bot stop"},
+        )
+    if start_score >= BOT_VERB_FUZZY_THRESHOLD and start_score > stop_score:
+        return IntentResult(
+            "START_BOT",
+            min(start_score, 1.0),
+            {"match_reason": start_reason, "normalized_command": "/bot start"},
+        )
+    return None
+
 
 class IntentResult:
     """Risultato della classificazione intent."""
@@ -3311,6 +3463,18 @@ def classify_intent(normalized_text: str) -> IntentResult:
     """
     if not normalized_text:
         return IntentResult(None, 0.0)
+
+    bot_intent = _classify_start_stop_bot_intent(normalized_text)
+    if bot_intent and bot_intent.intent_name:
+        logger.info(
+            "[NLR_BOT] intent=%s confidence=%.3f text=%r match=%s command=%s",
+            bot_intent.intent_name,
+            bot_intent.confidence,
+            normalized_text,
+            bot_intent.params.get("match_reason"),
+            bot_intent.params.get("normalized_command"),
+        )
+        return bot_intent
     
     best_intent = None
     best_confidence = 0.0
@@ -4343,6 +4507,255 @@ def _enqueue_command_to_runner(
         logger.error(f"[CHAT] {error_msg} - chat_id={chat_id}, user_id={user_id}", exc_info=True)
         return (False, error_msg)
 
+
+def _resolve_runner_device_id(chat_id: str, user_id: str) -> Optional[str]:
+    """Risolve device_id per chat (memoria + runner_tokens), come per i comandi runner."""
+    device_id = get_chat_device_id(chat_id)
+    if device_id and device_id.strip():
+        return device_id.strip()
+    device_id = _resolve_device_id_from_runner_tokens(user_id, chat_id)
+    if device_id:
+        set_chat_device_id(chat_id, device_id)
+        return device_id.strip()
+    return None
+
+
+_BACKTEST_PREVIEW_TRIGGERS = (
+    "preview",
+    "anteprima",
+    "simulazione",
+    "simula",
+    "backtest",
+    "ultimi 30 giorni",
+    "come si sarebbe comportato",
+    "come avrebbe performato",
+)
+
+
+def _is_backtest_preview_request(text: str) -> bool:
+    """True se il messaggio chiede una preview/backtest (anche senza lookback esplicito)."""
+    normalized = normalize_user_text(text)
+    if not normalized:
+        return False
+    return any(trigger in normalized for trigger in _BACKTEST_PREVIEW_TRIGGERS)
+
+
+def _format_backtest_preview_pct(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n > 0:
+        return f"+{n:.1f}%"
+    return f"{n:.1f}%"
+
+
+def _format_backtest_preview_done_reply(
+    event_payload: Dict[str, Any],
+    lookback_fallback: int,
+) -> str:
+    def _positive_int(key: str, fallback: int) -> int:
+        raw = event_payload.get(key, fallback)
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+        return fallback
+
+    effective_lb = _positive_int("effective_lookback_days", lookback_fallback)
+    requested_lb = _positive_int("requested_lookback_days", lookback_fallback)
+    max_allowed_lb = _positive_int(
+        "max_allowed_lookback_days",
+        effective_lb,
+    )
+    timeframe = event_payload.get("timeframe") or "—"
+    if isinstance(timeframe, str):
+        timeframe = timeframe.strip() or "—"
+
+    lines = [
+        f"Preview ultimi {effective_lb} giorni 📊",
+        f"Timeframe: {timeframe}",
+        "",
+        (
+            f"Per questo timeframe Idith usa massimo {max_allowed_lb} giorni, "
+            "così l'analisi resta veloce e leggibile."
+        ),
+    ]
+    if requested_lb > effective_lb:
+        lines.extend(
+            [
+                "",
+                (
+                    f"Hai chiesto {requested_lb} giorni, ma con timeframe {timeframe} "
+                    f"il massimo consentito è {max_allowed_lb} giorni."
+                ),
+                f"Ho quindi analizzato gli ultimi {effective_lb} giorni.",
+            ]
+        )
+    lines.extend(["", "Risultato stimato:"])
+
+    if event_payload.get("simulated_trades") is not None:
+        lines.append(f"- Ordini stimati: {event_payload['simulated_trades']}")
+    if event_payload.get("wins") is not None:
+        lines.append(f"- Operazioni positive: {event_payload['wins']}")
+    if event_payload.get("losses") is not None:
+        lines.append(f"- Operazioni negative: {event_payload['losses']}")
+    pnl = _format_backtest_preview_pct(event_payload.get("pnl_pct"))
+    if pnl is not None:
+        lines.append(f"- Risultato stimato: {pnl}")
+    dd = _format_backtest_preview_pct(event_payload.get("max_drawdown_pct"))
+    if dd is not None:
+        lines.append(f"- Massima perdita temporanea stimata: {dd}")
+
+    is_mock = event_payload.get("mock") is True
+    if is_mock:
+        note_body = (
+            "questa è una simulazione basata su dati storici/mock e non rappresenta "
+            "una previsione futura né una garanzia di profitto."
+        )
+    else:
+        note_body = (
+            "questa è una simulazione basata su dati storici reali e non rappresenta "
+            "una previsione futura né una garanzia di profitto."
+        )
+
+    lines.extend(
+        [
+            "",
+            "Nota:",
+            note_body,
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _handle_backtest_preview_request(
+    chat_id: str,
+    user_id: str,
+    user_message: str,
+) -> tuple[str, str, str]:
+    """
+    Accoda BACKTEST_PREVIEW su runner_commands e attende BACKTEST_PREVIEW_DONE.
+    Ritorna (assistant_reply, source, mode).
+    """
+    if not runner_backtest_mod:
+        return (
+            "❌ Modulo backtest preview non disponibile sul server.",
+            "backtest_preview",
+            "backtest_preview_error",
+        )
+    if not supabase_queue:
+        return (
+            "❌ Modulo coda runner non disponibile sul server.",
+            "backtest_preview",
+            "backtest_preview_error",
+        )
+
+    device_id = _resolve_runner_device_id(chat_id, user_id)
+    if not device_id:
+        return (
+            "Per generare la preview serve il runner collegato.",
+            "backtest_preview",
+            "backtest_preview_no_runner",
+        )
+
+    chat_state = load_chat_state(chat_id)
+    config_state = chat_state.get("config_state") if isinstance(chat_state, dict) else None
+    lookback_days = runner_backtest_mod.extract_lookback_days(user_message, default=30)
+    payload = runner_backtest_mod.build_backtest_preview_payload(
+        chat_id=chat_id,
+        config_state=config_state if isinstance(config_state, dict) else None,
+        lookback_days=lookback_days,
+    )
+    payload["user_id"] = user_id
+
+    try:
+        command_id = supabase_queue.enqueue_runner_command(
+            device_id, payload, user_id=user_id
+        )
+        logger.info(
+            "[CHAT] BACKTEST_PREVIEW enqueued: command_id=%s chat_id=%s device_id=%s lookback_days=%s",
+            command_id,
+            chat_id,
+            device_id,
+            lookback_days,
+        )
+
+        event_payload: Optional[Dict[str, Any]] = None
+        timeout_seconds = 450.0
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                res = (
+                    supabase.table("runner_events")
+                    .select("payload")
+                    .eq("device_id", device_id)
+                    .eq("command_id", command_id)
+                    .eq("type", "BACKTEST_PREVIEW_DONE")
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                rows = res.data or []
+                if rows and isinstance(rows[0], dict):
+                    raw_payload = rows[0].get("payload")
+                    if isinstance(raw_payload, dict):
+                        event_payload = raw_payload
+                        break
+            except Exception as poll_err:
+                logger.warning(
+                    "[CHAT] BACKTEST_PREVIEW poll error command_id=%s: %s",
+                    command_id,
+                    poll_err,
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.5, remaining))
+
+        if event_payload:
+            logger.info(
+                "[CHAT] BACKTEST_PREVIEW_DONE received: command_id=%s chat_id=%s",
+                command_id,
+                chat_id,
+            )
+            return (
+                _format_backtest_preview_done_reply(event_payload, lookback_days),
+                "backtest_preview",
+                "backtest_preview_done",
+            )
+
+        logger.warning(
+            "[CHAT] BACKTEST_PREVIEW timeout: command_id=%s device_id=%s timeout_seconds=%s",
+            command_id,
+            device_id,
+            timeout_seconds,
+        )
+        return (
+            "Ho inviato la richiesta al runner, ma non ho ancora ricevuto il risultato. "
+            "Verifica che il runner sia collegato e riprova.",
+            "backtest_preview",
+            "backtest_preview_timeout",
+        )
+    except Exception as e:
+        logger.error(
+            "[CHAT] BACKTEST_PREVIEW enqueue failed: chat_id=%s user_id=%s error=%s",
+            chat_id,
+            user_id,
+            e,
+            exc_info=True,
+        )
+        return (
+            f"❌ Errore nell'invio della preview al runner: {e}",
+            "backtest_preview",
+            "backtest_preview_enqueue_failed",
+        )
+
+
 def get_runner_online_for_user(user_id: str) -> tuple[bool, float | None, str | None]:
     """
     Verifica se il runner è online per l'utente specificato.
@@ -4971,6 +5384,39 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
         )
         
         return response_data
+
+    # STEP 2.4: Backtest preview (linguaggio naturale) -> runner_commands
+    if runner_backtest_mod and _is_backtest_preview_request(user_message_content):
+        assistant_reply, source, mode = _handle_backtest_preview_request(
+            chat_id=chat_id,
+            user_id=user_id,
+            user_message=user_message_content,
+        )
+        insert_assistant_ok, assistant_message_id, assistant_insert_error = _insert_assistant_message(
+            chat_id=chat_id,
+            user_id=user_id,
+            content=assistant_reply,
+        )
+        if not insert_assistant_ok:
+            error_details = str(assistant_insert_error) if assistant_insert_error else "Unknown error"
+            logger.error(
+                f"[CHAT] INSERT assistant FAILED (backtest preview): "
+                f"chat_id={chat_id}, user_id={user_id}, error={error_details}"
+            )
+        response_data = {
+            "ok": True,
+            "chat_id": chat_id,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id if insert_assistant_ok else None,
+            "reply": assistant_reply,
+            "source": source,
+            "mode": mode,
+        }
+        logger.info(
+            f"[CHAT] POST /chat BACKTEST_PREVIEW reply: chat_id={chat_id}, user_id={user_id}, "
+            f"mode={mode}, insert_user_ok={insert_user_ok}, insert_assistant_ok={insert_assistant_ok}"
+        )
+        return response_data
     
     # STEP 2.5: Domande di stato runner (linguaggio naturale) -> risposta immediata
     if _is_runner_status_question(user_message_content):
@@ -5091,6 +5537,17 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
         f"confidence={intent_result.confidence if intent_result else 0.0:.2f} "
         f"normalized={normalized_command!r} chat_id={chat_id} user_id={user_id}"
     )
+    if intent_result and intent_result.intent_name in ("START_BOT", "STOP_BOT"):
+        logger.info(
+            "[CHAT_BOT_INTENT] original=%r intent=%s confidence=%.3f "
+            "normalized_command=%r match=%s chat_id=%s",
+            user_message_content,
+            intent_result.intent_name,
+            intent_result.confidence,
+            normalized_command,
+            intent_result.params.get("match_reason"),
+            chat_id,
+        )
     
     # STEP 4: Genera risposta
     assistant_reply = ""
@@ -5269,9 +5726,22 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                 cmd_sub = parts_cmd[1].lower() if len(parts_cmd) >= 2 else ""
                 
                 if cmd_base == "/bot" and cmd_sub == "start":
-                    assistant_reply = random.choice(START_BOT_MESSAGES)
+                    assistant_reply = random.choice(START_BOT_MESSAGES) + (
+                        "\n\n"
+                        "Puoi seguire lo stato del bot nella tabella a sinistra.\n\n"
+                        "Per interromperlo in qualsiasi momento scrivi in chat:\n"
+                        "• ferma bot\n"
+                        "• stop bot\n"
+                        "• blocca tutto"
+                    )
                 elif cmd_base == "/bot" and cmd_sub == "stop":
-                    assistant_reply = random.choice(STOP_BOT_MESSAGES)
+                    assistant_reply = random.choice(STOP_BOT_MESSAGES) + (
+                        "\n\n"
+                        "Vuoi modificare qualche parametro o riavviare il bot?\n\n"
+                        "Puoi:\n"
+                        "• modificare la configurazione\n"
+                        "• avviare nuovamente il bot"
+                    )
                 else:
                     # Messaggio più chiaro: mostra il testo originale se diverso dal normalizzato
                     if user_message_content != normalized_command:
