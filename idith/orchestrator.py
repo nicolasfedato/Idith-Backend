@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 import os
@@ -73,8 +73,6 @@ FORCE_FULL_RESET_CONFIG_STATE_SNAPSHOT: Dict[str, Any] = {
         "strategy_params": None,
     },
     "error_count": {},
-    "suggested_sl": None,
-    "last_greeting_variant": None,
     "pending_sl_confirmation": None,
     "pending_risk_confirmation": None,
     "pending_leverage_confirmation": None,
@@ -84,39 +82,135 @@ FORCE_FULL_RESET_CONFIG_STATE_SNAPSHOT: Dict[str, Any] = {
 HIGH_LEVERAGE_WARNING_THRESHOLD = 4
 HIGH_RISK_PCT_WARNING_THRESHOLD = 4
 
+AWAITING_LEVERAGE_VALUE_STEP = "awaiting_leverage_value"
+_LEV_REMOVE_REPLY_PREFIX = "Ho rimosso la leva e aggiornato il mercato a Spot."
+
+
+def _lev_remove_reply_with_summary(params: Dict[str, Any]) -> str:
+    return f"{_LEV_REMOVE_REPLY_PREFIX}\n\n{_build_summary(params, full_config=True)}"
+
+
+def _apply_leverage_remove_params(
+    params: Dict[str, Any],
+    cs: Dict[str, Any],
+    state: Dict[str, Any],
+) -> None:
+    """Spot + leverage=None immediato, senza conferme."""
+    params["market_type"] = "spot"
+    params["leverage"] = None
+    cs["pending_leverage_confirmation"] = None
+    if cs.get("step") == AWAITING_LEVERAGE_VALUE_STEP:
+        cs["step"] = None
+        state["step"] = None
+
+# Effimeri: non persistiti in config_state (vedi app.save_chat_state sanitization)
+_greeting_variant_by_chat: Dict[str, int] = {}
+
+
+def _chat_id_from_state(state: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(state, dict):
+        return None
+    cid = state.get("chat_id") or state.get("session_id")
+    return str(cid) if cid else None
+
+
+def _next_greeting_variant(state: Dict[str, Any]) -> int:
+    chat_id = _chat_id_from_state(state) or "__default__"
+    last = _greeting_variant_by_chat.get(chat_id)
+    next_v = 0 if last is None else (last + 1) % 3
+    _greeting_variant_by_chat[chat_id] = next_v
+    return next_v
+
+
+def _runtime_suggested_sl(cs: Dict[str, Any]) -> Optional[float]:
+    """Suggerimento SL per pending attivo (ricalcolato, non persistito)."""
+    pending = cs.get("pending_sl_confirmation")
+    if pending is None:
+        return None
+    try:
+        sl_pct = float(str(pending).replace("%", "").replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    _, _, suggested = _check_sl_warning(sl_pct)
+    return suggested
+
+
+def _strategy_period_index(params: Dict[str, Any]) -> int:
+    """Indice del primo periodo indicatore ancora da raccogliere."""
+    required = free_plan.get_required_period_fields_ordered(params)
+    for i, field in enumerate(required):
+        if params.get(field) is None:
+            return i
+    return len(required)
+
+
+_NON_LEVERAGE_NUMERIC_CONTEXT_RE = re.compile(
+    r"(?:\bsl\b|stop\s*loss|stoploss|\btp\b|take\s*profit|takeprofit|\brischio\b|\brisk\b)"
+    r"\s*[:=]?\s*\d+(?:[.,]\d+)?\s*%?",
+    re.I,
+)
+
+_LEV_DIRECT_VALUE_PATTERNS: Tuple[str, ...] = (
+    r"\b(?:leva|leverage|lev)\s*[:=]?\s*(?:x\s*)?(\d+(?:\.\d+)?)\s*x?\b",
+    r"\b(?:metti|inserisci|aggiungi|imposta|usa|voglio|vorrei)\s+(?:la\s+)?(?:leva|leverage|lev)\s+(\d+(?:\.\d+)?)\s*x?\b",
+    r"\b(\d+(?:\.\d+)?)\s*x\b",
+)
+
+
+def _leverage_number_in_non_leverage_context(lt: str, match: re.Match) -> bool:
+    """True se il numero catturato appartiene a sl/tp/rischio nel messaggio."""
+    num_start = match.start(1)
+    before = lt[max(0, num_start - 40):num_start]
+    if re.search(
+        r"(?:\bsl\b|stop\s*loss|stoploss|\btp\b|take\s*profit|takeprofit|\brischio\b|\brisk\b)\s*[:=]?\s*$",
+        before,
+        re.I,
+    ):
+        return True
+    for ctx_m in _NON_LEVERAGE_NUMERIC_CONTEXT_RE.finditer(lt):
+        ctx_num = re.search(r"\d+(?:[.,]\d+)?", ctx_m.group(0))
+        if not ctx_num:
+            continue
+        abs_start = ctx_m.start() + ctx_num.start()
+        abs_end = ctx_m.start() + ctx_num.end()
+        if not (num_start >= abs_end or match.end(1) <= abs_start):
+            return True
+    return False
+
+
+def _extract_direct_leverage_value(text: str) -> Optional[int]:
+    """
+    Estrae la leva solo se il numero è legato direttamente alla leva.
+    Non usa numeri di sl/tp/rischio/risk.
+    """
+    lt = _normalize_lev_intent_text(text)
+    if not lt:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?\s*x", lt):
+        m = re.match(r"(\d+(?:\.\d+)?)", lt)
+        if m:
+            try:
+                return int(float(m.group(1)))
+            except Exception:
+                return None
+    for pattern in _LEV_DIRECT_VALUE_PATTERNS:
+        for m in re.finditer(pattern, lt, re.I):
+            if _leverage_number_in_non_leverage_context(lt, m):
+                continue
+            try:
+                return int(float(m.group(1)))
+            except Exception:
+                continue
+    return None
+
 
 def _extract_leverage_int_from_text(user_text: str) -> Optional[int]:
     """
     Estrae la leva come intero da testo libero.
-    Formati tipici: '2x', '2', '2 X', 'x10', 'leva 5', 'leverage 3'.
+    Formati tipici: '10x', 'leva 5', 'leverage 3', 'metti leva 10'.
+    Non usa numeri generici né numeri legati a sl/tp/rischio.
     """
-    text = (user_text or "").strip()
-    if not text:
-        return None
-    lt = text.lower()
-    candidate_num_str: Optional[str] = None
-    num_pattern = r"\d+(?:\.\d+)?"
-    m = re.search(rf"(?:leva|leverag|lev)\s*[:=]?\s*(?:x\s*({num_pattern})|({num_pattern})\s*x?)", lt)
-    if m:
-        candidate_num_str = m.group(1) or m.group(2)
-    if not candidate_num_str:
-        m = re.search(rf"x\s*({num_pattern})", lt)
-        if m:
-            candidate_num_str = m.group(1)
-    if not candidate_num_str:
-        m = re.search(rf"({num_pattern})\s*x\b", lt)
-        if m:
-            candidate_num_str = m.group(1)
-    if not candidate_num_str:
-        all_nums = re.findall(num_pattern, lt)
-        if all_nums:
-            candidate_num_str = all_nums[-1]
-    if not candidate_num_str:
-        return None
-    try:
-        return int(float(candidate_num_str))
-    except Exception:
-        return None
+    return _extract_direct_leverage_value(user_text)
 
 
 def _parse_user_leverage_int(raw: Any) -> Optional[int]:
@@ -128,6 +222,334 @@ def _parse_user_leverage_int(raw: Any) -> Optional[int]:
     if isinstance(raw, float):
         return int(raw)
     return _extract_leverage_int_from_text(str(raw))
+
+
+_LEV_INTENT_REMOVE_PHRASES: Tuple[str, ...] = (
+    "voglio togliere la leva",
+    "vorrei togliere la leva",
+    "metti senza leva",
+    "non voglio la leva",
+    "non voglio leva",
+    "non usare la leva",
+    "non usare leva",
+    "leva disattivata",
+    "disattiva la leva",
+    "togli la leva",
+    "togli leva",
+    "rimuovi la leva",
+    "rimuovi leva",
+    "elimina la leva",
+    "elimina leva",
+    "cancella la leva",
+    "cancella leva",
+    "senza leva",
+    "no leva",
+    "leva no",
+    "leva zero",
+)
+
+_LEV_INTENT_ADD_NO_VALUE_PHRASES: Tuple[str, ...] = (
+    "voglio passare a futures",
+    "passa a futures",
+    "voglio inserire la leva",
+    "vorrei inserire la leva",
+    "voglio usare la leva",
+    "vorrei usare la leva",
+    "metti la leva",
+    "voglio la leva",
+    "vorrei la leva",
+    "inserisci la leva",
+    "aggiungi la leva",
+    "abilita la leva",
+    "attiva la leva",
+    "rimetti la leva",
+    "usa la leva",
+    "usa futures",
+    "abilita futures",
+    "voglio mettere la leva",
+    "vorrei mettere la leva",
+    "metti leva",
+    "imposta leva",
+)
+
+_LEV_INTENT_ADD_NO_VALUE_PATTERNS: Tuple[str, ...] = (
+    r"\b(?:voglio|vorrei)\s+(?:di\s+)?(?:mettere|inserire|usare|avere)\s+(?:la\s+)?leva\b",
+    r"\b(?:metti|inserisci|aggiungi|imposta|abilita|attiva|usa)\s+(?:la\s+)?leva\b",
+    r"\b(?:voglio|vorrei)\s+(?:la\s+)?leva\b",
+)
+
+
+def _normalize_lev_intent_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _detect_remove_leverage_intent(text: str) -> bool:
+    """Priorità assoluta: richieste di rimozione/disattivazione leva."""
+    lt = _normalize_lev_intent_text(text)
+    if not lt:
+        return False
+    for phrase in _LEV_INTENT_REMOVE_PHRASES:
+        if phrase in lt:
+            return True
+    return False
+
+
+def _detect_add_leverage_no_value_intent(text: str) -> bool:
+    """Richiesta di abilitare leva senza valore numerico esplicito."""
+    if _extract_direct_leverage_value(text) is not None:
+        return False
+    lt = _normalize_lev_intent_text(text)
+    if not lt:
+        return False
+    for phrase in _LEV_INTENT_ADD_NO_VALUE_PHRASES:
+        if phrase in lt:
+            return True
+    for pattern in _LEV_INTENT_ADD_NO_VALUE_PATTERNS:
+        if re.search(pattern, lt, re.I):
+            return True
+    return False
+
+
+def _detect_leverage_intent(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Normalizza le frasi con cui l'utente vuole rimuovere, aggiungere o impostare la leva.
+    Ritorna {"action": "remove"} oppure {"action": "add", "value": int|None}.
+    """
+    lt = _normalize_lev_intent_text(text)
+    if not lt:
+        return None
+
+    if _detect_remove_leverage_intent(text):
+        logger.info("[LEV_INTENT] remove_leverage_intent=True")
+        return {"action": "remove"}
+
+    lev_val = _extract_direct_leverage_value(text)
+    if lev_val is not None:
+        logger.info("[LEV_INTENT] add_leverage_intent=True value=%s", lev_val)
+        return {"action": "add", "value": lev_val}
+
+    if _detect_add_leverage_no_value_intent(text):
+        logger.info("[LEV_INTENT] add_leverage_intent=True value=None")
+        return {"action": "add", "value": None}
+
+    return None
+
+
+def _apply_leverage_intent(
+    intent: Dict[str, Any],
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Applica remove/add leva e persiste config_state."""
+    action = intent.get("action")
+
+    if action == "remove":
+        logger.info("[LEV_INTENT] remove -> spot leverage=None")
+        _apply_leverage_remove_params(params, cs, state)
+        if is_config_complete(params):
+            state["config_status"] = "complete"
+            _cleanup_config_state_when_complete(cs)
+            cs["step"] = None
+            state["step"] = None
+        else:
+            state["config_status"] = "in_progress"
+            _recompute_step(cs)
+        params = _sync_strategy_from_periods(params)
+        state, cs, params = _sync_state(state, cs, params)
+        logger.info("[LEV_INTENT] saved config_state")
+        return {
+            "reply": _lev_remove_reply_with_summary(params),
+            "state": state,
+        }
+
+    if action == "add":
+        lev_val = intent.get("value")
+        params["market_type"] = "futures"
+
+        if lev_val is None:
+            logger.info("[LEV_INTENT] add_without_value -> awaiting_leverage_value")
+            params["leverage"] = None
+            cs["pending_leverage_confirmation"] = None
+            cs["step"] = AWAITING_LEVERAGE_VALUE_STEP
+            state["config_status"] = "in_progress"
+            state["step"] = AWAITING_LEVERAGE_VALUE_STEP
+            params = _sync_strategy_from_periods(params)
+            state, cs, params = _sync_state(state, cs, params)
+            logger.info("[LEV_INTENT] saved config_state")
+            return {"reply": "Che leva vuoi utilizzare?", "state": state}
+
+        logger.info("[LEV_INTENT] add -> futures leverage=%s", lev_val)
+        is_valid, error_msg, _warning_msg = _validate_step_value("leverage", lev_val, params)
+        if not is_valid:
+            params = _sync_strategy_from_periods(params)
+            state, cs, params = _sync_state(state, cs, params)
+            logger.info("[LEV_INTENT] saved config_state")
+            return {"reply": error_msg or "Valore di leva non valido.", "state": state}
+
+        lev_int = int(lev_val)
+        requires_confirm, warning_msg = _check_leverage_warning(
+            lev_int, params.get("symbol") or "questa coppia"
+        )
+        if requires_confirm:
+            cs["pending_leverage_confirmation"] = lev_int
+            cs["step"] = "leverage"
+            state["config_status"] = "in_progress"
+            params = _sync_strategy_from_periods(params)
+            state, cs, params = _sync_state(state, cs, params)
+            logger.info("[LEV_INTENT] saved config_state")
+            return {"reply": warning_msg or _step_question("leverage", params), "state": state}
+
+        params["leverage"] = lev_int
+        cs["pending_leverage_confirmation"] = None
+        if is_config_complete(params):
+            state["config_status"] = "complete"
+            _cleanup_config_state_when_complete(cs)
+            cs["step"] = None
+            state["step"] = None
+        else:
+            state["config_status"] = "in_progress"
+            _recompute_step(cs)
+        params = _sync_strategy_from_periods(params)
+        state, cs, params = _sync_state(state, cs, params)
+        logger.info("[LEV_INTENT] saved config_state")
+        return {
+            "reply": _build_summary(params, full_config=True),
+            "state": state,
+        }
+
+    return {"reply": _step_question(cs.get("step") or "market_type", params), "state": state}
+
+
+def _lev_intent_has_non_leverage_params(user_text: str) -> bool:
+    """True se il messaggio contiene anche altri parametri oltre a leva/market_type."""
+    updates = _extract_modification_requests(user_text, {}, current_step=None)
+    return bool({k for k in updates if k not in ("leverage", "market_type")})
+
+
+def _apply_leverage_intent_side_effects(
+    intent: Dict[str, Any],
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Applica solo gli effetti su params/cs, senza costruire la reply."""
+    action = intent.get("action")
+    if action == "remove":
+        logger.info("[LEV_INTENT] remove -> spot leverage=None (inline)")
+        _apply_leverage_remove_params(params, cs, state)
+        cs["_lev_remove_inline_this_turn"] = True
+    elif action == "add":
+        params["market_type"] = "futures"
+        lev_val = intent.get("value")
+        if lev_val is None:
+            logger.info("[LEV_INTENT] add -> futures leverage=None (inline)")
+            params["leverage"] = None
+            cs["pending_leverage_confirmation"] = None
+        else:
+            lev_int = int(lev_val)
+            requires_confirm, _ = _check_leverage_warning(
+                lev_int, params.get("symbol") or "questa coppia"
+            )
+            if requires_confirm:
+                logger.info("[LEV_INTENT] add -> futures pending_leverage=%s (inline)", lev_int)
+                cs["pending_leverage_confirmation"] = lev_int
+            else:
+                logger.info("[LEV_INTENT] add -> futures leverage=%s (inline)", lev_int)
+                params["leverage"] = lev_int
+                cs["pending_leverage_confirmation"] = None
+    params = _sync_strategy_from_periods(params)
+    return _sync_state(state, cs, params)
+
+
+def _try_handle_remove_leverage_intent(
+    user_text: str,
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Priorità 1: rimozione leva."""
+    if not _detect_remove_leverage_intent(user_text):
+        return None
+    intent = {"action": "remove"}
+    if _lev_intent_has_non_leverage_params(user_text):
+        logger.info("[LEV_INTENT] multiparam remove: apply side effects and continue")
+        state, cs, params = _apply_leverage_intent_side_effects(intent, state, cs, params)
+        return None
+    return _apply_leverage_intent(intent, state, cs, params)
+
+
+def _try_handle_awaiting_leverage_value(
+    user_text: str,
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Priorità 2: attende valore numerico leva dopo add senza valore."""
+    if cs.get("step") != AWAITING_LEVERAGE_VALUE_STEP:
+        return None
+
+    lev_val = _wizard_try_minimal_leverage_value(user_text)
+    if lev_val is None:
+        lev_val = _extract_direct_leverage_value(user_text)
+    if lev_val is None:
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": "Che leva vuoi utilizzare?", "state": state}
+
+    logger.info("[LEV_INTENT] pending_value -> leverage=%s", lev_val)
+    is_valid, error_msg, _ = _validate_step_value("leverage", lev_val, params)
+    if not is_valid:
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": error_msg or "Che leva vuoi utilizzare?", "state": state}
+
+    lev_int = int(lev_val)
+    params["market_type"] = "futures"
+    requires_confirm, warning_msg = _check_leverage_warning(
+        lev_int, params.get("symbol") or "questa coppia"
+    )
+    if requires_confirm:
+        cs["pending_leverage_confirmation"] = lev_int
+        cs["step"] = "leverage"
+        state["step"] = "leverage"
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": warning_msg or _step_question("leverage", params), "state": state}
+
+    params["leverage"] = lev_int
+    cs["pending_leverage_confirmation"] = None
+    if is_config_complete(params):
+        state["config_status"] = "complete"
+        _cleanup_config_state_when_complete(cs)
+        cs["step"] = None
+        state["step"] = None
+    else:
+        state["config_status"] = "in_progress"
+        _recompute_step(cs)
+    params = _sync_strategy_from_periods(params)
+    state, cs, params = _sync_state(state, cs, params)
+    logger.info("[LEV_INTENT] saved config_state")
+    return {
+        "reply": _build_summary(params, full_config=True),
+        "state": state,
+    }
+
+
+def _try_handle_add_leverage_intent(
+    user_text: str,
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Priorità 3: aggiunta/impostazione leva."""
+    intent = _detect_leverage_intent(user_text)
+    if intent is None or intent.get("action") != "add":
+        return None
+
+    if _lev_intent_has_non_leverage_params(user_text):
+        logger.info("[LEV_INTENT] multiparam add: apply side effects and continue")
+        state, cs, params = _apply_leverage_intent_side_effects(intent, state, cs, params)
+        return None
+
+    return _apply_leverage_intent(intent, state, cs, params)
 
 
 # Modalità operative supportate nel piano FREE
@@ -526,11 +948,9 @@ def _ensure_state(state: Dict[str, Any]) -> Dict[str, Any]:
     if "pending_risk_confirmation" not in cs:
         cs["pending_risk_confirmation"] = None
     
-    # Inizializza pending_sl_confirmation e suggested_sl se mancano (per gating stop loss)
+    # Inizializza pending_sl_confirmation se manca (per gating stop loss)
     if "pending_sl_confirmation" not in cs:
         cs["pending_sl_confirmation"] = None
-    if "suggested_sl" not in cs:
-        cs["suggested_sl"] = None
     # BUG3: Inizializza pending_leverage_confirmation per leva alta
     if "pending_leverage_confirmation" not in cs:
         cs["pending_leverage_confirmation"] = None
@@ -559,23 +979,20 @@ def _ensure_state(state: Dict[str, Any]) -> Dict[str, Any]:
     if "error_count" not in cs:
         cs["error_count"] = {}  # {step: count}
     
-    # Inizializza last_greeting_variant per anti-ripetizione saluti
-    if "last_greeting_variant" not in cs:
-        cs["last_greeting_variant"] = None  # 0, 1, o 2
-    
     # Migrazione: se free_strategy_id è presente in params, assicurati che sia persistito
     # (non serve più _preset_id, usiamo direttamente free_strategy_id in params)
     # Rimuoviamo _preset_id se presente (cleanup legacy)
     cs.pop("_preset_id", None)
     
     # Step corrente = primo campo mancante nella sequenza free_plan.FREE_WIZARD_SEQUENCE
-    missing = free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
-    if missing is not None:
-        cs["step"] = missing
-    elif is_config_complete(params):
-        cs["step"] = None
-    else:
-        cs["step"] = _free_wizard_terminal_step(params)
+    if cs.get("step") != AWAITING_LEVERAGE_VALUE_STEP:
+        missing = free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
+        if missing is not None:
+            cs["step"] = missing
+        elif is_config_complete(params):
+            cs["step"] = None
+        else:
+            cs["step"] = _free_wizard_terminal_step(params)
     state["config_state"] = cs
 
     # Coerenza: mai restare "complete" se i params non soddisfano is_config_complete (es. reset DB incompleto).
@@ -1544,6 +1961,8 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
         v_min = _wizard_try_minimal_numeric_percent_value(text, "sl")
         if v_min is not None:
             return _wizard_format_sl_tp_string(v_min)
+        if _text_mentions_tp(lt) and not _text_mentions_sl(lt):
+            return None
         pct_raw = extract_percentage_value(text)
         if pct_raw is not None:
             return _wizard_format_sl_tp_string(float(pct_raw))
@@ -1560,6 +1979,9 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
                 fv = None
             if fv is not None:
                 return _wizard_format_sl_tp_string(fv)
+        ctx_tp = _extract_contextual_tp_numeric(user_text)
+        if ctx_tp is not None:
+            return _wizard_format_sl_tp_string(ctx_tp)
         v_min = _wizard_try_minimal_numeric_percent_value(text, "tp")
         if v_min is not None:
             return _wizard_format_sl_tp_string(v_min)
@@ -1619,7 +2041,11 @@ def _extract_confirmation(user_text: str) -> Optional[bool]:
     lt = user_text.strip().lower()
     confirm_words = ["si", "sì", "s", "yes", "y", "ok", "confermo", "conferma"]
     deny_words = ["no", "n", "non", "niente"]
-    
+
+    # "no, metti 2" / "no metti 2%" → sostituzione valore, non diniego secco
+    if any(w in lt for w in deny_words) and re.search(r"\d", lt):
+        return None
+
     for word in confirm_words:
         if word in lt:
             return True
@@ -1627,6 +2053,387 @@ def _extract_confirmation(user_text: str) -> Optional[bool]:
         if word in lt:
             return False
     return None
+
+
+_SL_CONTEXT_NUMERIC_PATTERNS = (
+    r"(?:\bsl\b|stop\s*loss|stoploss)\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*%?",
+    r"(?:metti|imposta|cambia|modifica|setta|aggiorna|vorrei|preferisco|usa|meglio)\s+"
+    r"(?:a\s+)?(?:lo\s+)?(?:\bsl\b|stop\s*loss|stoploss)\s*(\d+(?:[.,]\d+)?)\s*%?",
+    r"(?:metti|imposta|cambia|modifica|setta|aggiorna|vorrei|preferisco|usa|meglio)\s+"
+    r"(?:a\s+)?(\d+(?:[.,]\d+)?)\s*%?\s+(?:\bsl\b|stop\s*loss|stoploss)\b",
+)
+
+_RISK_CONTEXT_NUMERIC_PATTERNS = (
+    r"(?:\brischio\b|\brisk\b|risk_pct)\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*%?",
+    r"(?:metti|imposta|cambia|modifica|setta|aggiorna|vorrei|preferisco|usa|meglio)\s+"
+    r"(?:a\s+)?(?:il\s+)?(?:\brischio\b|\brisk\b)\s*(\d+(?:[.,]\d+)?)\s*%?",
+    r"(?:metti|imposta|cambia|modifica|setta|aggiorna|vorrei|preferisco|usa|meglio)\s+"
+    r"(?:a\s+)?(\d+(?:[.,]\d+)?)\s*%?\s+(?:\brischio\b|\brisk\b)\b",
+    r"(?:percentuale\s+)?(?:di\s+)?(?:\brischio\b|\brisk\b)\s*(?:a|al|in)?\s*(\d+(?:[.,]\d+)?)\s*%?",
+)
+
+
+def _float_from_matched_numeric(raw: str) -> Optional[float]:
+    try:
+        return float(str(raw).replace("%", "").replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_contextual_sl_numeric(user_text: str) -> Optional[float]:
+    """Estrae SL solo se il numero è esplicitamente legato a sl/stop loss nel testo."""
+    if not (user_text or "").strip():
+        return None
+    lt = user_text.strip().lower()
+    for pattern in _SL_CONTEXT_NUMERIC_PATTERNS:
+        m = re.search(pattern, lt, re.I)
+        if m:
+            val = _float_from_matched_numeric(m.group(1))
+            if val is not None:
+                return val
+    return None
+
+
+def _extract_contextual_risk_pct_numeric(user_text: str) -> Optional[float]:
+    """Estrae risk_pct solo se il numero è esplicitamente legato a rischio/risk nel testo."""
+    if not (user_text or "").strip():
+        return None
+    lt = user_text.strip().lower()
+    for pattern in _RISK_CONTEXT_NUMERIC_PATTERNS:
+        m = re.search(pattern, lt, re.I)
+        if m:
+            val = _float_from_matched_numeric(m.group(1))
+            if val is not None:
+                return val
+    return None
+
+
+_TP_CONTEXT_NUMERIC_PATTERNS = (
+    r"(?:take\s*profit|takeprofit|\btp\b)\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*%?",
+    r"(?:take\s*profit|takeprofit|\btp\b)[^0-9]{0,96}?\b(?:detto|era|è|e'|fosse|sia|metti|imposta|cambia|modifica|aggiorna|avevo|volevo|doveva|devi|dovevi|dimenticat\w*)\b[^0-9]{0,32}?(\d+(?:[.,]\d+)?)\s*%?",
+    r"\b(?:detto|era|è|e'|fosse|sia|metti|imposta|cambia|modifica|aggiorna|avevo|volevo|doveva|devi|dovevi)\b\s*(\d+(?:[.,]\d+)?)\s*%?[^0-9]{0,96}?(?:take\s*profit|takeprofit|\btp\b)",
+)
+
+_TP_MENTION_RE = re.compile(r"\b(?:take\s*profit|takeprofit|tp)\b", re.I)
+_SL_MENTION_RE = re.compile(r"\b(?:stop\s*loss|stoploss|sl)\b", re.I)
+
+
+def _text_mentions_tp(lt: str) -> bool:
+    return bool(_TP_MENTION_RE.search(lt or ""))
+
+
+def _text_mentions_sl(lt: str) -> bool:
+    return bool(_SL_MENTION_RE.search(lt or ""))
+
+
+def _extract_contextual_tp_numeric(user_text: str) -> Optional[float]:
+    """Estrae TP se il testo menziona tp/take profit e un numero associato (anche non adiacente)."""
+    if not (user_text or "").strip():
+        return None
+    lt = user_text.strip().lower()
+    if not _text_mentions_tp(lt):
+        return None
+    for pattern in _TP_CONTEXT_NUMERIC_PATTERNS:
+        m = re.search(pattern, lt, re.I)
+        if m:
+            val = _float_from_matched_numeric(m.group(1))
+            if val is not None:
+                return val
+    if not _text_mentions_sl(lt):
+        pct_raw = extract_percentage_value(user_text)
+        if pct_raw is not None:
+            try:
+                return float(pct_raw)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _extract_pending_sl_replacement_value(
+    user_text: str,
+    pending_sl: Optional[Any] = None,
+) -> Optional[float]:
+    """
+    Nuovo SL proposto dall'utente mentre c'è pending_sl_confirmation.
+    Usa solo pattern contestuali SL (mai il primo numero generico del messaggio).
+    """
+    val = _extract_contextual_sl_numeric(user_text)
+    if val is None:
+        return None
+    if pending_sl is not None:
+        try:
+            if abs(val - float(pending_sl)) < 1e-9:
+                return None
+        except (TypeError, ValueError):
+            pass
+    return val
+
+
+def _user_confirms_pending_sl(user_text: str) -> bool:
+    """Conferma esplicita del pending SL senza nuovo valore SL nel messaggio."""
+    if _extract_contextual_sl_numeric(user_text) is not None:
+        return False
+    return _user_confirms_sl_in_message(user_text)
+
+
+def _user_confirms_sl_in_message(user_text: str) -> bool:
+    """True se il messaggio conferma esplicitamente lo SL (anche con altri numeri per altri campi)."""
+    lt = (user_text or "").strip().lower()
+    if re.search(r"\bconferm\w*\s+(?:lo\s+)?(?:\bsl\b|stop\s*loss|stoploss)\b", lt, re.I):
+        return True
+    if re.search(r"\b(?:\bsl\b|stop\s*loss|stoploss)\b", lt, re.I) and re.search(
+        r"\b(?:si|sì|ok|confermo|conferma|va\s+bene|accetto)\b", lt, re.I
+    ):
+        if _extract_contextual_sl_numeric(user_text) is None:
+            return True
+    return False
+
+
+_SL_EXPLICIT_CONFIRM_IN_MESSAGE_RE = re.compile(
+    r"\b(?:si|sì|ok|confermo|conferma|va\s+bene|accetto)\b",
+    re.I,
+)
+
+
+def _has_explicit_sl_confirm_intent(user_text: str) -> bool:
+    """
+    True se il messaggio contiene conferma esplicita (anche insieme a un nuovo valore SL).
+    Es.: "metti sl 20 e confermo rischio", "ok sl 20", "confermo sl 20".
+    """
+    return bool(_SL_EXPLICIT_CONFIRM_IN_MESSAGE_RE.search((user_text or "").strip()))
+
+
+def _user_confirms_pending_risk_in_message(user_text: str) -> bool:
+    """
+    True se il messaggio conferma esplicitamente il rischio pending.
+    Es.: "confermo rischio", "metti sl 30 e confermo rischio", "ok confermo risk".
+    """
+    if _extract_contextual_risk_pct_numeric(user_text) is not None:
+        return False
+    lt = (user_text or "").strip().lower()
+    if re.search(r"\bconferm\w*\s+(?:il\s+)?(?:rischio|risk)\b", lt, re.I):
+        return True
+    if re.search(r"\b(?:rischio|risk)\b", lt, re.I) and re.search(
+        r"\b(?:si|sì|ok|confermo|conferma|va\s+bene|accetto)\b", lt, re.I
+    ):
+        return True
+    return False
+
+
+def _apply_risk_pct_from_message(
+    user_text: str,
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Applica risk_pct dal messaggio: nuovo valore contestuale (metti rischio 5) oppure
+    conferma del pending se non c'è un nuovo numero per il rischio.
+    """
+    contextual_risk = _extract_contextual_risk_pct_numeric(user_text)
+    if contextual_risk is not None:
+        params["risk_pct"] = contextual_risk
+        cs["pending_risk_confirmation"] = None
+        _ec = cs.get("error_count")
+        if isinstance(_ec, dict):
+            _ec2 = dict(_ec)
+            _ec2.pop("risk_pct", None)
+            cs["error_count"] = _ec2
+        logger.info("[RISK_APPLY] apply risk_pct=%s (contextual value in message)", contextual_risk)
+        fmt = int(contextual_risk) if contextual_risk == int(contextual_risk) else contextual_risk
+        return f"Rischio impostato a {fmt}%."
+
+    pending_risk = cs.get("pending_risk_confirmation")
+    if pending_risk is None:
+        return None
+    if not _user_confirms_pending_risk_in_message(user_text):
+        return None
+    try:
+        risk_val = float(str(pending_risk).replace("%", "").replace(",", "."))
+    except (TypeError, ValueError):
+        risk_val = pending_risk
+    params["risk_pct"] = risk_val
+    cs["pending_risk_confirmation"] = None
+    _ec = cs.get("error_count")
+    if isinstance(_ec, dict):
+        _ec2 = dict(_ec)
+        _ec2.pop("risk_pct", None)
+        cs["error_count"] = _ec2
+    logger.info("[RISK_CONFIRM_SKIP] apply risk_pct=%s (explicit confirm in message)", risk_val)
+    fmt = int(risk_val) if isinstance(risk_val, float) and risk_val == int(risk_val) else risk_val
+    return f"Rischio confermato a {fmt}%."
+
+
+def _commit_pending_risk_if_confirmed_in_message(
+    user_text: str,
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Optional[str]:
+    """Compat: delega a _apply_risk_pct_from_message."""
+    return _apply_risk_pct_from_message(user_text, cs, params)
+
+
+def _extract_sl_numeric_from_message(
+    user_text: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """Estrae SL solo da pattern esplicitamente legati a sl/stop loss."""
+    return _extract_contextual_sl_numeric(user_text)
+
+
+def _commit_sl_value_wizard_reply(
+    sl_val: float,
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+    current_step: str,
+    *,
+    ack_line: Optional[str] = None,
+    skip_high_risk_confirm: bool = False,
+    user_text: str = "",
+) -> Dict[str, Any]:
+    hard_sl = _wizard_hard_limit_error_message("sl", sl_val)
+    if hard_sl:
+        _log_wizard_numeric_hard_reject("sl", sl_val, "out_of_range")
+        cs["pending_sl_confirmation"] = None
+        _log_wizard_numeric_hard_reject_return("sl")
+        state, cs, params = _sync_state(state, cs, params)
+        return {"reply": hard_sl, "state": state}
+
+    if not skip_high_risk_confirm:
+        requires_confirm, warning_msg, suggested_sl = _check_sl_warning(sl_val)
+        if requires_confirm:
+            cs["pending_sl_confirmation"] = sl_val
+            state, cs, params = _sync_state(state, cs, params)
+            return {"reply": warning_msg or _step_question("sl", params), "state": state}
+    else:
+        logger.info("[SL_CONFIRM_SKIP] apply sl=%s without high-risk pending (explicit confirm in message)", sl_val)
+
+    params["sl"] = f"{sl_val}%"
+    cs["pending_sl_confirmation"] = None
+
+    risk_ack = _apply_risk_pct_from_message(user_text, cs, params)
+
+    params = _sync_strategy_from_periods(params)
+    state, cs, params = _sync_state(state, cs, params)
+
+    fmt = int(sl_val) if sl_val == int(sl_val) else sl_val
+    prefix_parts = [ack_line or f"Stop Loss aggiornato a {fmt}%."]
+    if risk_ack:
+        prefix_parts.append(risk_ack)
+    prefix = "\n".join(prefix_parts)
+    tail = _wizard_seq_tail_after_save(
+        state,
+        cs,
+        params,
+        current_step,
+        summary_followup=_CONFIG_COMPLETE_FOLLOWUP,
+    )
+    tail["reply"] = f"{prefix}\n\n{tail['reply']}"
+    return tail
+
+
+def _handle_pending_sl_user_reply(
+    user_text: str,
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+    current_step: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Gestisce risposta utente con pending_sl_confirmation attivo (qualsiasi step).
+    Priorità: nuovo valore → conferma → diniego secco → ripeti warning.
+    """
+    pending_sl = cs.get("pending_sl_confirmation")
+    if pending_sl is None:
+        return None
+
+    contextual_sl = _extract_contextual_sl_numeric(user_text)
+    contextual_risk = _extract_contextual_risk_pct_numeric(user_text)
+    confirms_sl = _user_confirms_sl_in_message(user_text)
+    explicit_confirm = _has_explicit_sl_confirm_intent(user_text)
+
+    # "confermo sl e metti rischio 5" → conferma SL pending, imposta risk=5
+    if confirms_sl and contextual_sl is None and contextual_risk is not None:
+        try:
+            sl_confirm = float(str(pending_sl).replace("%", "").replace(",", "."))
+        except (TypeError, ValueError):
+            sl_confirm = None
+        if sl_confirm is not None:
+            logger.info(
+                "[PENDING_SL_CONFIRM_APPLY] value=%s with contextual risk_pct=%s",
+                sl_confirm,
+                contextual_risk,
+            )
+            return _commit_sl_value_wizard_reply(
+                sl_confirm,
+                state,
+                cs,
+                params,
+                current_step,
+                skip_high_risk_confirm=True,
+                user_text=user_text,
+            )
+
+    replacement = _extract_pending_sl_replacement_value(user_text, pending_sl)
+    if replacement is None:
+        replacement = contextual_sl
+
+    if replacement is not None:
+        logger.info("[PENDING_SL_REPLACE] old=%s new=%s explicit_confirm=%s", pending_sl, replacement, explicit_confirm)
+        sl_str = _wizard_format_sl_tp_string(replacement)
+        is_valid, error_msg, _ = _validate_step_value("sl", sl_str, params)
+        if not is_valid:
+            cs["pending_sl_confirmation"] = None
+            state, cs, params = _sync_state(state, cs, params)
+            if _wizard_hard_limit_error_message("sl", replacement):
+                _log_wizard_numeric_hard_reject_return("sl")
+            return {
+                "reply": (error_msg or _step_question("sl", params)),
+                "state": state,
+            }
+        return _commit_sl_value_wizard_reply(
+            replacement,
+            state,
+            cs,
+            params,
+            current_step,
+            skip_high_risk_confirm=explicit_confirm,
+            user_text=user_text,
+        )
+
+    if confirms_sl and contextual_sl is None:
+        try:
+            sl_confirm = float(str(pending_sl).replace("%", "").replace(",", "."))
+        except (TypeError, ValueError):
+            sl_confirm = None
+        if sl_confirm is not None:
+            logger.info("[PENDING_SL_CONFIRM_APPLY] value=%s", sl_confirm)
+            return _commit_sl_value_wizard_reply(
+                sl_confirm,
+                state,
+                cs,
+                params,
+                current_step,
+                skip_high_risk_confirm=True,
+                user_text=user_text,
+            )
+
+    lt = user_text.strip().lower()
+    if re.search(r"\bno\b", lt) and not re.search(r"\d", lt):
+        cs["pending_sl_confirmation"] = None
+        state, cs, params = _sync_state(state, cs, params)
+        return {
+            "reply": _step_question("sl", params),
+            "state": state,
+        }
+
+    try:
+        psl = float(str(pending_sl).replace("%", "").replace(",", "."))
+    except (TypeError, ValueError):
+        psl = None
+    _, warning_msg, _ = _check_sl_warning(psl) if psl is not None else (False, None, None)
+    state, cs, params = _sync_state(state, cs, params)
+    return {"reply": warning_msg or _step_question("sl", params), "state": state}
 
 
 def _analyze_pending_resolve_input(
@@ -1648,6 +2455,20 @@ def _analyze_pending_resolve_input(
             explicit_updates[key] = extracted[key]
 
     explicit_keys_for_ambiguity = set(explicit_updates.keys())
+
+    if "sl" in merged_pending and "sl" not in explicit_updates:
+        sl_repl = _extract_pending_sl_replacement_value(
+            user_text, merged_pending.get("sl")
+        )
+        if sl_repl is not None:
+            explicit_updates["sl"] = sl_repl
+
+    if "risk_pct" in merged_pending and "risk_pct" not in explicit_updates:
+        risk_val = _extract_contextual_risk_pct_numeric(user_text)
+        if risk_val is not None:
+            pending_risk = merged_pending.get("risk_pct")
+            if pending_risk is None or abs(risk_val - float(pending_risk)) >= 1e-9:
+                explicit_updates["risk_pct"] = risk_val
 
     # Nuova leva nel messaggio mentre c'è pending: aggiorna sempre il pending (non ripetere vecchio warning)
     if (
@@ -1749,7 +2570,14 @@ def resolve_input(
     touched_fields: set[str] = set()
 
     for field, value in explicit_updates.items():
-        merged_params[field] = value
+        if field == "sl":
+            try:
+                sl_f = float(str(value).replace("%", "").replace(",", "."))
+                merged_params[field] = f"{sl_f}%"
+            except (TypeError, ValueError):
+                merged_params[field] = value
+        else:
+            merged_params[field] = value
         touched_fields.add(field)
 
     for field in confirmed_fields:
@@ -1794,7 +2622,6 @@ def _flush_all_high_risk_pending_to_params(cs: Dict[str, Any], params: Dict[str,
         except (TypeError, ValueError):
             pass
         cs["pending_sl_confirmation"] = None
-        cs["suggested_sl"] = None
 
 
 def _is_pending_numeric_positive_confirmation_text(user_text: str) -> bool:
@@ -1823,7 +2650,6 @@ def _clear_pending_confirmation_batch(cs: Dict[str, Any]) -> Dict[str, Any]:
     cs["pending_risk_confirmation"] = None
     cs["pending_leverage_confirmation"] = None
     cs["pending_sl_confirmation"] = None
-    cs["suggested_sl"] = None
     logger.info("[PENDING_BATCH_CLEAR] cleared=%s", before)
     return before
 
@@ -1883,8 +2709,6 @@ def _commit_pending_risk_or_leverage_on_confirm(
     cs["pending_sl_confirmation"] = merged_pending.get("sl")
     cs["pending_risk_confirmation"] = merged_pending.get("risk_pct")
     cs["pending_leverage_confirmation"] = merged_pending.get("leverage")
-    if "sl" not in merged_pending:
-        cs["suggested_sl"] = None
     return None
 
 
@@ -3182,6 +4006,8 @@ def _extract_modification_requests(user_text: str, params: Dict[str, Any], curre
                 updates["timeframe"] = f"{tf_num}m"
             elif tf_unit in ("ora", "ore"):
                 updates["timeframe"] = f"{tf_num}h"
+        elif re.search(r"\b(?:giornalier\w*|daily|giorno)\b", lt, re.I):
+            updates["timeframe"] = "1d"
     
     # Estrai leverage: pattern (\d+(\.\d+)?)\s*x oppure "leva 3"
     leverage_patterns = [
@@ -3231,6 +4057,11 @@ def _extract_modification_requests(user_text: str, params: Dict[str, Any], curre
                 break
             except:
                 pass
+
+    if "tp" not in updates:
+        tp_ctx = _extract_contextual_tp_numeric(user_text)
+        if tp_ctx is not None:
+            updates["tp"] = tp_ctx
     
     # Risk percentage
     risk_patterns = [
@@ -3453,6 +4284,18 @@ def _wizard_seq_handle_message(
         state, cs, params = _sync_state(state, cs, params)
         return {"reply": f"{faq_answer}\n\n{suffix}", "state": state, "skip_llm": True}
 
+    remove_lev_out = _try_handle_remove_leverage_intent(user_text, state, cs, params)
+    if remove_lev_out is not None:
+        return remove_lev_out
+
+    awaiting_lev_out = _try_handle_awaiting_leverage_value(user_text, state, cs, params)
+    if awaiting_lev_out is not None:
+        return awaiting_lev_out
+
+    add_lev_out = _try_handle_add_leverage_intent(user_text, state, cs, params)
+    if add_lev_out is not None:
+        return add_lev_out
+
     # Conferma cumulativa pending numerici (sl/risk/leva): prima di extract / modifiche / wizard
     if (
         _is_pending_numeric_positive_confirmation_text(user_text)
@@ -3496,6 +4339,13 @@ def _wizard_seq_handle_message(
         state, cs, params = _sync_state(state, cs, params)
         return {"reply": _step_question(next_ask, params), "state": state}
 
+    if cs.get("pending_sl_confirmation") is not None:
+        pending_sl_out = _handle_pending_sl_user_reply(
+            user_text, state, cs, params, current_step
+        )
+        if pending_sl_out is not None:
+            return pending_sl_out
+
     # Priorità modifiche dirette su configurazione completa:
     # Solo se il flag persisted è complete E i params passano il controllo stretto is_config_complete.
     config_is_complete = _is_configuration_complete(state) and is_config_complete(params)
@@ -3518,8 +4368,6 @@ def _wizard_seq_handle_message(
                 cs["pending_sl_confirmation"] = merged_pending.get("sl")
                 cs["pending_risk_confirmation"] = merged_pending.get("risk_pct")
                 cs["pending_leverage_confirmation"] = merged_pending.get("leverage")
-                if "sl" not in merged_pending:
-                    cs["suggested_sl"] = None
 
                 params = _sync_strategy_from_periods(params)
                 state, cs, params = _sync_state(state, cs, params)
@@ -3633,6 +4481,9 @@ def _wizard_seq_handle_message(
                         invalid_messages.append(num_error_msg or f"Valore non valido per {key}.")
                         continue
                     if numeric_val >= 4:
+                        if key == "sl" and _has_explicit_sl_confirm_intent(user_text):
+                            immediate_patch[key] = numeric_val
+                            continue
                         risky_updates[key] = numeric_val
                         continue
                 if key == "tp":
@@ -3684,7 +4535,11 @@ def _wizard_seq_handle_message(
                     state, cs, params = _sync_state(state, cs, params)
                     if invalid_messages:
                         logger.info("[SUMMARY_BUILD] full_config_summary_with_invalids=True")
-                    reply = "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True)
+                    lev_removed_inline = cs.pop("_lev_remove_inline_this_turn", False)
+                    if lev_removed_inline:
+                        reply = _lev_remove_reply_with_summary(params)
+                    else:
+                        reply = "Configurazione completata ✅\n\n" + _build_summary(params, full_config=True)
                     if invalid_messages:
                         invalid_block = "Non ho applicato questi valori:\n" + "\n".join(
                             [f"- {msg}" for msg in invalid_messages]
@@ -3800,87 +4655,11 @@ def _wizard_seq_handle_message(
                 )
 
         if current_step == "sl" and cs.get("pending_sl_confirmation") is not None:
-            # Short-circuit: conferma positiva esplicita applica subito il pending SL.
-            # Senza questo branch, frasi come "si", "sì", "ok", "confermo", "va bene"
-            # potevano restare bloccate nel pending senza arrivare a _extract_confirmation.
-            lt_sl_confirm = user_text.strip().lower()
-            sl_positive_confirm_patterns = (
-                r"\bsi\b",
-                r"\bsì\b",
-                r"\bok\b",
-                r"\bconfermo\b",
-                r"\bva\s+bene\b",
+            pending_sl_out = _handle_pending_sl_user_reply(
+                user_text, state, cs, params, current_step
             )
-            if any(re.search(p, lt_sl_confirm, re.I) for p in sl_positive_confirm_patterns):
-                pending_sl_value = cs.get("pending_sl_confirmation")
-                try:
-                    sl_val_confirm = float(str(pending_sl_value).replace("%", "").replace(",", "."))
-                except (TypeError, ValueError):
-                    sl_val_confirm = None
-                if sl_val_confirm is not None:
-                    hard_sl = _wizard_hard_limit_error_message("sl", sl_val_confirm)
-                    if hard_sl:
-                        _log_wizard_numeric_hard_reject("sl", sl_val_confirm, "out_of_range")
-                        cs["pending_sl_confirmation"] = None
-                        cs["suggested_sl"] = None
-                        _log_wizard_numeric_hard_reject_return("sl")
-                        state, cs, params = _sync_state(state, cs, params)
-                        return {"reply": hard_sl, "state": state}
-                    logger.info("[SL_PENDING_STEP_CONFIRM_APPLY] value=%s", sl_val_confirm)
-                    params["sl"] = f"{sl_val_confirm}%"
-                    cs["pending_sl_confirmation"] = None
-                    cs["suggested_sl"] = None
-                    logger.info("[SL_PENDING_STEP_CONFIRM_CLEAR]")
-                    params = _sync_strategy_from_periods(params)
-                    state, cs, params = _sync_state(state, cs, params)
-                    return _wizard_seq_tail_after_save(
-                        state,
-                        cs,
-                        params,
-                        current_step,
-                        summary_followup=_CONFIG_COMPLETE_FOLLOWUP,
-                    )
-            new_sl_value = _extract_step_value(user_text, "sl", params)
-            if new_sl_value is None:
-                lt_pending = user_text.strip().lower()
-                if re.search(r"\d+(?:\.\d+)?\s*%", user_text):
-                    has_other_param_context = any(
-                        token in lt_pending
-                        for token in ["take profit", "tp", "rischio", "risk", "leva", "leverage"]
-                    )
-                    if not has_other_param_context:
-                        m_pct = re.search(r"(\d+(?:\.\d+)?)\s*%", user_text)
-                        if m_pct:
-                            new_sl_value = f"{m_pct.group(1)}%"
-            if new_sl_value is not None:
-                sl_val = float(str(new_sl_value).replace("%", "").replace(",", "."))
-                is_valid, error_msg, _ = _validate_step_value("sl", new_sl_value, params)
-                if not is_valid:
-                    logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
-                    if _wizard_hard_limit_error_message("sl", sl_val):
-                        _log_wizard_numeric_hard_reject_return("sl")
-                    cs["pending_sl_confirmation"] = None
-                    cs["suggested_sl"] = None
-                    state, cs, params = _sync_state(state, cs, params)
-                    return {"reply": (error_msg or _step_question(current_step, params)), "state": state}
-                requires_confirm, warning_msg, suggested_sl = _check_sl_warning(sl_val)
-                if requires_confirm:
-                    cs["pending_sl_confirmation"] = sl_val
-                    cs["suggested_sl"] = suggested_sl
-                    state, cs, params = _sync_state(state, cs, params)
-                    return {"reply": warning_msg or _step_question(current_step, params), "state": state}
-                params["sl"] = f"{sl_val}%"
-                cs["pending_sl_confirmation"] = None
-                cs["suggested_sl"] = None
-                params = _sync_strategy_from_periods(params)
-                state, cs, params = _sync_state(state, cs, params)
-                return _wizard_seq_tail_after_save(
-                    state,
-                    cs,
-                    params,
-                    current_step,
-                    summary_followup=_CONFIG_COMPLETE_FOLLOWUP,
-                )
+            if pending_sl_out is not None:
+                return pending_sl_out
 
         confirmation = _extract_confirmation(user_text)
         if confirmation is True:
@@ -3905,14 +4684,12 @@ def _wizard_seq_handle_message(
                 hard_sl_c = _wizard_hard_limit_error_message("sl", sl_val)
                 if hard_sl_c:
                     cs["pending_sl_confirmation"] = None
-                    cs["suggested_sl"] = None
                     _log_wizard_numeric_hard_reject("sl", sl_val, "out_of_range")
                     _log_wizard_numeric_hard_reject_return("sl")
                     state, cs, params = _sync_state(state, cs, params)
                     return {"reply": hard_sl_c, "state": state}
                 params["sl"] = f"{sl_val}%"
                 cs["pending_sl_confirmation"] = None
-                cs["suggested_sl"] = None
             params = _sync_strategy_from_periods(params)
             state, cs, params = _sync_state(state, cs, params)
             step = cs.get("step")
@@ -3939,8 +4716,6 @@ def _wizard_seq_handle_message(
             )
         elif confirmation is False:
             cs[pending_key] = None
-            if current_step == "sl":
-                cs["suggested_sl"] = None
             logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
             state, cs, params = _sync_state(state, cs, params)
             return {"reply": _step_question(current_step, params), "state": state}
@@ -3956,7 +4731,6 @@ def _wizard_seq_handle_message(
                 if hard_pending_sl:
                     _log_wizard_numeric_hard_reject("sl", psl, "out_of_range")
                     cs["pending_sl_confirmation"] = None
-                    cs["suggested_sl"] = None
                     _log_wizard_numeric_hard_reject_return("sl")
                     state, cs, params = _sync_state(state, cs, params)
                     return {"reply": hard_pending_sl, "state": state}
@@ -4039,15 +4813,15 @@ def _wizard_seq_handle_message(
         params["leverage"] = lev_int
     elif current_step == "sl":
         sl_val = float(str(extracted_value).replace("%", "").replace(",", "."))
-        requires_confirm, warning_msg, suggested_sl = _check_sl_warning(sl_val)
-        if requires_confirm:
-            cs["pending_sl_confirmation"] = sl_val
-            cs["suggested_sl"] = suggested_sl
-            state, cs, params = _sync_state(state, cs, params)
-            return {"reply": warning_msg or _step_question(current_step, params), "state": state}
+        skip_sl_confirm = _has_explicit_sl_confirm_intent(user_text)
+        if not skip_sl_confirm:
+            requires_confirm, warning_msg, suggested_sl = _check_sl_warning(sl_val)
+            if requires_confirm:
+                cs["pending_sl_confirmation"] = sl_val
+                state, cs, params = _sync_state(state, cs, params)
+                return {"reply": warning_msg or _step_question(current_step, params), "state": state}
         params["sl"] = f"{sl_val}%"
         cs["pending_sl_confirmation"] = None
-        cs["suggested_sl"] = None
     elif current_step == "tp":
         patch_result = apply_config_patch(cs, {"tp": extracted_value})
         if not patch_result.get("ok", True):
@@ -4114,7 +4888,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             "pending_risk_confirmation": None,
             "pending_leverage_confirmation": None,
             "pending_sl_confirmation": None,
-            "suggested_sl": None,
         }
         state.pop("params", None)
         return {
@@ -4590,7 +5363,10 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     requires_confirmation, confirmation_msg = _check_leverage_warning(lev_int, symbol)
                 elif param_name == "sl":
                     sl_val = float(str(new_value).replace("%", ""))
-                    requires_confirmation, confirmation_msg, suggested_value = _check_sl_warning(sl_val)
+                    if _has_explicit_sl_confirm_intent(user_text):
+                        requires_confirmation = False
+                    else:
+                        requires_confirmation, confirmation_msg, suggested_value = _check_sl_warning(sl_val)
                 
                 if requires_confirmation:
                     # Se richiede conferma, salva per gestirlo dopo
@@ -4635,7 +5411,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                         logger.info("[LOCAL_UPDATE] operating_mode -> %s", new_value)
                     elif param_name == "sl":
                         cs["pending_sl_confirmation"] = None
-                        cs["suggested_sl"] = None
                     elif param_name == "risk_pct":
                         cs["pending_risk_confirmation"] = None
                     elif param_name == "market_type":
@@ -4672,7 +5447,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                         )
                     elif param_name == "sl":
                         cs["pending_sl_confirmation"] = float(str(new_value).replace("%", "").replace(",", "."))
-                        cs["suggested_sl"] = suggested_value
 
                 logger.info("[PENDING_BATCH_SET] pending=%s", _pending_batch_snapshot(cs))
 
@@ -4928,8 +5702,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             cs["pending_sl_confirmation"] = merged_pending.get("sl")
             cs["pending_risk_confirmation"] = merged_pending.get("risk_pct")
             cs["pending_leverage_confirmation"] = merged_pending.get("leverage")
-            if "sl" not in merged_pending:
-                cs["suggested_sl"] = None
 
             params = _sync_strategy_from_periods(params)
             cs["params"] = params
@@ -5221,7 +5993,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
 
     if cs.get("pending_sl_confirmation") is not None:
         pending_sl = cs.get("pending_sl_confirmation")
-        suggested_sl = cs.get("suggested_sl")
+        suggested_sl = _runtime_suggested_sl(cs)
 
         new_sl_value = _extract_step_value(user_text, "sl", params)
         if new_sl_value is None:
@@ -5244,7 +6016,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 if requires_confirm:
                     # Caso B: nuovo valore ancora ad alto rischio -> NON scrivere in params["sl"]
                     cs["pending_sl_confirmation"] = sl_val
-                    cs["suggested_sl"] = suggested_value
                     state, cs, params = _sync_state(state, cs, params)
                     reply = confirmation_msg or "Confermi questo stop loss?"
                     if empathetic_response and not empathetic_response.lower() in reply.lower():
@@ -5254,7 +6025,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 # Caso A: nuovo valore definitivo (non richiede conferma) -> commit reale + pulizia pending
                 params["sl"] = f"{sl_val}%"
                 cs["pending_sl_confirmation"] = None
-                cs["suggested_sl"] = None
                 next_step = _get_next_step(current_step, params, cs)
                 if next_step is None:
                     state["config_status"] = "complete"
@@ -5287,7 +6057,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             if suggested_str in lt or f"{suggested_str}%" in lt:
                 params["sl"] = f"{suggested_sl}%"
                 cs["pending_sl_confirmation"] = None
-                cs["suggested_sl"] = None
                 next_step = _get_next_step(current_step, params, cs)
                 if next_step is None:
                     state["config_status"] = "complete"
@@ -5311,7 +6080,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             if accept_suggested:
                 params["sl"] = f"{suggested_sl}%"
                 cs["pending_sl_confirmation"] = None
-                cs["suggested_sl"] = None
                 next_step = _get_next_step(current_step, params, cs)
                 if next_step is None:
                     state["config_status"] = "complete"
@@ -5335,7 +6103,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         if confirm_extreme or _extract_confirmation(user_text) is True:
             params["sl"] = f"{pending_sl}%"
             cs["pending_sl_confirmation"] = None
-            cs["suggested_sl"] = None
             next_step = _get_next_step(current_step, params, cs)
             if next_step is None:
                 state["config_status"] = "complete"
@@ -5452,20 +6219,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         # Se contiene già una risposta valida, non gestire come saluto puro
         # L'estrazione del valore verrà gestita normalmente più avanti
         if not has_market_type:
-            # Determina quale variante usare (ruota tra 0, 1, 2)
-            last_variant = cs.get("last_greeting_variant")
-            
-            # Se non c'è una variante precedente, usa la prima (0)
-            if last_variant is None:
-                next_variant = 0
-            else:
-                # Ruota alla prossima variante (0 -> 1 -> 2 -> 0)
-                next_variant = (last_variant + 1) % 3
-            
-            # Salva la variante usata nello state
-            cs["last_greeting_variant"] = next_variant
-            
-            # Genera la risposta con la variante scelta
+            next_variant = _next_greeting_variant(state)
             reply = _step_question("market_type", params, greeting_variant=next_variant)
             
             params = _sync_strategy_from_periods(params)
@@ -5563,7 +6317,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
     # Usa period_index per chiedere ogni periodo in ordine (EMA -> ATR -> RSI) e sovrascrivere SEMPRE il valore
     if current_step in ("strategy", "strategy_params"):
         required = free_plan.get_required_period_fields_ordered(params)
-        period_index = cs.get("period_index", 0)
+        period_index = _strategy_period_index(params)
         missing_step = required[period_index] if (required and period_index < len(required)) else None
         
         logger.info(
@@ -5645,12 +6399,10 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                 logger.info("[PERIOD] applied %s=%s", missing_step, period_value)
                 logger.info("[PERIOD] params periods: rsi_period=%s atr_period=%s ema_period=%s",
                             params.get("rsi_period"), params.get("atr_period"), params.get("ema_period"))
-                cs["period_index"] = period_index + 1
-                
                 params = _sync_strategy_from_periods(params)
                 
                 # Altri periodi da chiedere o avanza
-                next_period_index = cs.get("period_index", period_index + 1)
+                next_period_index = _strategy_period_index(params)
                 if required and next_period_index < len(required):
                     next_missing = required[next_period_index]
                     next_indicator = next_missing.replace("_period", "").upper()
@@ -5725,7 +6477,7 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             }
         
         required = free_plan.get_required_period_fields_ordered(params)
-        period_index = cs.get("period_index", 0)
+        period_index = _strategy_period_index(params)
         field_name = required[period_index] if period_index < len(required) else None
         
         period_value = None
@@ -5789,11 +6541,10 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
         logger.info("[PERIOD] applied %s=%s", field_name, period_value)
         logger.info("[PERIOD] params periods: rsi_period=%s atr_period=%s ema_period=%s",
                     params.get("rsi_period"), params.get("atr_period"), params.get("ema_period"))
-        cs["period_index"] = period_index + 1
         params = _sync_strategy_from_periods(params)
         state, cs, params = _sync_state(state, cs, params)
         
-        next_period_index = cs.get("period_index", period_index + 1)
+        next_period_index = _strategy_period_index(params)
         if required and next_period_index < len(required):
             next_field = required[next_period_index]
             if next_field == "ema_period":
@@ -5924,7 +6675,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
                     
                     # Porta lo step su strategy_params e inizia a chiedere i periodi in ordine (sovrascrivendo sempre)
                     cs["step"] = "strategy_params"
-                    cs["period_index"] = 0
                     state, cs, params = _sync_state(state, cs, params)
                     
                     # Chiedi il primo periodo in ordine (EMA -> ATR -> RSI)
@@ -6065,7 +6815,6 @@ def handle_message(user_text: str, state: Dict[str, Any], history: List[Dict[str
             if requires_confirm:
                 # Richiede conferma esplicita: salva temporaneamente e chiedi conferma
                 cs["pending_sl_confirmation"] = sl_val
-                cs["suggested_sl"] = suggested_sl
                 state, cs, params = _sync_state(state, cs, params)
                 reply = warning_msg
                 # Aggiungi frase empatica se rilevata
@@ -6405,6 +7154,311 @@ def test_apply_config_patch():
     print("TUTTI I TEST PASSATI!")
     print("="*60 + "\n")
 
+
+def _lev_intent_test_state(
+    *,
+    market_type: str,
+    leverage: Optional[int] = None,
+    step: Optional[str] = "market_type",
+    config_status: str = "in_progress",
+) -> Dict[str, Any]:
+    params = copy.deepcopy(DEFAULT_PARAMS)
+    params.update(
+        {
+            "market_type": market_type,
+            "leverage": leverage,
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+            "sl": "2.0%",
+            "tp": "5.0%",
+            "risk_pct": 2.0,
+        }
+    )
+    params = _apply_operating_mode_preset(params, "equilibrata")
+    return {
+        "config_status": config_status,
+        "config_state": {
+            "step": step,
+            "params": params,
+            "error_count": {},
+            "pending_sl_confirmation": None,
+            "pending_risk_confirmation": None,
+            "pending_leverage_confirmation": None,
+        },
+    }
+
+
+def _lev_test_numeric_value(value: Any) -> Optional[float]:
+    """Normalizza sl/tp/risk per confronto numerico nei test."""
+    if value is None:
+        return None
+    try:
+        return float(str(value).replace("%", "").replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def test_leverage_intent():
+    """Test obbligatori LEV_INTENT (TEST 1–11)."""
+    print("\n" + "=" * 60)
+    print("TEST OBBLIGATORI: _detect_leverage_intent / handle_message")
+    print("=" * 60)
+
+    # TEST 1
+    state = _lev_intent_test_state(market_type="futures", leverage=10, step=None, config_status="complete")
+    out = handle_message("voglio togliere la leva", state, [])
+    p = out["state"]["config_state"]["params"]
+    assert p["market_type"] == "spot", f"TEST1 market_type: {p['market_type']}"
+    assert p["leverage"] is None, f"TEST1 leverage: {p['leverage']}"
+    assert out["reply"].startswith(_LEV_REMOVE_REPLY_PREFIX), f"TEST1 reply: {out['reply']!r}"
+    print("✅ TEST 1 passed")
+
+    # TEST 2
+    state = _lev_intent_test_state(market_type="futures", leverage=10, step=None, config_status="complete")
+    out = handle_message("senza leva", state, [])
+    p = out["state"]["config_state"]["params"]
+    assert p["market_type"] == "spot", f"TEST2 market_type: {p['market_type']}"
+    assert p["leverage"] is None, f"TEST2 leverage: {p['leverage']}"
+    assert out["reply"].startswith(_LEV_REMOVE_REPLY_PREFIX), f"TEST2 reply: {out['reply']!r}"
+    print("✅ TEST 2 passed")
+
+    # TEST 3
+    state = _lev_intent_test_state(market_type="spot", leverage=None)
+    out = handle_message("metti la leva", state, [])
+    p = out["state"]["config_state"]["params"]
+    cs = out["state"]["config_state"]
+    assert p["market_type"] == "futures", f"TEST3 market_type: {p['market_type']}"
+    assert p["leverage"] is None, f"TEST3 leverage: {p['leverage']}"
+    assert cs.get("step") == AWAITING_LEVERAGE_VALUE_STEP, f"TEST3 step: {cs.get('step')}"
+    assert out["reply"] == "Che leva vuoi utilizzare?", f"TEST3 reply: {out['reply']!r}"
+    print("✅ TEST 3 passed")
+
+    # TEST 4 (dopo TEST 3)
+    out2 = handle_message("10", out["state"], [])
+    p2 = out2["state"]["config_state"]["params"]
+    assert p2["market_type"] == "futures", f"TEST4 market_type: {p2['market_type']}"
+    cs2 = out2["state"]["config_state"]
+    lev_ok = p2["leverage"] == 10 or cs2.get("pending_leverage_confirmation") == 10
+    assert lev_ok, f"TEST4 leverage={p2['leverage']} pending={cs2.get('pending_leverage_confirmation')}"
+    print("✅ TEST 4 passed")
+
+    # TEST 5
+    state = _lev_intent_test_state(market_type="spot", leverage=None)
+    out = handle_message("voglio inserire la leva", state, [])
+    p = out["state"]["config_state"]["params"]
+    cs = out["state"]["config_state"]
+    assert p["market_type"] == "futures", f"TEST5 market_type: {p['market_type']}"
+    assert p["leverage"] is None, f"TEST5 leverage: {p['leverage']}"
+    assert cs.get("step") == AWAITING_LEVERAGE_VALUE_STEP, f"TEST5 step: {cs.get('step')}"
+    assert out["reply"] == "Che leva vuoi utilizzare?", f"TEST5 reply: {out['reply']!r}"
+    print("✅ TEST 5 passed")
+
+    # TEST 6
+    state = _lev_intent_test_state(market_type="spot", leverage=None)
+    out = handle_message("vorrei la leva", state, [])
+    p = out["state"]["config_state"]["params"]
+    cs = out["state"]["config_state"]
+    assert p["market_type"] == "futures", f"TEST6 market_type: {p['market_type']}"
+    assert p["leverage"] is None, f"TEST6 leverage: {p['leverage']}"
+    assert cs.get("step") == AWAITING_LEVERAGE_VALUE_STEP, f"TEST6 step: {cs.get('step')}"
+    assert out["reply"] == "Che leva vuoi utilizzare?", f"TEST6 reply: {out['reply']!r}"
+    print("✅ TEST 6 passed")
+
+    # TEST 7
+    state = _lev_intent_test_state(market_type="spot", leverage=None)
+    out = handle_message("metti leva 10", state, [])
+    p = out["state"]["config_state"]["params"]
+    cs = out["state"]["config_state"]
+    assert p["market_type"] == "futures", f"TEST7 market_type: {p['market_type']}"
+    lev_ok = p["leverage"] == 10 or cs.get("pending_leverage_confirmation") == 10
+    assert lev_ok, f"TEST7 leverage={p['leverage']} pending={cs.get('pending_leverage_confirmation')}"
+    print("✅ TEST 7 passed")
+
+    # Unit: _detect_leverage_intent
+    assert _detect_leverage_intent("10") is None
+    assert _detect_leverage_intent("leva 10") == {"action": "add", "value": 10}
+    assert _detect_leverage_intent("10x") == {"action": "add", "value": 10}
+    assert _detect_leverage_intent("togli la leva") == {"action": "remove"}
+    assert _detect_leverage_intent("togli leva e metti ethusdt, sl 2") == {"action": "remove"}
+    assert _detect_leverage_intent("metti leva 10, sl 2") == {"action": "add", "value": 10}
+    assert _detect_leverage_intent("voglio mettere la leva") == {"action": "add", "value": None}
+    assert _detect_leverage_intent("metti leva") == {"action": "add", "value": None}
+    assert _detect_leverage_intent("imposta leva") == {"action": "add", "value": None}
+    print("✅ _detect_leverage_intent unit checks passed")
+
+    # TEST 8 — multiparam: togli leva + symbol + sl
+    state = _lev_intent_test_state(market_type="futures", leverage=10, step=None, config_status="complete")
+    state["config_state"]["params"]["sl"] = "5.0%"
+    old_tp = state["config_state"]["params"]["tp"]
+    out = handle_message("togli leva e metti ethusdt, sl 2", state, [])
+    p = out["state"]["config_state"]["params"]
+    assert p["market_type"] == "spot", f"TEST8 market_type: {p['market_type']}"
+    assert p["leverage"] is None, f"TEST8 leverage: {p['leverage']}"
+    assert p["symbol"] == "ETHUSDT", f"TEST8 symbol: {p['symbol']}"
+    assert _lev_test_numeric_value(p["sl"]) == 2.0, f"TEST8 sl: {p['sl']}"
+    assert p["tp"] == old_tp, f"TEST8 tp changed: {p['tp']} vs {old_tp}"
+    logger.info(
+        "[LEV_INTENT_TEST] TEST8 market_type=%s leverage=%s symbol=%s sl=%s tp=%s",
+        p["market_type"],
+        p["leverage"],
+        p["symbol"],
+        p["sl"],
+        p["tp"],
+    )
+    print("✅ TEST 8 passed")
+
+    # TEST 9 — multiparam: togli leva + tp + rischio
+    state = _lev_intent_test_state(market_type="futures", leverage=10, step=None, config_status="complete")
+    out = handle_message("togli leva, tp 3, rischio 1", state, [])
+    p = out["state"]["config_state"]["params"]
+    assert p["market_type"] == "spot", f"TEST9 market_type: {p['market_type']}"
+    assert p["leverage"] is None, f"TEST9 leverage: {p['leverage']}"
+    assert _lev_test_numeric_value(p["tp"]) == 3.0, f"TEST9 tp: {p['tp']}"
+    assert _lev_test_numeric_value(p["risk_pct"]) == 1.0, f"TEST9 risk_pct: {p['risk_pct']}"
+    logger.info(
+        "[LEV_INTENT_TEST] TEST9 market_type=%s leverage=%s tp=%s risk_pct=%s",
+        p["market_type"],
+        p["leverage"],
+        p["tp"],
+        p["risk_pct"],
+    )
+    print("✅ TEST 9 passed")
+
+    # TEST 10 — multiparam: metti leva 10 + sl
+    state = _lev_intent_test_state(market_type="spot", leverage=None, step=None, config_status="complete")
+    out = handle_message("metti leva 10, sl 2", state, [])
+    p = out["state"]["config_state"]["params"]
+    cs = out["state"]["config_state"]
+    assert p["market_type"] == "futures", f"TEST10 market_type: {p['market_type']}"
+    lev_ok = p["leverage"] == 10 or cs.get("pending_leverage_confirmation") == 10
+    assert lev_ok, f"TEST10 leverage={p['leverage']} pending={cs.get('pending_leverage_confirmation')}"
+    assert _lev_test_numeric_value(p["sl"]) == 2.0, f"TEST10 sl: {p['sl']}"
+    logger.info(
+        "[LEV_INTENT_TEST] TEST10 market_type=%s leverage=%s sl=%s",
+        p["market_type"],
+        p["leverage"],
+        p["sl"],
+    )
+    print("✅ TEST 10 passed")
+
+    # TEST 11 — add senza valore: futures + awaiting_leverage_value
+    state = _lev_intent_test_state(market_type="spot", leverage=None)
+    out = handle_message("voglio inserire la leva", state, [])
+    p = out["state"]["config_state"]["params"]
+    cs = out["state"]["config_state"]
+    assert p["market_type"] == "futures", f"TEST11 market_type: {p['market_type']}"
+    assert p["leverage"] is None, f"TEST11 leverage: {p['leverage']}"
+    assert cs.get("step") == AWAITING_LEVERAGE_VALUE_STEP, f"TEST11 step: {cs.get('step')}"
+    assert out["reply"] == "Che leva vuoi utilizzare?", f"TEST11 reply: {out['reply']!r}"
+    logger.info(
+        "[LEV_INTENT_TEST] TEST11 market_type=%s leverage=%s step=%s reply=%r",
+        p["market_type"],
+        p["leverage"],
+        cs.get("step"),
+        out["reply"],
+    )
+    print("✅ TEST 11 passed")
+
+    # TEST 12 — awaiting: "2" → leverage=2, step=None
+    out2 = handle_message("2", out["state"], [])
+    p2 = out2["state"]["config_state"]["params"]
+    cs2 = out2["state"]["config_state"]
+    assert p2["market_type"] == "futures", f"TEST12 market_type: {p2['market_type']}"
+    assert p2["leverage"] == 2, f"TEST12 leverage: {p2['leverage']}"
+    assert cs2.get("step") is None, f"TEST12 step: {cs2.get('step')}"
+    logger.info(
+        "[LEV_INTENT_TEST] TEST12 market_type=%s leverage=%s step=%s",
+        p2["market_type"],
+        p2["leverage"],
+        cs2.get("step"),
+    )
+    print("✅ TEST 12 passed")
+
+    # TEST 13 — multiparam add: metti leva 10, sl 2
+    state = _lev_intent_test_state(market_type="spot", leverage=None, step=None, config_status="complete")
+    out = handle_message("metti leva 10, sl 2", state, [])
+    p = out["state"]["config_state"]["params"]
+    cs = out["state"]["config_state"]
+    assert p["market_type"] == "futures", f"TEST13 market_type: {p['market_type']}"
+    lev_ok = p["leverage"] == 10 or cs.get("pending_leverage_confirmation") == 10
+    assert lev_ok, f"TEST13 leverage={p['leverage']} pending={cs.get('pending_leverage_confirmation')}"
+    assert _lev_test_numeric_value(p["sl"]) == 2.0, f"TEST13 sl: {p['sl']}"
+    print("✅ TEST 13 passed")
+
+    # TEST 14 — multiparam remove: togli leva + symbol + sl
+    state = _lev_intent_test_state(market_type="futures", leverage=10, step=None, config_status="complete")
+    state["config_state"]["params"]["sl"] = "5.0%"
+    out = handle_message("togli leva e metti ethusdt, sl 2", state, [])
+    p = out["state"]["config_state"]["params"]
+    assert p["market_type"] == "spot", f"TEST14 market_type: {p['market_type']}"
+    assert p["leverage"] is None, f"TEST14 leverage: {p['leverage']}"
+    assert p["symbol"] == "ETHUSDT", f"TEST14 symbol: {p['symbol']}"
+    assert _lev_test_numeric_value(p["sl"]) == 2.0, f"TEST14 sl: {p['sl']}"
+    assert out["reply"].startswith(_LEV_REMOVE_REPLY_PREFIX), f"TEST14 reply: {out['reply']!r}"
+    print("✅ TEST 14 passed")
+
+    print("\n" + "=" * 60)
+    print("TUTTI I TEST LEV_INTENT PASSATI!")
+    print("=" * 60 + "\n")
+
+
+def test_corrective_tp_phrase_same_sl_value():
+    """
+    Frase correttiva: tp citato con numero separato; sl già uguale al valore proposto.
+    initial sl=6.0%, tp=5.0%
+    input="ti sei dimenticato il tp, ti avevo detto 6"
+    expected sl=6.0%, tp=6.0%
+    """
+    print("\n" + "=" * 60)
+    print("TEST: frase correttiva TP (numero separato, sl già 6%)")
+    print("=" * 60)
+
+    params = copy.deepcopy(DEFAULT_PARAMS)
+    params.update(
+        {
+            "sl": "6.0%",
+            "tp": "5.0%",
+            "market_type": "futures",
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+            "operating_mode": "equilibrata",
+            "risk_pct": 2.0,
+            "leverage": 10,
+        }
+    )
+    params = _apply_operating_mode_preset(params, "equilibrata")
+
+    user_text = "ti sei dimenticato il tp, ti avevo detto 6"
+    updates = _extract_modification_requests(user_text, params)
+    assert "tp" in updates, f"expected tp in updates, got {updates}"
+    assert updates["tp"] == 6.0, f"expected tp=6.0, got {updates['tp']}"
+    assert "sl" not in updates, f"sl must not be updated, got {updates}"
+
+    assert _extract_step_value(user_text, "tp", params) == "6%"
+    assert _extract_step_value(user_text, "sl", params) is None
+
+    state = {
+        "config_status": "complete",
+        "config_state": {
+            "step": None,
+            "params": copy.deepcopy(params),
+            "error_count": {},
+            "pending_sl_confirmation": None,
+            "pending_risk_confirmation": None,
+            "pending_leverage_confirmation": None,
+        },
+    }
+    out = handle_message(user_text, state, [])
+    final_params = out["state"]["config_state"]["params"]
+    assert _lev_test_numeric_value(final_params.get("sl")) == 6.0, (
+        f"expected sl=6.0%, got {final_params.get('sl')}"
+    )
+    assert _lev_test_numeric_value(final_params.get("tp")) == 6.0, (
+        f"expected tp=6.0%, got {final_params.get('tp')}"
+    )
+    print("✅ TEST passed: corrective TP phrase updates tp, leaves sl unchanged")
+
+
 # ============================================================
 # TEST MANUALE (non eseguito in prod): deep_merge_config
 # ============================================================
@@ -6431,5 +7485,6 @@ def test_apply_config_patch():
 
 
 if __name__ == "__main__":
-    # Esegui test manuale
     test_apply_config_patch()
+    test_leverage_intent()
+    test_corrective_tp_phrase_same_sl_value()
