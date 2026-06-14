@@ -101,7 +101,7 @@ def test_format_preview_done_reply_full():
         "losses": 5,
         "max_drawdown_pct": -18.6,
     }
-    text = format_preview_done_reply(payload, 30)
+    text = format_preview_done_reply(payload, 30, lang="it")
     assert "📊 Preview indicativa — ultimi 7 giorni" in text
     assert "BTCUSDT · 3m · futures" in text
     assert "Strategia: aggressiva" in text
@@ -117,6 +117,36 @@ def test_format_preview_done_reply_full():
     assert "Capitale" not in text
     assert "Preview basata su dati storici Bybit." in text
     assert "Non garantisce risultati futuri." in text
+
+
+def test_format_preview_done_reply_full_en():
+    payload = {
+        "effective_lookback_days": 30,
+        "symbol": "BTCUSDT",
+        "timeframe": "1h",
+        "market_type": "spot",
+        "risk_pct": 5,
+        "sl_pct": 5.0,
+        "tp_pct": 5.0,
+        "pnl_pct": -15.0,
+        "simulated_trades": 5,
+        "wins": 1,
+        "losses": 4,
+        "max_drawdown_pct": -18.6,
+    }
+    text = format_preview_done_reply(payload, 30, lang="en")
+    assert "📊 Indicative Preview — Last 30 Days" in text
+    assert "BTCUSDT · 1h · Spot" in text
+    assert "Risk 5%" in text
+    assert "SL 5% · TP 5%" in text
+    assert "Estimated Result: -15.0%" in text
+    assert "Simulated Trades: 5" in text
+    assert "Win Rate: 20%" in text
+    assert "Maximum Drawdown: -18.6%" in text
+    assert "Preview based on historical Bybit data." in text
+    assert "Past performance does not guarantee future results." in text
+    assert "Preview indicativa" not in text
+    assert "Risultato stimato" not in text
 
 
 def test_format_preview_done_reply_leverage_from_config():
@@ -136,12 +166,12 @@ def test_format_preview_done_reply_leverage_from_config():
         "max_drawdown_pct": -18.6,
     }
     config_params = {"leverage": 3, "risk_pct": 2}
-    text = format_preview_done_reply(payload, 30, config_params=config_params)
+    text = format_preview_done_reply(payload, 30, config_params=config_params, lang="it")
     assert "Leva 3x · Rischio 2%" in text
 
 
 def test_format_preview_done_reply_minimal():
-    text = format_preview_done_reply({"effective_lookback_days": 7, "pnl_pct": 5.0}, 30)
+    text = format_preview_done_reply({"effective_lookback_days": 7, "pnl_pct": 5.0}, 30, lang="it")
     assert "📊 Preview indicativa — ultimi 7 giorni" in text
     assert "Risultato stimato: +5.0%" in text
     assert "Operazioni simulate:" not in text
@@ -215,6 +245,7 @@ if __name__ == "__main__":
     test_validate_config_missing()
     test_extract_lookback_two_years()
     test_format_preview_done_reply_full()
+    test_format_preview_done_reply_full_en()
     test_format_preview_done_reply_leverage_from_config()
     test_format_preview_done_reply_minimal()
     test_build_backtest_previews_row_maps_columns()

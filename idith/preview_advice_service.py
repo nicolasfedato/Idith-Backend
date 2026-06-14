@@ -14,6 +14,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 try:
+    from . import ai_lang
+except Exception:
+    try:
+        import ai_lang
+    except Exception:
+        ai_lang = None  # type: ignore[assignment]
+
+try:
     from .preview_history_service import format_created_at_rome
 except Exception:
     try:
@@ -42,6 +50,18 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_lang(lang: Optional[str] = None) -> str:
+    if ai_lang is not None:
+        return ai_lang.normalize_lang(lang or ai_lang.get_request_lang())
+    code = (lang or "it").strip().lower()
+    return "en" if code.startswith("en") else "it"
+
+
+def _texts(lang: Optional[str] = None) -> Dict[str, str]:
+    return _PREVIEW_TEXTS[_resolve_lang(lang)]
+
+
 _LEGACY_CLOSING = "Vuoi che aggiorni la configurazione con questi parametri?"
 
 _CHAT_PARAMS_HEADER = (
@@ -54,6 +74,230 @@ CONFIRMATION_QUESTION = _CHAT_PARAMS_HEADER
 
 _SUGGESTIONS_HEADER = "Cosa proverei a cambiare"
 _PREVIEW_ADVICE_CTA = "Vuoi modificare qualche parametro oppure vuoi avviare il bot?"
+
+_PREVIEW_TEXTS: Dict[str, Dict[str, str]] = {
+    "it": {
+        "legacy_closing": _LEGACY_CLOSING,
+        "chat_params_header": _CHAT_PARAMS_HEADER,
+        "suggestions_header": _SUGGESTIONS_HEADER,
+        "why_header": "Perché la preview è andata così",
+        "preview_advice_cta": _PREVIEW_ADVICE_CTA,
+        "start_bot_prompt": "Vuoi avviare il bot adesso?",
+        "no_preview_reply": (
+            'Non ho ancora una preview salvata per te. Genera prima una preview '
+            '(es. "fammi una preview" o "simula gli ultimi 30 giorni") e poi chiedimi '
+            "di spiegarla o di suggerirti come migliorare."
+        ),
+        "params_fallback": (
+            "Puoi provare scrivendo in chat i parametri suggeriti sopra, "
+            "specificando coppia, timeframe, modalità, stop loss, take profit e rischio."
+        ),
+        "label_operating_mode": "modalità operativa",
+        "label_risk": "rischio per trade",
+        "label_stop_loss": "stop loss",
+        "label_take_profit": "take profit",
+        "label_pair": "coppia",
+        "nd": "N/D",
+        "why_opening": (
+            "La preview su {symbol} (timeframe {timeframe}) chiude a {pnl} "
+            "con win rate {win_rate} su {trades} operazioni. "
+            "Il drawdown massimo è stato {drawdown}."
+        ),
+        "why_negative": " Il risultato negativo indica che le perdite hanno superato i guadagni.",
+        "why_positive": " Il risultato positivo indica che la strategia ha chiuso in guadagno nel periodo simulato.",
+        "why_neutral": " Il risultato è in pareggio nel periodo simulato.",
+        "why_low_wr": " Un win rate sotto il 45% rende difficile recuperare anche con buon risk/reward.",
+        "why_high_dd": " Un drawdown elevato segnala sequenze di perdite consecutive pesanti.",
+        "why_short_tf": " Il timeframe {timeframe} tende a generare più segnali e più rumore.",
+        "why_sl_tp_tight": (
+            " Con SL/TP a {sl}/{tp} i trade hanno poco margine prima di chiudersi in stop o in target."
+        ),
+        "why_sl_tp_equal": (
+            " Con SL e TP entrambi al {sl}, servono molti trade vincenti per compensare le perdite."
+        ),
+        "why_aggressive_mode": " La modalità Aggressiva aumenta la frequenza dei segnali.",
+        "suggest_tf_15m_1h": "timeframe 15m o 1h",
+        "suggest_tf_1h": "timeframe 1h",
+        "suggest_sl": "stop loss {value}",
+        "suggest_tp": "take profit {value}",
+        "suggest_sl_3": "stop loss 3%",
+        "suggest_tp_4_5": "take profit 4-5%",
+        "suggest_tp_above_sl": "take profit leggermente sopra lo stop (es. SL {sl}, TP 4%)",
+        "suggest_pair": "coppia {symbol}",
+        "suggest_pair_or": "coppia {primary} o {secondary}",
+        "suggest_mode_selective_balanced": "modalità Selettiva o Equilibrata",
+        "suggest_mode_balanced": "modalità Equilibrata",
+        "suggest_mode_selective": "modalità Selettiva",
+        "suggest_leverage": "leva più contenuta (es. {value}x)",
+        "suggest_risk_1": "rischio 1% per trade",
+        "fallback_keep": "mantenere timeframe e modalità attuali",
+        "fallback_protect": "stop loss 2.5% e take profit 4% per proteggere i guadagni",
+        "fallback_tf_15m": "timeframe 15m",
+        "fallback_sl_3": "stop loss 3%",
+        "fallback_tp_4": "take profit 4%",
+        "hypo_generic": (
+            "È una domanda ipotetica: chiedi cosa cambierebbe un parametro, non di applicarlo. "
+            "Prima di applicarlo, userei la preview attuale solo come riferimento per l'impatto."
+        ),
+        "hypo_leverage": (
+            "Se cambi la leva, modifichi l'esposizione senza cambiare il capitale impegnato. "
+            "Leva più alta amplifica guadagni e perdite e può peggiorare il drawdown. "
+            "Prima di applicarlo, valuterei una leva più contenuta se il drawdown attuale è già elevato."
+        ),
+        "hypo_risk": (
+            "Se aumenti il rischio per trade, ogni operazione pesa di più sul capitale totale. "
+            "Il drawdown può crescere più rapidamente su sequenze negative. "
+            "Prima di applicarlo, valuterei se il rischio attuale è già sostenibile."
+        ),
+    },
+    "en": {
+        "legacy_closing": "Do you want me to update the configuration with these parameters?",
+        "chat_params_header": (
+            "You can try typing in chat:\n"
+            "modify these parameters:"
+        ),
+        "suggestions_header": "What I would try changing",
+        "why_header": "Why the preview turned out this way",
+        "preview_advice_cta": "Do you want to change any parameters or start the bot?",
+        "start_bot_prompt": "Do you want to start the bot now?",
+        "no_preview_reply": (
+            "I don't have a saved preview for you yet. Generate a preview first "
+            '(e.g. "run a preview" or "simulate the last 30 days") and then ask me '
+            "to explain it or suggest how to improve it."
+        ),
+        "params_fallback": (
+            "You can try typing the parameters suggested above in chat, "
+            "specifying pair, timeframe, mode, stop loss, take profit and risk."
+        ),
+        "label_operating_mode": "operating mode",
+        "label_risk": "risk per trade",
+        "label_stop_loss": "stop loss",
+        "label_take_profit": "take profit",
+        "label_pair": "pair",
+        "nd": "N/A",
+        "why_opening": (
+            "The preview on {symbol} (timeframe {timeframe}) closes at {pnl} "
+            "with a {win_rate} win rate over {trades} trades. "
+            "Maximum drawdown was {drawdown}."
+        ),
+        "why_negative": " The negative result means losses outweighed gains.",
+        "why_positive": " The positive result means the strategy closed in profit over the simulated period.",
+        "why_neutral": " The result is break-even over the simulated period.",
+        "why_low_wr": " A win rate below 45% makes recovery difficult even with good risk/reward.",
+        "why_high_dd": " A high drawdown signals heavy consecutive losing streaks.",
+        "why_short_tf": " The {timeframe} timeframe tends to generate more signals and more noise.",
+        "why_sl_tp_tight": (
+            " With SL/TP at {sl}/{tp}, trades have little room before closing at stop or target."
+        ),
+        "why_sl_tp_equal": (
+            " With SL and TP both at {sl}, you need many winning trades to offset losses."
+        ),
+        "why_aggressive_mode": " Aggressive mode increases signal frequency.",
+        "suggest_tf_15m_1h": "timeframe 15m or 1h",
+        "suggest_tf_1h": "timeframe 1h",
+        "suggest_sl": "stop loss {value}",
+        "suggest_tp": "take profit {value}",
+        "suggest_sl_3": "stop loss 3%",
+        "suggest_tp_4_5": "take profit 4-5%",
+        "suggest_tp_above_sl": "take profit slightly above stop (e.g. SL {sl}, TP 4%)",
+        "suggest_pair": "pair {symbol}",
+        "suggest_pair_or": "pair {primary} or {secondary}",
+        "suggest_mode_selective_balanced": "Selective or Balanced mode",
+        "suggest_mode_balanced": "Balanced mode",
+        "suggest_mode_selective": "Selective mode",
+        "suggest_leverage": "lower leverage (e.g. {value}x)",
+        "suggest_risk_1": "risk 1% per trade",
+        "fallback_keep": "keep current timeframe and mode",
+        "fallback_protect": "stop loss 2.5% and take profit 4% to protect gains",
+        "fallback_tf_15m": "timeframe 15m",
+        "fallback_sl_3": "stop loss 3%",
+        "fallback_tp_4": "take profit 4%",
+        "hypo_generic": (
+            "This is a hypothetical question: you're asking what would change if you adjusted a parameter, "
+            "not to apply it. Before applying it, I'd use the current preview only as a reference for impact."
+        ),
+        "hypo_leverage": (
+            "If you change leverage, you change exposure without changing committed capital. "
+            "Higher leverage amplifies gains and losses and can worsen drawdown. "
+            "Before applying it, I'd consider lower leverage if current drawdown is already high."
+        ),
+        "hypo_risk": (
+            "If you increase risk per trade, each operation weighs more on total capital. "
+            "Drawdown can grow faster during losing streaks. "
+            "Before applying it, I'd check whether current risk is already sustainable."
+        ),
+    },
+}
+
+_PREVIEW_ADVICE_SYSTEM: Dict[str, str] = {
+    "it": (
+        "Sei Idith. L'utente chiede spiegazione e suggerimenti sulla sua ultima preview backtest salvata.\n\n"
+        "Rispondi SEMPRE in italiano con ESATTAMENTE questa struttura (tre sezioni, titoli come scritti sotto):\n\n"
+        "Perché la preview è andata così\n"
+        "[2-4 frasi che spiegano il motivo principale del risultato. DEVI citare esplicitamente: "
+        "pnl_pct, win rate, numero operazioni, drawdown, timeframe. "
+        "Cita SL/TP se rilevanti per spiegare stop frequenti o risk/reward.]\n\n"
+        "Cosa proverei a cambiare\n"
+        "[elenco numerato 1-4 con modifiche concrete: timeframe, SL, TP, modalità operativa, rischio, leva]\n\n"
+        "Regole:\n"
+        "- Usa SOLO i numeri presenti nel JSON della preview; non inventare metriche.\n"
+        "- Valori ammessi: timeframe 1m,3m,5m,15m,1h,4h,1d; modalità Aggressiva/Equilibrata/Selettiva.\n"
+        "- NON promettere guadagni. NON applicare modifiche: solo consiglio testuale.\n"
+        "- Non usare markdown o asterischi. Non chiedere API key. Tutta la risposta in italiano."
+    ),
+    "en": (
+        "You are Idith. The user asks for explanation and suggestions about their last saved backtest preview.\n\n"
+        "ALWAYS respond in English with EXACTLY this structure (three sections, titles as written below):\n\n"
+        "Why the preview turned out this way\n"
+        "[2-4 sentences explaining the main reason for the result. You MUST explicitly cite: "
+        "pnl_pct, win rate, number of trades, drawdown, timeframe. "
+        "Mention SL/TP if relevant to explain frequent stops or risk/reward.]\n\n"
+        "What I would try changing\n"
+        "[numbered list 1-4 with concrete changes: timeframe, SL, TP, operating mode, risk, leverage]\n\n"
+        "Rules:\n"
+        "- Use ONLY numbers from the preview JSON; do not invent metrics.\n"
+        "- Allowed values: timeframe 1m,3m,5m,15m,1h,4h,1d; modes Aggressive/Balanced/Selective.\n"
+        "- Do NOT promise profits. Do NOT apply changes: text advice only.\n"
+        "- No markdown or asterisks. Do not ask for API key. Entire response in English."
+    ),
+}
+
+_HYPOTHETICAL_ADVICE_SYSTEM_BY_LANG: Dict[str, str] = {
+    "it": (
+        "Sei Idith. L'utente fa una domanda IPOTETICA o teorica (es. 'what if', 'e se', "
+        "'cosa succede se', 'if I set', 'if I change') su un parametro di trading.\n"
+        "La preview salvata è solo CONTESTO di riferimento, non il soggetto principale.\n\n"
+        "Rispondi SEMPRE in italiano, in prosa diretta compatta: massimo 4-5 righe, un solo paragrafo.\n\n"
+        "REGOLE OBBLIGATORIE per domande ipotetiche:\n"
+        "- NON scrivere 'Perché la preview è andata così' come titolo o apertura.\n"
+        "- NON fare mini-report lunghi, NON usare elenchi numerati o puntati.\n"
+        "- NON dare consigli generici da preview: al massimo UNA frase finale di valutazione.\n"
+        "- NON suggerire 'modifica questi parametri' né chiedere di aggiornare la configurazione.\n"
+        "- Apri subito con 'Se imposti/cambi/usassi ...' citando il parametro e, se possibile, "
+        "il confronto con il valore attuale della preview.\n"
+        "- Spiega solo l'impatto diretto (rischio/rendimento, drawdown, stop prematuri) se pertinente.\n"
+        "- Usa SOLO i numeri presenti nel JSON della preview; non inventare metriche.\n"
+        "- NON promettere guadagni. NON applicare modifiche: solo spiegazione teorica.\n"
+        "- Non usare markdown o asterischi. Tutta la risposta in italiano."
+    ),
+    "en": (
+        "You are Idith. The user asks a HYPOTHETICAL or theoretical question (e.g. 'what if', "
+        "'what happens if', 'if I set', 'if I change') about a trading parameter.\n"
+        "The saved preview is only REFERENCE context, not the main subject.\n\n"
+        "ALWAYS respond in English, in compact direct prose: at most 4-5 lines, one paragraph only.\n\n"
+        "MANDATORY rules for hypothetical questions:\n"
+        "- Do NOT write 'Why the preview turned out this way' as a title or opening.\n"
+        "- Do NOT write long mini-reports, do NOT use numbered or bulleted lists.\n"
+        "- Do NOT give generic preview advice: at most ONE final evaluation sentence.\n"
+        "- Do NOT suggest 'modify these parameters' or ask to update the configuration.\n"
+        "- Open immediately with 'If you set/change/use ...' citing the parameter and, if possible, "
+        "comparison with the current preview value.\n"
+        "- Explain only direct impact (risk/reward, drawdown, premature stops) if relevant.\n"
+        "- Use ONLY numbers from the preview JSON; do not invent metrics.\n"
+        "- Do NOT promise profits. Do NOT apply changes: theoretical explanation only.\n"
+        "- No markdown or asterisks. Entire response in English."
+    ),
+}
 _VALID_TIMEFRAMES = ("1d", "4h", "1h", "15m", "5m", "3m", "1m")
 _OPERATING_MODES = ("selettiva", "equilibrata", "aggressiva")
 _PREFERRED_SYMBOLS = (
@@ -157,30 +401,6 @@ _PREVIEW_COLUMNS = (
     "created_at, symbol, timeframe, market_type, operating_mode, strategy_id, "
     "stop_loss_pct, take_profit_pct, leverage, risk_pct, "
     "pnl_pct, max_drawdown_pct, estimated_trades, closed_trades, wins, losses"
-)
-
-_NO_PREVIEW_REPLY = (
-    'Non ho ancora una preview salvata per te. Genera prima una preview '
-    '(es. "fammi una preview" o "simula gli ultimi 30 giorni") e poi chiedimi '
-    "di spiegarla o di suggerirti come migliorare."
-)
-
-_HYPOTHETICAL_ADVICE_SYSTEM = (
-    "Sei Idith. L'utente fa una domanda IPOTETICA o teorica (es. 'what if', 'e se', "
-    "'cosa succede se', 'if I set', 'if I change') su un parametro di trading.\n"
-    "La preview salvata è solo CONTESTO di riferimento, non il soggetto principale.\n\n"
-    "Rispondi SEMPRE in italiano, in prosa diretta compatta: massimo 4-5 righe, un solo paragrafo.\n\n"
-    "REGOLE OBBLIGATORIE per domande ipotetiche:\n"
-    "- NON scrivere 'Perché la preview è andata così' come titolo o apertura.\n"
-    "- NON fare mini-report lunghi, NON usare elenchi numerati o puntati.\n"
-    "- NON dare consigli generici da preview: al massimo UNA frase finale di valutazione.\n"
-    "- NON suggerire 'modifica questi parametri' né chiedere di aggiornare la configurazione.\n"
-    "- Apri subito con 'Se imposti/cambi/usassi ...' citando il parametro e, se possibile, "
-    "il confronto con il valore attuale della preview.\n"
-    "- Spiega solo l'impatto diretto (rischio/rendimento, drawdown, stop prematuri) se pertinente.\n"
-    "- Usa SOLO i numeri presenti nel JSON della preview; non inventare metriche.\n"
-    "- NON promettere guadagni. NON applicare modifiche: solo spiegazione teorica.\n"
-    "- Non usare markdown o asterischi."
 )
 
 _SHORT_TIMEFRAMES = frozenset({"1m", "3m", "5m"})
@@ -305,12 +525,14 @@ def _optional_int(value: Any) -> Optional[int]:
         return None
 
 
-def _display_str(value: Any, fallback: str = "N/D") -> str:
+def _display_str(value: Any, fallback: str = "N/D", *, lang: Optional[str] = None) -> str:
+    t = _texts(lang)
+    fb = t["nd"] if fallback == "N/D" else fallback
     if isinstance(value, str) and value.strip():
         return value.strip()
     if value is not None and not isinstance(value, str):
         return str(value)
-    return fallback
+    return fb
 
 
 def _trade_count(row: Dict[str, Any]) -> Optional[int]:
@@ -353,16 +575,16 @@ def fetch_latest_preview(user_id: str, deps: PreviewAdviceDeps) -> Optional[Dict
         return None
 
 
-def build_preview_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
+def build_preview_snapshot(row: Dict[str, Any], *, lang: Optional[str] = None) -> Dict[str, Any]:
     sl_pct = _optional_float(row.get("stop_loss_pct"))
     tp_pct = _optional_float(row.get("take_profit_pct"))
     trades = _trade_count(row)
     return {
-        "symbol": _display_str(row.get("symbol")),
-        "timeframe": _display_str(row.get("timeframe")),
-        "market_type": _display_str(row.get("market_type")),
-        "operating_mode": _display_str(row.get("operating_mode")),
-        "strategy_id": _display_str(row.get("strategy_id")),
+        "symbol": _display_str(row.get("symbol"), lang=lang),
+        "timeframe": _display_str(row.get("timeframe"), lang=lang),
+        "market_type": _display_str(row.get("market_type"), lang=lang),
+        "operating_mode": _display_str(row.get("operating_mode"), lang=lang),
+        "strategy_id": _display_str(row.get("strategy_id"), lang=lang),
         "sl_pct": sl_pct,
         "tp_pct": tp_pct,
         "leverage": _optional_float(row.get("leverage")),
@@ -377,9 +599,9 @@ def build_preview_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _format_pct_value(value: Optional[float]) -> str:
+def _format_pct_value(value: Optional[float], *, lang: Optional[str] = None) -> str:
     if value is None:
-        return "N/D"
+        return _texts(lang)["nd"]
     if value > 0:
         return f"+{value:.1f}%"
     if value < 0:
@@ -387,32 +609,33 @@ def _format_pct_value(value: Optional[float]) -> str:
     return "+0.0%"
 
 
-def _format_win_rate(value: Optional[float]) -> str:
+def _format_win_rate(value: Optional[float], *, lang: Optional[str] = None) -> str:
     if value is None:
-        return "N/D"
+        return _texts(lang)["nd"]
     if value == int(value):
         return f"{int(value)}%"
     return f"{value:.1f}%"
 
 
-def _format_level_pct(value: Optional[float]) -> str:
+def _format_level_pct(value: Optional[float], *, lang: Optional[str] = None) -> str:
     if value is None:
-        return "N/D"
+        return _texts(lang)["nd"]
     if value == int(value):
         return f"{int(value)}%"
     return f"{value:.1f}%"
 
 
-def _build_why_section(snapshot: Dict[str, Any]) -> str:
-    symbol = snapshot.get("symbol", "N/D")
-    timeframe = snapshot.get("timeframe", "N/D")
-    pnl = _format_pct_value(snapshot.get("pnl_pct"))
-    win_rate = _format_win_rate(snapshot.get("win_rate_pct"))
+def _build_why_section(snapshot: Dict[str, Any], *, lang: Optional[str] = None) -> str:
+    t = _texts(lang)
+    symbol = snapshot.get("symbol", t["nd"])
+    timeframe = snapshot.get("timeframe", t["nd"])
+    pnl = _format_pct_value(snapshot.get("pnl_pct"), lang=lang)
+    win_rate = _format_win_rate(snapshot.get("win_rate_pct"), lang=lang)
     trades = snapshot.get("trades_count")
-    trades_text = str(trades) if trades is not None else "N/D"
+    trades_text = str(trades) if trades is not None else t["nd"]
     drawdown_val = snapshot.get("max_drawdown_pct")
     if drawdown_val is None:
-        drawdown = "N/D"
+        drawdown = t["nd"]
     else:
         drawdown = f"{abs(drawdown_val):.1f}%"
 
@@ -420,65 +643,69 @@ def _build_why_section(snapshot: Dict[str, Any]) -> str:
     tp_pct = snapshot.get("tp_pct")
     sl_tp_note = ""
     if sl_pct is not None and tp_pct is not None:
-        sl_tp_note = (
-            f" Con SL/TP a {_format_level_pct(sl_pct)}/{_format_level_pct(tp_pct)} "
-            "i trade hanno poco margine prima di chiudersi in stop o in target."
+        sl_tp_note = t["why_sl_tp_tight"].format(
+            sl=_format_level_pct(sl_pct, lang=lang),
+            tp=_format_level_pct(tp_pct, lang=lang),
         )
         if sl_pct == tp_pct and (snapshot.get("pnl_pct") or 0) < 0:
-            sl_tp_note = (
-                f" Con SL e TP entrambi al {_format_level_pct(sl_pct)}, "
-                "servono molti trade vincenti per compensare le perdite."
+            sl_tp_note = t["why_sl_tp_equal"].format(
+                sl=_format_level_pct(sl_pct, lang=lang),
             )
 
-    operating_mode = snapshot.get("operating_mode", "N/D")
+    operating_mode = snapshot.get("operating_mode", t["nd"])
     mode_note = ""
-    if isinstance(operating_mode, str) and operating_mode.lower() == "aggressiva":
-        mode_note = " La modalità Aggressiva aumenta la frequenza dei segnali."
+    if isinstance(operating_mode, str) and operating_mode.lower() in ("aggressiva", "aggressive"):
+        mode_note = t["why_aggressive_mode"]
 
     tf_note = ""
     tf = str(snapshot.get("timeframe", "")).lower()
     if tf in _SHORT_TIMEFRAMES:
-        tf_note = f" Il timeframe {timeframe} tende a generare più segnali e più rumore."
+        tf_note = t["why_short_tf"].format(timeframe=timeframe)
 
     pnl_val = snapshot.get("pnl_pct")
     outcome_hint = ""
     if pnl_val is not None:
         if pnl_val < 0:
-            outcome_hint = " Il risultato negativo indica che le perdite hanno superato i guadagni."
+            outcome_hint = t["why_negative"]
         elif pnl_val > 0:
-            outcome_hint = " Il risultato positivo indica che la strategia ha chiuso in guadagno nel periodo simulato."
+            outcome_hint = t["why_positive"]
         else:
-            outcome_hint = " Il risultato è in pareggio nel periodo simulato."
+            outcome_hint = t["why_neutral"]
 
     win_rate_val = snapshot.get("win_rate_pct")
     wr_note = ""
     if win_rate_val is not None and win_rate_val < 45:
-        wr_note = " Un win rate sotto il 45% rende difficile recuperare anche con buon risk/reward."
+        wr_note = t["why_low_wr"]
 
     dd_val = snapshot.get("max_drawdown_pct")
     dd_note = ""
     if dd_val is not None and dd_val > 10:
-        dd_note = " Un drawdown elevato segnala sequenze di perdite consecutive pesanti."
+        dd_note = t["why_high_dd"]
 
-    body = (
-        f"La preview su {symbol} (timeframe {timeframe}) chiude a {pnl} "
-        f"con win rate {win_rate} su {trades_text} operazioni. "
-        f"Il drawdown massimo è stato {drawdown}."
-        f"{outcome_hint}{wr_note}{dd_note}{tf_note}{sl_tp_note}{mode_note}"
+    body = t["why_opening"].format(
+        symbol=symbol,
+        timeframe=timeframe,
+        pnl=pnl,
+        win_rate=win_rate,
+        trades=trades_text,
+        drawdown=drawdown,
     )
+    body += f"{outcome_hint}{wr_note}{dd_note}{tf_note}{sl_tp_note}{mode_note}"
     return body.strip()
 
 
-def _suggest_timeframe(snapshot: Dict[str, Any]) -> Optional[str]:
+def _suggest_timeframe(snapshot: Dict[str, Any], *, lang: Optional[str] = None) -> Optional[str]:
+    t = _texts(lang)
     tf = str(snapshot.get("timeframe", "")).lower()
     if tf in _SHORT_TIMEFRAMES:
-        return "timeframe 15m o 1h"
+        return t["suggest_tf_15m_1h"]
     if tf in {"15m", "5m"}:
-        return "timeframe 1h"
+        return t["suggest_tf_1h"]
     return None
 
 
-def _suggest_sl_tp(snapshot: Dict[str, Any]) -> List[str]:
+def _suggest_sl_tp(snapshot: Dict[str, Any], *, lang: Optional[str] = None) -> List[str]:
+    t = _texts(lang)
     suggestions: List[str] = []
     sl = snapshot.get("sl_pct")
     tp = snapshot.get("tp_pct")
@@ -487,13 +714,15 @@ def _suggest_sl_tp(snapshot: Dict[str, Any]) -> List[str]:
     if sl is not None and tp is not None and sl == tp and (pnl is None or pnl < 0):
         new_sl = max(sl + 0.5, 2.5)
         new_tp = max(tp + 1.5, 4.0)
-        suggestions.append(f"stop loss {_format_level_pct(new_sl)}")
-        suggestions.append(f"take profit {_format_level_pct(new_tp)}")
+        suggestions.append(t["suggest_sl"].format(value=_format_level_pct(new_sl, lang=lang)))
+        suggestions.append(t["suggest_tp"].format(value=_format_level_pct(new_tp, lang=lang)))
     elif sl is not None and sl <= 2.0 and (pnl is None or pnl < 0):
-        suggestions.append("stop loss 3%")
-        suggestions.append("take profit 4-5%")
+        suggestions.append(t["suggest_sl_3"])
+        suggestions.append(t["suggest_tp_4_5"])
     elif tp is not None and sl is not None and tp <= sl:
-        suggestions.append(f"take profit leggermente sopra lo stop (es. SL {_format_level_pct(sl)}, TP 4%)")
+        suggestions.append(
+            t["suggest_tp_above_sl"].format(sl=_format_level_pct(sl, lang=lang))
+        )
 
     return suggestions
 
@@ -576,35 +805,38 @@ def _should_suggest_symbol_change(snapshot: Dict[str, Any]) -> bool:
     return False
 
 
-def _suggest_symbol(snapshot: Dict[str, Any]) -> Optional[str]:
+def _suggest_symbol(snapshot: Dict[str, Any], *, lang: Optional[str] = None) -> Optional[str]:
     if not _should_suggest_symbol_change(snapshot):
         return None
     alternatives = _symbol_alternatives(snapshot)
     if not alternatives:
         return None
+    t = _texts(lang)
     primary = alternatives[0]
     if len(alternatives) >= 2:
-        return f"coppia {primary} o {alternatives[1]}"
-    return f"coppia {primary}"
+        return t["suggest_pair_or"].format(primary=primary, secondary=alternatives[1])
+    return t["suggest_pair"].format(symbol=primary)
 
 
-def _suggest_operating_mode(snapshot: Dict[str, Any]) -> Optional[str]:
+def _suggest_operating_mode(snapshot: Dict[str, Any], *, lang: Optional[str] = None) -> Optional[str]:
+    t = _texts(lang)
     mode = str(snapshot.get("operating_mode", "")).lower()
     trades = snapshot.get("trades_count")
     pnl = snapshot.get("pnl_pct")
 
-    if mode == "aggressiva" and (pnl is None or pnl < 0):
-        return "modalità Selettiva o Equilibrata"
-    if mode == "selettiva" and trades is not None and trades < 15:
-        return "modalità Equilibrata"
-    if mode != "selettiva" and (pnl is None or pnl < 0):
+    if mode in ("aggressiva", "aggressive") and (pnl is None or pnl < 0):
+        return t["suggest_mode_selective_balanced"]
+    if mode in ("selettiva", "selective") and trades is not None and trades < 15:
+        return t["suggest_mode_balanced"]
+    if mode not in ("selettiva", "selective") and (pnl is None or pnl < 0):
         win_rate = snapshot.get("win_rate_pct")
         if win_rate is not None and win_rate < 45:
-            return "modalità Selettiva"
+            return t["suggest_mode_selective"]
     return None
 
 
-def _suggest_risk_leverage(snapshot: Dict[str, Any]) -> List[str]:
+def _suggest_risk_leverage(snapshot: Dict[str, Any], *, lang: Optional[str] = None) -> List[str]:
+    t = _texts(lang)
     suggestions: List[str] = []
     leverage = snapshot.get("leverage")
     risk = snapshot.get("risk_pct")
@@ -613,9 +845,11 @@ def _suggest_risk_leverage(snapshot: Dict[str, Any]) -> List[str]:
 
     if dd is not None and dd > 10:
         if leverage is not None and leverage >= 5 and market != "spot":
-            suggestions.append(f"leva più contenuta (es. {max(3, int(leverage // 2))}x)")
+            suggestions.append(
+                t["suggest_leverage"].format(value=max(3, int(leverage // 2)))
+            )
         if risk is not None and risk >= 1.5:
-            suggestions.append("rischio 1% per trade")
+            suggestions.append(t["suggest_risk_1"])
 
     return suggestions
 
@@ -689,21 +923,26 @@ def _extract_timeframes(text: str) -> List[str]:
     return found
 
 
-def _extract_suggestions_section(reply: str) -> str:
+def _extract_suggestions_section(reply: str, *, lang: Optional[str] = None) -> str:
+    t = _texts(lang)
     lower = reply.lower()
-    header = _SUGGESTIONS_HEADER.lower()
+    header = t["suggestions_header"].lower()
     idx = lower.find(header)
     if idx < 0:
         return ""
-    start = idx + len(_SUGGESTIONS_HEADER)
+    start = idx + len(t["suggestions_header"])
     rest = reply[start:].lstrip("\n:")
-    for stop in (
-        "Puoi provare scrivendo in chat",
+    stop_markers = (
+        t["chat_params_header"].split("\n")[0],
         "Se vuoi provare queste modifiche",
-        _LEGACY_CLOSING,
+        "If you want to try these changes",
+        t["legacy_closing"],
         "Vuoi che aggiorni",
+        "Do you want me to update",
         "modifica questi parametri",
-    ):
+        "modify these parameters",
+    )
+    for stop in stop_markers:
         stop_idx = rest.lower().find(stop.lower())
         if stop_idx >= 0:
             rest = rest[:stop_idx]
@@ -880,8 +1119,10 @@ def _parse_timeframe_value(suggestion: str, current_timeframe: str) -> Optional[
 def _collect_advised_changes_from_reply(
     reply: str,
     snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
 ) -> _AdvisedChanges:
-    section = _extract_suggestions_section(reply)
+    section = _extract_suggestions_section(reply, lang=lang)
     suggestions = _parse_numbered_suggestions(section)
     if not suggestions and section:
         suggestions = [line.strip() for line in section.splitlines() if line.strip()]
@@ -937,46 +1178,62 @@ def _collect_advised_changes_from_reply(
 def build_final_params_section_from_advice(
     reply: str,
     snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
 ) -> str:
     """Costruisce il blocco finale solo dai parametri consigliati in 'Cosa proverei a cambiare'."""
-    changes = _collect_advised_changes_from_reply(reply, snapshot)
+    t = _texts(lang)
+    changes = _collect_advised_changes_from_reply(reply, snapshot, lang=lang)
     lines: List[str] = []
 
     if "timeframe" in changes.intents and changes.timeframe:
         lines.append(f"- timeframe: {changes.timeframe}")
     if "operating_mode" in changes.intents and changes.operating_mode:
-        lines.append(f"- modalità operativa: {changes.operating_mode}")
+        lines.append(f"- {t['label_operating_mode']}: {changes.operating_mode}")
     if "risk_pct" in changes.intents and changes.risk_pct is not None:
-        lines.append(f"- rischio per trade: {_format_level_pct(changes.risk_pct)}")
+        lines.append(
+            f"- {t['label_risk']}: {_format_level_pct(changes.risk_pct, lang=lang)}"
+        )
     if "sl_pct" in changes.intents and changes.sl_pct is not None:
-        lines.append(f"- stop loss: {_format_level_pct(changes.sl_pct)}")
+        lines.append(
+            f"- {t['label_stop_loss']}: {_format_level_pct(changes.sl_pct, lang=lang)}"
+        )
     if "tp_pct" in changes.intents and changes.tp_pct is not None:
-        lines.append(f"- take profit: {_format_level_pct(changes.tp_pct)}")
+        lines.append(
+            f"- {t['label_take_profit']}: {_format_level_pct(changes.tp_pct, lang=lang)}"
+        )
     if "symbol" in changes.intents and changes.symbol:
-        lines.append(f"- coppia: {changes.symbol}")
+        lines.append(f"- {t['label_pair']}: {changes.symbol}")
 
     if not lines:
-        return (
-            "Puoi provare scrivendo in chat i parametri suggeriti sopra, "
-            "specificando coppia, timeframe, modalità, stop loss, take profit e rischio."
-        )
-    return f"{_CHAT_PARAMS_HEADER}\n" + "\n".join(lines)
+        return t["params_fallback"]
+    return f"{t['chat_params_header']}\n" + "\n".join(lines)
 
 
-def build_confirmation_suffix(reply: str, snapshot: Dict[str, Any]) -> str:
-    return build_final_params_section_from_advice(reply, snapshot)
+def build_confirmation_suffix(
+    reply: str,
+    snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> str:
+    return build_final_params_section_from_advice(reply, snapshot, lang=lang)
 
 
-def _strip_existing_confirmation(text: str) -> str:
+def _strip_existing_confirmation(text: str, *, lang: Optional[str] = None) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
         return ""
-    if _LEGACY_CLOSING.lower() in cleaned.lower():
-        idx = cleaned.lower().find(_LEGACY_CLOSING.lower())
-        cleaned = cleaned[:idx].rstrip()
+    t = _texts(lang)
+    for closing in (t["legacy_closing"], _LEGACY_CLOSING):
+        if closing.lower() in cleaned.lower():
+            idx = cleaned.lower().find(closing.lower())
+            cleaned = cleaned[:idx].rstrip()
     for marker in (
+        t["chat_params_header"].split("\n")[0],
         "Puoi provare scrivendo in chat",
+        "You can try typing in chat",
         "Se vuoi provare queste modifiche",
+        "If you want to try these changes",
     ):
         if marker in cleaned:
             idx = cleaned.find(marker)
@@ -984,48 +1241,50 @@ def _strip_existing_confirmation(text: str) -> str:
     return cleaned
 
 
-def _finalize_preview_advice_reply(text: str) -> str:
+def _finalize_preview_advice_reply(text: str, *, lang: Optional[str] = None) -> str:
     """Aggiunge la CTA standard come ultima frase, una sola volta."""
+    t = _texts(lang)
     cleaned = (text or "").strip()
     if not cleaned:
-        return _PREVIEW_ADVICE_CTA
-    cleaned = _strip_existing_confirmation(cleaned)
-    for marker in ("Vuoi avviare il bot adesso?", _PREVIEW_ADVICE_CTA):
+        return t["preview_advice_cta"]
+    cleaned = _strip_existing_confirmation(cleaned, lang=lang)
+    for marker in (t["start_bot_prompt"], t["preview_advice_cta"], _PREVIEW_ADVICE_CTA):
         lower = cleaned.lower()
         idx = lower.find(marker.lower())
         if idx >= 0:
             cleaned = cleaned[:idx].rstrip()
-    return f"{cleaned}\n\n{_PREVIEW_ADVICE_CTA}"
+    return f"{cleaned}\n\n{t['preview_advice_cta']}"
 
 
-def build_rule_based_advice(snapshot: Dict[str, Any]) -> str:
-    why = _build_why_section(snapshot)
+def build_rule_based_advice(snapshot: Dict[str, Any], *, lang: Optional[str] = None) -> str:
+    t = _texts(lang)
+    why = _build_why_section(snapshot, lang=lang)
 
     raw_suggestions: List[str] = []
-    symbol = _suggest_symbol(snapshot)
+    symbol = _suggest_symbol(snapshot, lang=lang)
     if symbol:
         raw_suggestions.append(symbol)
-    tf = _suggest_timeframe(snapshot)
+    tf = _suggest_timeframe(snapshot, lang=lang)
     if tf:
         raw_suggestions.append(tf)
-    raw_suggestions.extend(_suggest_sl_tp(snapshot))
-    mode = _suggest_operating_mode(snapshot)
+    raw_suggestions.extend(_suggest_sl_tp(snapshot, lang=lang))
+    mode = _suggest_operating_mode(snapshot, lang=lang)
     if mode:
         raw_suggestions.append(mode)
-    raw_suggestions.extend(_suggest_risk_leverage(snapshot))
+    raw_suggestions.extend(_suggest_risk_leverage(snapshot, lang=lang))
 
     if not raw_suggestions:
         pnl = snapshot.get("pnl_pct")
         if pnl is not None and pnl >= 0:
             raw_suggestions = [
-                "mantenere timeframe e modalità attuali",
-                "stop loss 2.5% e take profit 4% per proteggere i guadagni",
+                t["fallback_keep"],
+                t["fallback_protect"],
             ]
         else:
             raw_suggestions = [
-                "timeframe 15m",
-                "stop loss 3%",
-                "take profit 4%",
+                t["fallback_tf_15m"],
+                t["fallback_sl_3"],
+                t["fallback_tp_4"],
             ]
 
     seen = set()
@@ -1037,7 +1296,7 @@ def build_rule_based_advice(snapshot: Dict[str, Any]) -> str:
             unique.append(item)
     unique = unique[:5]
     if len(unique) < 2:
-        for filler in ("stop loss 3%", "take profit 4%"):
+        for filler in (t["fallback_sl_3"], t["fallback_tp_4"]):
             if filler.lower() not in seen:
                 unique.append(filler)
                 seen.add(filler.lower())
@@ -1047,17 +1306,22 @@ def build_rule_based_advice(snapshot: Dict[str, Any]) -> str:
     suggestion_lines = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(unique))
 
     advice_body = (
-        "Perché la preview è andata così\n"
+        f"{t['why_header']}\n"
         f"{why}\n\n"
-        "Cosa proverei a cambiare\n"
+        f"{t['suggestions_header']}\n"
         f"{suggestion_lines}"
     )
-    return f"{advice_body}\n\n{build_confirmation_suffix(advice_body, snapshot)}"
+    return f"{advice_body}\n\n{build_confirmation_suffix(advice_body, snapshot, lang=lang)}"
 
 
-def ensure_confirmation_suffix(reply: str, snapshot: Optional[Dict[str, Any]] = None) -> str:
-    text = _strip_existing_confirmation(reply)
-    suffix = build_confirmation_suffix(text, snapshot or {})
+def ensure_confirmation_suffix(
+    reply: str,
+    snapshot: Optional[Dict[str, Any]] = None,
+    *,
+    lang: Optional[str] = None,
+) -> str:
+    text = _strip_existing_confirmation(reply, lang=lang)
+    suffix = build_confirmation_suffix(text, snapshot or {}, lang=lang)
     if not text:
         return suffix
     return f"{text}\n\n{suffix}"
@@ -1144,16 +1408,67 @@ def _extract_symbol_from_user_text(text: str, snapshot: Dict[str, Any]) -> Optio
     return None
 
 
-def _build_hypothetical_sl_reply(user_message: str, snapshot: Dict[str, Any]) -> str:
+def _build_hypothetical_sl_reply(
+    user_message: str,
+    snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> str:
     proposed = _extract_pct_near_keywords(user_message, r"stop\s*loss|\bsl\b")
     current_sl = snapshot.get("sl_pct")
     current_tp = snapshot.get("tp_pct")
     sl_val = proposed if proposed is not None else current_sl
+    code = _resolve_lang(lang)
+
+    if code == "en":
+        if proposed is not None and current_sl is not None and proposed != current_sl:
+            opener = (
+                f"If you set Stop Loss to {_format_level_pct(proposed, lang=lang)} "
+                f"instead of the current {_format_level_pct(current_sl, lang=lang)}, "
+            )
+            if proposed < current_sl:
+                opener += "you close losing positions sooner."
+                tradeoff = (
+                    "This can reduce maximum drawdown, but increases the risk of being stopped out "
+                    "on normal price swings."
+                )
+                closing = (
+                    f"Before applying it, I'd also consider a higher TP or SL closer to "
+                    f"{_format_level_pct(current_sl, lang=lang)}."
+                )
+            else:
+                opener += "you tolerate larger losses before closing."
+                tradeoff = (
+                    "This can reduce premature stops, but if the trade goes wrong drawdown can worsen."
+                )
+                closing = "Before applying it, I'd consider a tighter SL or higher TP."
+        elif sl_val is not None:
+            opener = (
+                f"If you set Stop Loss to {_format_level_pct(sl_val, lang=lang)}, "
+                "you change the maximum loss per trade."
+            )
+            tradeoff = "Tighter values close sooner at a loss; wider values tolerate more movement."
+            closing = "Before applying it, I'd balance it with the current TP."
+        else:
+            return (
+                "If you change Stop Loss, you change how much you're willing to lose per trade. "
+                "Before applying it, compare it with TP to see if risk/reward holds up."
+            )
+        sentences = [opener, tradeoff]
+        if sl_val is not None and current_tp is not None and sl_val > current_tp:
+            sl_i = int(sl_val) if sl_val == int(sl_val) else sl_val
+            tp_i = int(current_tp) if current_tp == int(current_tp) else current_tp
+            sentences.append(
+                f"With TP at {_format_level_pct(current_tp, lang=lang)}, risk/reward stays delicate "
+                f"because you risk {sl_i} to target {tp_i}."
+            )
+        sentences.append(closing)
+        return " ".join(sentences)
 
     if proposed is not None and current_sl is not None and proposed != current_sl:
         opener = (
-            f"Se imposti lo Stop Loss al {_format_level_pct(proposed)} "
-            f"invece dell'attuale {_format_level_pct(current_sl)}, "
+            f"Se imposti lo Stop Loss al {_format_level_pct(proposed, lang=lang)} "
+            f"invece dell'attuale {_format_level_pct(current_sl, lang=lang)}, "
         )
         if proposed < current_sl:
             opener += "chiudi prima le posizioni in perdita."
@@ -1163,7 +1478,7 @@ def _build_hypothetical_sl_reply(user_message: str, snapshot: Dict[str, Any]) ->
             )
             closing = (
                 f"Prima di applicarlo, valuterei anche TP più alto o SL più vicino al "
-                f"{_format_level_pct(current_sl)}."
+                f"{_format_level_pct(current_sl, lang=lang)}."
             )
         else:
             opener += "tolleri perdite più ampie prima di chiudere."
@@ -1172,7 +1487,10 @@ def _build_hypothetical_sl_reply(user_message: str, snapshot: Dict[str, Any]) ->
             )
             closing = "Prima di applicarlo, valuterei uno SL più contenuto o un TP più alto."
     elif sl_val is not None:
-        opener = f"Se imposti lo Stop Loss al {_format_level_pct(sl_val)}, cambi la perdita massima per trade."
+        opener = (
+            f"Se imposti lo Stop Loss al {_format_level_pct(sl_val, lang=lang)}, "
+            "cambi la perdita massima per trade."
+        )
         tradeoff = "Valori più stretti chiudono prima in perdita; valori più larghi tollerano più movimento."
         closing = "Prima di applicarlo, valuterei l'equilibrio con il TP attuale."
     else:
@@ -1186,16 +1504,34 @@ def _build_hypothetical_sl_reply(user_message: str, snapshot: Dict[str, Any]) ->
         sl_i = int(sl_val) if sl_val == int(sl_val) else sl_val
         tp_i = int(current_tp) if current_tp == int(current_tp) else current_tp
         sentences.append(
-            f"Con TP al {_format_level_pct(current_tp)}, il rapporto rischio/rendimento resta ancora delicato "
+            f"Con TP al {_format_level_pct(current_tp, lang=lang)}, il rapporto rischio/rendimento resta ancora delicato "
             f"perché rischi {sl_i} per puntare a {tp_i}."
         )
     sentences.append(closing)
     return " ".join(sentences)
 
 
-def _build_hypothetical_symbol_reply(user_message: str, snapshot: Dict[str, Any]) -> str:
-    current = snapshot.get("symbol", "N/D")
+def _build_hypothetical_symbol_reply(
+    user_message: str,
+    snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> str:
+    t = _texts(lang)
+    current = snapshot.get("symbol", t["nd"])
     proposed = _extract_symbol_from_user_text(user_message, snapshot)
+    if _resolve_lang(lang) == "en":
+        if proposed and proposed != current:
+            return (
+                f"If you use {proposed} instead of {current}, volatility and signal frequency change. "
+                f"Results from the preview on {current} don't transfer automatically. "
+                "Before applying it, I'd run a new preview on that pair."
+            )
+        return (
+            f"If you change pair from {current}, volatility, liquidity and entry opportunities change. "
+            f"The current preview only applies to {current}. "
+            "Before applying it, I'd simulate the new pair to see real drawdown and win rate."
+        )
     if proposed and proposed != current:
         return (
             f"Se usi {proposed} al posto di {current}, cambiano volatilità e frequenza dei segnali. "
@@ -1209,16 +1545,55 @@ def _build_hypothetical_symbol_reply(user_message: str, snapshot: Dict[str, Any]
     )
 
 
-def _build_hypothetical_tp_reply(user_message: str, snapshot: Dict[str, Any]) -> str:
+def _build_hypothetical_tp_reply(
+    user_message: str,
+    snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> str:
     proposed = _extract_pct_near_keywords(user_message, r"take\s*profit|\btp\b")
     current_tp = snapshot.get("tp_pct")
     current_sl = snapshot.get("sl_pct")
     tp_val = proposed if proposed is not None else current_tp
+    code = _resolve_lang(lang)
+
+    if code == "en":
+        if proposed is not None and current_tp is not None and proposed != current_tp:
+            opener = (
+                f"If you set Take Profit to {_format_level_pct(proposed, lang=lang)} "
+                f"instead of the current {_format_level_pct(current_tp, lang=lang)}, "
+            )
+            if proposed > current_tp:
+                opener += "you aim for larger gains per trade."
+                tradeoff = "You hit target less often, but each winning trade offsets losses better."
+            else:
+                opener += "you close in profit sooner."
+                tradeoff = "You increase target probability, but each win weighs less on overall results."
+        elif tp_val is not None:
+            opener = (
+                f"If you set Take Profit to {_format_level_pct(tp_val, lang=lang)}, "
+                "you change the exit target per trade."
+            )
+            tradeoff = (
+                "Higher TPs improve return per winning trade; lower TPs increase target closures."
+            )
+        else:
+            return (
+                "If you change Take Profit, you change how much you seek to gain per trade. "
+                "Before applying it, compare it with SL to verify risk/reward."
+            )
+        sentences = [opener, tradeoff]
+        if tp_val is not None and current_sl is not None and tp_val <= current_sl:
+            sentences.append(
+                f"With SL at {_format_level_pct(current_sl, lang=lang)}, risk/reward stays delicate."
+            )
+        sentences.append("Before applying it, I'd balance it with the current SL.")
+        return " ".join(sentences)
 
     if proposed is not None and current_tp is not None and proposed != current_tp:
         opener = (
-            f"Se imposti il Take Profit al {_format_level_pct(proposed)} "
-            f"invece dell'attuale {_format_level_pct(current_tp)}, "
+            f"Se imposti il Take Profit al {_format_level_pct(proposed, lang=lang)} "
+            f"invece dell'attuale {_format_level_pct(current_tp, lang=lang)}, "
         )
         if proposed > current_tp:
             opener += "punti a guadagni più ampi per trade."
@@ -1227,7 +1602,10 @@ def _build_hypothetical_tp_reply(user_message: str, snapshot: Dict[str, Any]) ->
             opener += "chiudi prima in guadagno."
             tradeoff = "Aumenti la probabilità di target, ma ogni vincita pesa meno sul risultato complessivo."
     elif tp_val is not None:
-        opener = f"Se imposti il Take Profit al {_format_level_pct(tp_val)}, cambi il target di uscita per trade."
+        opener = (
+            f"Se imposti il Take Profit al {_format_level_pct(tp_val, lang=lang)}, "
+            "cambi il target di uscita per trade."
+        )
         tradeoff = "TP più alti migliorano il rendimento per trade vincente, TP più bassi aumentano le chiusure in target."
     else:
         return (
@@ -1238,22 +1616,45 @@ def _build_hypothetical_tp_reply(user_message: str, snapshot: Dict[str, Any]) ->
     sentences = [opener, tradeoff]
     if tp_val is not None and current_sl is not None and tp_val <= current_sl:
         sentences.append(
-            f"Con SL al {_format_level_pct(current_sl)}, il rapporto rischio/rendimento resta delicato."
+            f"Con SL al {_format_level_pct(current_sl, lang=lang)}, il rapporto rischio/rendimento resta delicato."
         )
     sentences.append("Prima di applicarlo, valuterei l'equilibrio con lo SL attuale.")
     return " ".join(sentences)
 
 
-def _build_hypothetical_timeframe_reply(user_message: str, snapshot: Dict[str, Any]) -> str:
+def _build_hypothetical_timeframe_reply(
+    user_message: str,
+    snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> str:
     proposed_tfs = _extract_timeframes(user_message)
-    current_tf = snapshot.get("timeframe", "N/D")
+    t = _texts(lang)
+    current_tf = snapshot.get("timeframe", t["nd"])
     if proposed_tfs:
         new_tf = proposed_tfs[0]
+        if _resolve_lang(lang) == "en":
+            direction = (
+                "more signals and more noise"
+                if new_tf in _SHORT_TIMEFRAMES
+                else "fewer but more filtered signals"
+            )
+            return (
+                f"If you switch to timeframe {new_tf} instead of {current_tf}, you tend to get {direction}. "
+                "Trade frequency changes and it can affect win rate and drawdown. "
+                "Before applying it, I'd consider whether you want more trades or more selective signals."
+            )
         direction = "più segnali e più rumore" if new_tf in _SHORT_TIMEFRAMES else "meno segnali ma più filtrati"
         return (
             f"Se passi al timeframe {new_tf} invece di {current_tf}, tendi ad avere {direction}. "
             "Cambia frequenza dei trade e può influire su win rate e drawdown. "
             "Prima di applicarlo, valuterei se vuoi più operazioni o segnali più selezionati."
+        )
+    if _resolve_lang(lang) == "en":
+        return (
+            f"If you change timeframe from {current_tf}, you change how many signals you get and how much noise you include. "
+            "Shorter timeframes increase trades, longer ones reduce them. "
+            "Before applying it, I'd simulate the new timeframe in a preview."
         )
     return (
         f"Se cambi timeframe rispetto a {current_tf}, modifichi quanti segnali ricevi e quanto rumore includi. "
@@ -1262,7 +1663,13 @@ def _build_hypothetical_timeframe_reply(user_message: str, snapshot: Dict[str, A
     )
 
 
-def build_hypothetical_rule_based_advice(user_message: str, snapshot: Dict[str, Any]) -> str:
+def build_hypothetical_rule_based_advice(
+    user_message: str,
+    snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> str:
+    t = _texts(lang)
     topic = _detect_hypothetical_topic(user_message)
     builders = {
         "sl": _build_hypothetical_sl_reply,
@@ -1272,36 +1679,38 @@ def build_hypothetical_rule_based_advice(user_message: str, snapshot: Dict[str, 
     }
     builder = builders.get(topic)
     if builder:
-        return builder(user_message, snapshot)
+        return builder(user_message, snapshot, lang=lang)
     if topic == "leverage":
-        return (
-            "Se cambi la leva, modifichi l'esposizione senza cambiare il capitale impegnato. "
-            "Leva più alta amplifica guadagni e perdite e può peggiorare il drawdown. "
-            "Prima di applicarlo, valuterei una leva più contenuta se il drawdown attuale è già elevato."
-        )
+        return t["hypo_leverage"]
     if topic == "risk":
-        return (
-            "Se aumenti il rischio per trade, ogni operazione pesa di più sul capitale totale. "
-            "Il drawdown può crescere più rapidamente su sequenze negative. "
-            "Prima di applicarlo, valuterei se il rischio attuale è già sostenibile."
-        )
-    return (
-        "È una domanda ipotetica: chiedi cosa cambierebbe un parametro, non di applicarlo. "
-        "Prima di applicarlo, userei la preview attuale solo come riferimento per l'impatto."
-    )
+        return t["hypo_risk"]
+    return t["hypo_generic"]
 
 
-def _try_llm_hypothetical_advice(user_message: str, snapshot: Dict[str, Any]) -> Optional[str]:
+def _try_llm_hypothetical_advice(
+    user_message: str,
+    snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> Optional[str]:
     llm_client = _import_llm_client()
     if llm_client is None:
         return None
-    payload = (
-        f"Domanda ipotetica dell'utente:\n{(user_message or '').strip()}\n\n"
-        f"Preview salvata (solo contesto, non aprire con analisi generica):\n"
-        f"{json.dumps(snapshot, ensure_ascii=False, indent=2)}"
-    )
+    code = _resolve_lang(lang)
+    if code == "en":
+        payload = (
+            f"User hypothetical question:\n{(user_message or '').strip()}\n\n"
+            f"Saved preview (context only, do not open with generic analysis):\n"
+            f"{json.dumps(snapshot, ensure_ascii=False, indent=2)}"
+        )
+    else:
+        payload = (
+            f"Domanda ipotetica dell'utente:\n{(user_message or '').strip()}\n\n"
+            f"Preview salvata (solo contesto, non aprire con analisi generica):\n"
+            f"{json.dumps(snapshot, ensure_ascii=False, indent=2)}"
+        )
     messages = [
-        {"role": "system", "content": _HYPOTHETICAL_ADVICE_SYSTEM},
+        {"role": "system", "content": _HYPOTHETICAL_ADVICE_SYSTEM_BY_LANG[code]},
         {"role": "user", "content": payload},
     ]
     try:
@@ -1316,19 +1725,58 @@ def _try_llm_hypothetical_advice(user_message: str, snapshot: Dict[str, Any]) ->
         return None
 
 
+def _try_llm_preview_advice(
+    user_message: str,
+    snapshot: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> Optional[str]:
+    llm_client = _import_llm_client()
+    if llm_client is None:
+        return None
+    code = _resolve_lang(lang)
+    if code == "en":
+        payload = (
+            f"User question:\n{(user_message or '').strip()}\n\n"
+            f"Last saved preview (real data, do not invent other numbers):\n"
+            f"{json.dumps(snapshot, ensure_ascii=False, indent=2)}"
+        )
+    else:
+        payload = (
+            f"Domanda dell'utente:\n{(user_message or '').strip()}\n\n"
+            f"Ultima preview salvata (dati reali, non inventare altri numeri):\n"
+            f"{json.dumps(snapshot, ensure_ascii=False, indent=2)}"
+        )
+    messages = [
+        {"role": "system", "content": _PREVIEW_ADVICE_SYSTEM[code]},
+        {"role": "user", "content": payload},
+    ]
+    try:
+        res = llm_client.client.responses.create(
+            model=llm_client.MODEL_PRO,
+            input=messages,
+            max_output_tokens=450,
+        )
+        return (res.output_text or "").strip()
+    except Exception as e:
+        logger.error("[PREVIEW_ADVICE] preview_llm_failed error=%s", e, exc_info=True)
+        return None
+
+
 def _try_llm_advice(
     user_message: str,
     snapshot: Dict[str, Any],
     *,
     hypothetical: bool = False,
+    lang: Optional[str] = None,
 ) -> Optional[str]:
     llm_client = _import_llm_client()
     if llm_client is None:
         return None
     try:
         if hypothetical:
-            return _try_llm_hypothetical_advice(user_message, snapshot)
-        return llm_client.preview_advice_answer(user_message, snapshot)
+            return _try_llm_hypothetical_advice(user_message, snapshot, lang=lang)
+        return _try_llm_preview_advice(user_message, snapshot, lang=lang)
     except Exception as e:
         logger.error("[PREVIEW_ADVICE] llm_failed error=%s", e, exc_info=True)
         return None
@@ -1338,27 +1786,60 @@ def handle_preview_advice_request(
     user_id: str,
     user_message: str,
     deps: PreviewAdviceDeps,
+    *,
+    lang: Optional[str] = None,
 ) -> Tuple[str, str, str]:
+    resolved_lang = _resolve_lang(lang)
+    t = _texts(resolved_lang)
     row = fetch_latest_preview(user_id, deps)
     if not row:
-        return _finalize_preview_advice_reply(_NO_PREVIEW_REPLY), "preview_advice", "preview_advice_no_data"
+        logger.info("[PREVIEW_LANG] lang=%s", resolved_lang)
+        logger.info("[PREVIEW_LANG] mode=advice")
+        return (
+            _finalize_preview_advice_reply(t["no_preview_reply"], lang=resolved_lang),
+            "preview_advice",
+            "preview_advice_no_data",
+        )
 
-    snapshot = build_preview_snapshot(row)
+    snapshot = build_preview_snapshot(row, lang=resolved_lang)
     hypothetical = is_hypothetical_question(user_message)
-    llm_reply = _try_llm_advice(user_message, snapshot, hypothetical=hypothetical)
+    mode_label = "hypothetical" if hypothetical else "advice"
+    logger.info("[PREVIEW_LANG] lang=%s", resolved_lang)
+    logger.info("[PREVIEW_LANG] mode=%s", mode_label)
+
+    llm_reply = _try_llm_advice(
+        user_message,
+        snapshot,
+        hypothetical=hypothetical,
+        lang=resolved_lang,
+    )
     if llm_reply:
         if hypothetical:
             return (
-                _finalize_preview_advice_reply(llm_reply),
+                _finalize_preview_advice_reply(llm_reply, lang=resolved_lang),
                 "preview_advice",
                 "preview_advice_hypothetical_llm",
             )
-        reply = ensure_confirmation_suffix(llm_reply, snapshot)
-        return _finalize_preview_advice_reply(reply), "preview_advice", "preview_advice_llm"
+        reply = ensure_confirmation_suffix(llm_reply, snapshot, lang=resolved_lang)
+        return (
+            _finalize_preview_advice_reply(reply, lang=resolved_lang),
+            "preview_advice",
+            "preview_advice_llm",
+        )
 
     if hypothetical:
-        reply = build_hypothetical_rule_based_advice(user_message, snapshot)
-        return _finalize_preview_advice_reply(reply), "preview_advice", "preview_advice_hypothetical_fallback"
+        reply = build_hypothetical_rule_based_advice(
+            user_message, snapshot, lang=resolved_lang
+        )
+        return (
+            _finalize_preview_advice_reply(reply, lang=resolved_lang),
+            "preview_advice",
+            "preview_advice_hypothetical_fallback",
+        )
 
-    reply = build_rule_based_advice(snapshot)
-    return _finalize_preview_advice_reply(reply), "preview_advice", "preview_advice_fallback"
+    reply = build_rule_based_advice(snapshot, lang=resolved_lang)
+    return (
+        _finalize_preview_advice_reply(reply, lang=resolved_lang),
+        "preview_advice",
+        "preview_advice_fallback",
+    )

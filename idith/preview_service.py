@@ -14,6 +14,21 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from . import ai_lang
+except Exception:
+    try:
+        import ai_lang
+    except Exception:
+        ai_lang = None  # type: ignore[assignment]
+
+
+def _resolve_lang(lang: Optional[str] = None) -> str:
+    if ai_lang is not None:
+        return ai_lang.normalize_lang(lang or ai_lang.get_request_lang())
+    code = (lang or "it").strip().lower()
+    return "en" if code.startswith("en") else "it"
+
 
 def _normalize_config_market_type(raw: Any) -> Optional[str]:
     from .text_normalize_config_values import normalize_market_type
@@ -74,13 +89,104 @@ _PREVIEW_WORD_TRIGGERS = (
     "backtest",
 )
 
-_FIELD_LABELS = {
-    "symbol": "coppia",
-    "timeframe": "timeframe",
-    "market_type": "tipo di mercato",
-    "sl": "stop loss",
-    "tp": "take profit",
+_FIELD_LABELS: Dict[str, Dict[str, str]] = {
+    "it": {
+        "symbol": "coppia",
+        "timeframe": "timeframe",
+        "market_type": "tipo di mercato",
+        "sl": "stop loss",
+        "tp": "take profit",
+    },
+    "en": {
+        "symbol": "pair",
+        "timeframe": "timeframe",
+        "market_type": "market type",
+        "sl": "stop loss",
+        "tp": "take profit",
+    },
 }
+
+_PREVIEW_DONE_TEXTS: Dict[str, Dict[str, str]] = {
+    "it": {
+        "title": "📊 Preview indicativa — ultimi {days} giorni",
+        "strategy": "Strategia: {mode}",
+        "leverage": "Leva {value}",
+        "risk": "Rischio {value}",
+        "estimated_result": "Risultato stimato: {value}",
+        "simulated_trades": "Operazioni simulate: {value}",
+        "win_rate": "Win rate: {value}",
+        "max_drawdown": "Drawdown massimo: {value}",
+        "footer_data": "Preview basata su dati storici Bybit.",
+        "footer_disclaimer": "Non garantisce risultati futuri.",
+    },
+    "en": {
+        "title": "📊 Indicative Preview — Last {days} Days",
+        "strategy": "Strategy: {mode}",
+        "leverage": "Leverage {value}",
+        "risk": "Risk {value}",
+        "estimated_result": "Estimated Result: {value}",
+        "simulated_trades": "Simulated Trades: {value}",
+        "win_rate": "Win Rate: {value}",
+        "max_drawdown": "Maximum Drawdown: {value}",
+        "footer_data": "Preview based on historical Bybit data.",
+        "footer_disclaimer": "Past performance does not guarantee future results.",
+    },
+}
+
+_PREVIEW_ERROR_TEXTS: Dict[str, Dict[str, str]] = {
+    "it": {
+        "missing_intro": "Per generare la preview mi mancano ancora: {fields}.",
+        "missing_outro": "Completiamo prima questi parametri.",
+        "failed": "❌ Preview non completata: {error}",
+        "unknown_error": "Errore sconosciuto durante la preview.",
+        "module_unavailable": "❌ Modulo backtest preview non disponibile sul server.",
+        "queue_unavailable": "❌ Modulo coda runner non disponibile sul server.",
+        "no_runner": "Per generare la preview serve il runner collegato.",
+        "timeout": (
+            "Ho inviato la richiesta al runner, ma non ho ancora ricevuto il risultato. "
+            "Verifica che il runner sia collegato e riprova."
+        ),
+        "enqueue_failed": "❌ Errore nell'invio della preview al runner: {error}",
+    },
+    "en": {
+        "missing_intro": "To generate the preview I'm still missing: {fields}.",
+        "missing_outro": "Let's complete these parameters first.",
+        "failed": "❌ Preview not completed: {error}",
+        "unknown_error": "Unknown error during preview.",
+        "module_unavailable": "❌ Backtest preview module not available on the server.",
+        "queue_unavailable": "❌ Runner queue module not available on the server.",
+        "no_runner": "A connected runner is required to generate the preview.",
+        "timeout": (
+            "I sent the request to the runner, but haven't received the result yet. "
+            "Make sure the runner is connected and try again."
+        ),
+        "enqueue_failed": "❌ Error sending preview to runner: {error}",
+    },
+}
+
+def _preview_texts(lang: Optional[str] = None) -> Dict[str, str]:
+    return _PREVIEW_DONE_TEXTS[_resolve_lang(lang)]
+
+
+def _preview_error_texts(lang: Optional[str] = None) -> Dict[str, str]:
+    return _PREVIEW_ERROR_TEXTS[_resolve_lang(lang)]
+
+
+def _field_labels(lang: Optional[str] = None) -> Dict[str, str]:
+    return _FIELD_LABELS[_resolve_lang(lang)]
+
+
+def _join_field_list(labels: List[str], lang: Optional[str] = None) -> str:
+    if len(labels) == 1:
+        return labels[0]
+    resolved = _resolve_lang(lang)
+    if len(labels) == 2:
+        conj = " and " if resolved == "en" else " e "
+        return f"{labels[0]}{conj}{labels[1]}"
+    if resolved == "en":
+        return ", ".join(labels[:-1]) + f" and {labels[-1]}"
+    return ", ".join(labels[:-1]) + f" e {labels[-1]}"
+
 
 POLL_TIMEOUT_SECONDS = 450.0
 POLL_INTERVAL_SECONDS = 0.5
@@ -202,18 +308,12 @@ def validate_preview_config_params(params: Dict[str, Any]) -> List[str]:
     return missing
 
 
-def _missing_fields_message(missing_keys: List[str]) -> str:
-    labels = [_FIELD_LABELS.get(k, k) for k in missing_keys]
-    if len(labels) == 1:
-        fields_text = labels[0]
-    elif len(labels) == 2:
-        fields_text = f"{labels[0]} e {labels[1]}"
-    else:
-        fields_text = ", ".join(labels[:-1]) + f" e {labels[-1]}"
-    return (
-        f"Per generare la preview mi mancano ancora: {fields_text}. "
-        "Completiamo prima questi parametri."
-    )
+def _missing_fields_message(missing_keys: List[str], *, lang: Optional[str] = None) -> str:
+    labels_map = _field_labels(lang)
+    labels = [labels_map.get(k, k) for k in missing_keys]
+    texts = _preview_error_texts(lang)
+    fields_text = _join_field_list(labels, lang=lang)
+    return f"{texts['missing_intro'].format(fields=fields_text)} {texts['missing_outro']}"
 
 
 def build_preview_payload(
@@ -267,17 +367,24 @@ def _format_level_pct(value: Any) -> Optional[str]:
     return f"{n:.1f}".rstrip("0").rstrip(".")
 
 
-def _format_market_type_display(market_type: Any) -> Optional[str]:
+def _format_market_type_display(
+    market_type: Any,
+    *,
+    lang: Optional[str] = None,
+) -> Optional[str]:
     from .text_normalize_config_values import normalize_market_type
 
     if not isinstance(market_type, str) or not market_type.strip():
         return None
     mt = normalize_market_type(market_type)
     if mt:
-        return mt
-    raw = market_type.strip().lower()
-    if raw in ("linear", "future"):
-        return "futures"
+        raw = mt
+    else:
+        raw = market_type.strip().lower()
+        if raw in ("linear", "future"):
+            raw = "futures"
+    if _resolve_lang(lang) == "en" and raw:
+        return raw.capitalize()
     return raw
 
 
@@ -508,13 +615,17 @@ def format_preview_done_reply(
     event_payload: Dict[str, Any],
     lookback_fallback: int,
     config_params: Optional[Dict[str, Any]] = None,
+    *,
+    lang: Optional[str] = None,
 ) -> str:
+    resolved_lang = _resolve_lang(lang)
+    texts = _preview_texts(resolved_lang)
     display = _merge_config_for_display(event_payload, config_params)
     effective_lb = _positive_int(
         display.get("effective_lookback_days"), lookback_fallback
     )
 
-    lines = [f"📊 Preview indicativa — ultimi {effective_lb} giorni", ""]
+    lines = [texts["title"].format(days=effective_lb), ""]
 
     meta_parts: List[str] = []
     symbol = display.get("symbol")
@@ -523,7 +634,7 @@ def format_preview_done_reply(
     timeframe = display.get("timeframe")
     if isinstance(timeframe, str) and timeframe.strip():
         meta_parts.append(timeframe.strip())
-    market_display = _format_market_type_display(display.get("market_type"))
+    market_display = _format_market_type_display(display.get("market_type"), lang=resolved_lang)
     if market_display:
         meta_parts.append(market_display)
     if meta_parts:
@@ -531,16 +642,16 @@ def format_preview_done_reply(
 
     operating_mode = _normalize_config_operating_mode(display.get("operating_mode"))
     if operating_mode:
-        lines.append(f"Strategia: {operating_mode}")
+        lines.append(texts["strategy"].format(mode=operating_mode))
 
     lev_display = _format_leverage(display.get("leverage"))
     risk_display = _format_risk_pct(display.get("risk_pct"))
     if lev_display is not None or risk_display is not None:
         lev_risk_parts: List[str] = []
         if lev_display is not None:
-            lev_risk_parts.append(f"Leva {lev_display}")
+            lev_risk_parts.append(texts["leverage"].format(value=lev_display))
         if risk_display is not None:
-            lev_risk_parts.append(f"Rischio {risk_display}")
+            lev_risk_parts.append(texts["risk"].format(value=risk_display))
         lines.append(" · ".join(lev_risk_parts))
 
     sl_val = _format_level_pct(display.get("sl_pct"))
@@ -557,7 +668,7 @@ def format_preview_done_reply(
 
     pnl_pct = _format_pct(display.get("pnl_pct"))
     if pnl_pct:
-        lines.append(f"Risultato stimato: {pnl_pct}")
+        lines.append(texts["estimated_result"].format(value=pnl_pct))
 
     lines.append("")
 
@@ -567,29 +678,34 @@ def format_preview_done_reply(
     if trades is None:
         trades = display.get("entries_count")
     if trades is not None:
-        lines.append(f"Operazioni simulate: {trades}")
+        lines.append(texts["simulated_trades"].format(value=trades))
 
     win_rate = _compute_win_rate(display)
     if win_rate is not None:
-        lines.append(f"Win rate: {_format_win_rate_pct(win_rate)}")
+        lines.append(texts["win_rate"].format(value=_format_win_rate_pct(win_rate)))
 
     dd_pct = _format_pct(display.get("max_drawdown_pct"))
     if dd_pct:
-        lines.append(f"Drawdown massimo: {dd_pct}")
+        lines.append(texts["max_drawdown"].format(value=dd_pct))
 
     lines.extend(
         [
             "",
-            "Preview basata su dati storici Bybit.",
-            "Non garantisce risultati futuri.",
+            texts["footer_data"],
+            texts["footer_disclaimer"],
         ]
     )
     return "\n".join(lines)
 
 
-def format_preview_failed_reply(event_payload: Dict[str, Any]) -> str:
-    error = event_payload.get("error") or "Errore sconosciuto durante la preview."
-    return f"❌ Preview non completata: {error}"
+def format_preview_failed_reply(
+    event_payload: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> str:
+    texts = _preview_error_texts(lang)
+    error = event_payload.get("error") or texts["unknown_error"]
+    return texts["failed"].format(error=error)
 
 
 def _poll_runner_preview_result(
@@ -639,22 +755,27 @@ def handle_preview_request(
     user_id: str,
     user_message: str,
     deps: PreviewDeps,
+    *,
+    lang: Optional[str] = None,
 ) -> Tuple[str, str, str]:
     """
     Gestisce una richiesta preview end-to-end.
     Ritorna (assistant_reply, source, mode). Solo lettura su config_state.
     """
+    resolved_lang = _resolve_lang(lang)
+    error_texts = _preview_error_texts(resolved_lang)
+    logger.info("[PREVIEW_LANG] lang=%s preview_template=%s", resolved_lang, resolved_lang)
     logger.info("[PREVIEW_SERVICE] detected request chat_id=%s user_id=%s", chat_id, user_id)
 
     if not runner_backtest_mod:
         return (
-            "❌ Modulo backtest preview non disponibile sul server.",
+            error_texts["module_unavailable"],
             "backtest_preview",
             "backtest_preview_error",
         )
     if not deps.supabase_queue:
         return (
-            "❌ Modulo coda runner non disponibile sul server.",
+            error_texts["queue_unavailable"],
             "backtest_preview",
             "backtest_preview_error",
         )
@@ -669,7 +790,7 @@ def handle_preview_request(
     if missing:
         logger.info("[PREVIEW_SERVICE] config validation missing=%s", missing)
         return (
-            _missing_fields_message(missing),
+            _missing_fields_message(missing, lang=resolved_lang),
             "backtest_preview",
             "backtest_preview_config_incomplete",
         )
@@ -679,7 +800,7 @@ def handle_preview_request(
     device_id = deps.resolve_runner_device_id(chat_id, user_id)
     if not device_id:
         return (
-            "Per generare la preview serve il runner collegato.",
+            error_texts["no_runner"],
             "backtest_preview",
             "backtest_preview_no_runner",
         )
@@ -719,7 +840,7 @@ def handle_preview_request(
                 chat_id,
             )
             return (
-                format_preview_failed_reply(event_payload),
+                format_preview_failed_reply(event_payload, lang=resolved_lang),
                 "backtest_preview",
                 "backtest_preview_failed",
             )
@@ -740,7 +861,10 @@ def handle_preview_request(
             _save_backtest_preview(deps, save_row)
             return (
                 format_preview_done_reply(
-                    event_payload, lookback_days, config_params=params
+                    event_payload,
+                    lookback_days,
+                    config_params=params,
+                    lang=resolved_lang,
                 ),
                 "backtest_preview",
                 "backtest_preview_done",
@@ -753,8 +877,7 @@ def handle_preview_request(
             POLL_TIMEOUT_SECONDS,
         )
         return (
-            "Ho inviato la richiesta al runner, ma non ho ancora ricevuto il risultato. "
-            "Verifica che il runner sia collegato e riprova.",
+            error_texts["timeout"],
             "backtest_preview",
             "backtest_preview_timeout",
         )
@@ -767,7 +890,7 @@ def handle_preview_request(
             exc_info=True,
         )
         return (
-            f"❌ Errore nell'invio della preview al runner: {e}",
+            error_texts["enqueue_failed"].format(error=e),
             "backtest_preview",
             "backtest_preview_enqueue_failed",
         )

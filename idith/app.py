@@ -5550,6 +5550,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
             user_id=user_id,
             user_message=user_message_content,
             deps=preview_advice_service_mod.PreviewAdviceDeps(supabase=supabase),
+            lang=lang,
         )
         insert_assistant_ok, assistant_message_id, assistant_insert_error = _insert_assistant_message(
             chat_id=chat_id,
@@ -5595,6 +5596,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                 load_chat_state=load_chat_state,
                 resolve_runner_device_id=_resolve_runner_device_id,
             ),
+            lang=lang,
         )
         insert_assistant_ok, assistant_message_id, assistant_insert_error = _insert_assistant_message(
             chat_id=chat_id,
