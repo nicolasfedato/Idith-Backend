@@ -42,6 +42,47 @@ def _complete_state():
     }
 
 
+def test_wizard_sl_high_warning_yes_advances_en():
+    """lang=en: ten @ sl -> warning; yes -> sl saved, next step tp, never market_type."""
+    params = copy.deepcopy(DEFAULT_PARAMS)
+    params.update(
+        {
+            "market_type": "futures",
+            "symbol": "BTCUSDT",
+            "timeframe": "5m",
+            "operating_mode": "selettiva",
+            "leverage": None,
+            "risk_pct": None,
+            "sl": None,
+            "tp": None,
+        }
+    )
+    state = {
+        "config_status": "in_progress",
+        "config_state": {
+            "step": "sl",
+            "params": params,
+            "error_count": {},
+            "pending_sl_confirmation": None,
+            "pending_risk_confirmation": None,
+            "pending_leverage_confirmation": None,
+        },
+    }
+    out1 = handle_message("ten", state, [], lang="en")
+    cs1 = out1["state"]["config_state"]
+    assert cs1.get("pending_sl_confirmation") == 10.0
+    assert cs1.get("step") == "sl"
+    assert "Warning" in out1["reply"]
+
+    out2 = handle_message("yes", out1["state"], [], lang="en")
+    cs2 = out2["state"]["config_state"]
+    assert cs2["params"]["sl"] == "10.0%"
+    assert cs2.get("step") == "tp"
+    assert cs2.get("pending_sl_confirmation") is None
+    assert "Spot or Futures" not in out2["reply"]
+    assert "take profit" in out2["reply"].lower()
+
+
 def test_resolve_input_replaces_pending_risk_without_keyword():
     state = _complete_state()
     params = state["config_state"]["params"]

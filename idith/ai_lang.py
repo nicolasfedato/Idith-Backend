@@ -252,6 +252,62 @@ _CHAT: Dict[str, Dict[str, str]] = {
         "it": "Posso impostare {symbol}. Vuoi usare {symbol}?",
         "en": "I can set {symbol}. Do you want to use {symbol}?",
     },
+    "warning_risk_aggressive": {
+        "it": (
+            "⚠️ Attenzione: rischiare il {risk_pct}% per trade è molto aggressivo. "
+            "Confermi di volerlo impostare?"
+        ),
+        "en": (
+            "⚠️ Warning: risking {risk_pct}% per trade is very aggressive. "
+            "Do you confirm you want to set it?"
+        ),
+    },
+    "warning_leverage_confirm": {
+        "it": (
+            "⚠️ Attenzione: una leva di {leverage_int}x aumenta molto il rischio. "
+            "Confermi di volerla impostare?"
+        ),
+        "en": (
+            "⚠️ Warning: leverage of {leverage_int}x greatly increases risk. "
+            "Do you confirm you want to set it?"
+        ),
+    },
+    "warning_sl_very_high": {
+        "it": (
+            "⚠️ Attenzione: stai impostando uno stop loss del {sl_pct}%, che è molto alto e rischioso. "
+            "Ti suggerisco un valore più prudente del {suggested_sl}%. "
+            "Vuoi usare {suggested_sl}% o preferisci confermare {sl_pct}%?"
+        ),
+        "en": (
+            "⚠️ Warning: you are setting a Stop Loss of {sl_pct}%, which is very high and risky. "
+            "I suggest a more conservative value of {suggested_sl}%. "
+            "Do you want to use {suggested_sl}%, or do you prefer to confirm {sl_pct}%?"
+        ),
+    },
+    "warning_sl_high": {
+        "it": (
+            "⚠️ Attenzione: stai impostando uno stop loss del {sl_pct}%, che è alto. "
+            "Assicurati di comprendere i rischi. "
+            "Vuoi confermare {sl_pct}% o preferisci un valore più prudente?"
+        ),
+        "en": (
+            "⚠️ Warning: you are setting a Stop Loss of {sl_pct}%, which is high. "
+            "Make sure you understand the risks. "
+            "Do you want to confirm {sl_pct}%, or would you prefer a more conservative value?"
+        ),
+    },
+    "warning_leverage_high_soft": {
+        "it": (
+            "⚠️ Attenzione: stai usando una leva alta ({leverage_int}x) per {symbol}. "
+            "Le leve elevate aumentano significativamente il rischio. "
+            "Assicurati di comprendere i rischi prima di procedere."
+        ),
+        "en": (
+            "⚠️ Warning: you are using high leverage ({leverage_int}x) for {symbol}. "
+            "High leverage significantly increases risk. "
+            "Make sure you understand the risks before proceeding."
+        ),
+    },
 }
 
 _SUMMARY_LABELS: Dict[str, Dict[str, str]] = {
@@ -459,6 +515,13 @@ def chat(key: str, lang: Optional[str] = None, **kwargs: Any) -> str:
         except KeyError:
             return template
     return template
+
+
+def warning_chat(key: str, lang: Optional[str] = None, **kwargs: Any) -> str:
+    """Localized risk/SL/leverage warning with [LANG_WARNING] log."""
+    code = normalize_lang(lang or get_request_lang())
+    logger.info("[LANG_WARNING] key=%s lang=%s", key, code)
+    return chat(key, code, **kwargs)
 
 
 def phrase_variant(key: str, attempt: int = 0, lang: Optional[str] = None, **kwargs: Any) -> str:

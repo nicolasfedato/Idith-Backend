@@ -1065,15 +1065,21 @@ def _ensure_state(state: Dict[str, Any]) -> Dict[str, Any]:
     # Rimuoviamo _preset_id se presente (cleanup legacy)
     cs.pop("_preset_id", None)
     
-    # Step corrente = primo campo mancante nella sequenza free_plan.FREE_WIZARD_SEQUENCE
+    # Step corrente: pending ad alto rischio ha priorità (non regredire a market_type, ecc.)
     if cs.get("step") != AWAITING_LEVERAGE_VALUE_STEP:
-        missing = free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
-        if missing is not None:
-            cs["step"] = missing
-        elif is_config_complete(params):
-            cs["step"] = None
+        pinned = _pin_wizard_step_for_high_risk_pending(cs)
+        if pinned is not None:
+            cs["step"] = pinned
         else:
-            cs["step"] = _free_wizard_terminal_step(params)
+            missing = free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
+            if missing == "market_type" and _config_has_wizard_progress(params):
+                missing = _get_next_step(cs.get("step") or "market_type", params, cs)
+            if missing is not None:
+                cs["step"] = missing
+            elif is_config_complete(params):
+                cs["step"] = None
+            else:
+                cs["step"] = _free_wizard_terminal_step(params)
     state["config_state"] = cs
 
     # Coerenza: mai restare "complete" se i params non soddisfano is_config_complete (es. reset DB incompleto).
@@ -1244,6 +1250,17 @@ def _get_missing_indicator_period(params: Dict[str, Any]) -> Optional[str]:
         return "RSI"
     return None
 
+def _config_has_wizard_progress(params: Dict[str, Any]) -> bool:
+    """True se la config è già oltre market_type (non regredire al primo step)."""
+    return (
+        bool(params.get("symbol"))
+        or bool(params.get("timeframe"))
+        or params.get("operating_mode") in OPERATING_MODE_CANONICAL
+        or params.get("sl") not in (None, "")
+        or params.get("tp") not in (None, "")
+    )
+
+
 def _get_next_step(
     current_step: str,
     params: Dict[str, Any],
@@ -1254,7 +1271,24 @@ def _get_next_step(
     `current_step` è ignorato (compatibilità chiamate); la sequenza è sempre ricalcolata da params.
     """
     _ = current_step
-    return free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
+    cs = cs or {}
+    missing = free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
+    if missing == "market_type" and _config_has_wizard_progress(params):
+        for step in free_plan.FREE_WIZARD_SEQUENCE:
+            if step == "market_type":
+                continue
+            if step == "leverage" and params.get("market_type") == "spot":
+                continue
+            if step == "sl" and cs.get("pending_sl_confirmation") is not None:
+                return "sl"
+            if step == "risk_pct" and cs.get("pending_risk_confirmation") is not None:
+                return "risk_pct"
+            if step == "leverage" and cs.get("pending_leverage_confirmation") is not None:
+                return "leverage"
+            if not _is_step_filled(step, params):
+                return step
+        return _free_wizard_terminal_step(params)
+    return missing
 
 # Campi minimi piano FREE: senza questi non si marca mai config_status="complete".
 REQUIRED_FIELDS = ["market_type", "symbol", "timeframe", "operating_mode"]
@@ -2140,7 +2174,7 @@ def _check_risk_warning(risk_pct: float, market_type: str) -> tuple[bool, Option
     REGOLA BUG3: >=HIGH_RISK_PCT_WARNING_THRESHOLD% → warning + conferma obbligatoria; <soglia → accettato normalmente
     """
     if risk_pct >= HIGH_RISK_PCT_WARNING_THRESHOLD:
-        return (True, f"⚠️ Attenzione: rischiare il {risk_pct}% per trade è molto aggressivo. Confermi di volerlo impostare?")
+        return (True, ai_lang.warning_chat("warning_risk_aggressive", risk_pct=risk_pct))
     return (False, None)
 
 def _check_leverage_warning(leverage_int: int, symbol: str) -> tuple[bool, Optional[str]]:
@@ -2150,8 +2184,7 @@ def _check_leverage_warning(leverage_int: int, symbol: str) -> tuple[bool, Optio
     REGOLA BUG3: >=HIGH_LEVERAGE_WARNING_THRESHOLD → warning + conferma obbligatoria; <soglia → accettato normalmente
     """
     if leverage_int >= HIGH_LEVERAGE_WARNING_THRESHOLD:
-        sym = symbol or "questa coppia"
-        return (True, f"⚠️ Attenzione: una leva di {leverage_int}x aumenta molto il rischio. Confermi di volerla impostare?")
+        return (True, ai_lang.warning_chat("warning_leverage_confirm", leverage_int=leverage_int))
     return (False, None)
 
 def _check_sl_warning(sl_pct: float) -> tuple[bool, Optional[str], Optional[float]]:
@@ -2166,10 +2199,14 @@ def _check_sl_warning(sl_pct: float) -> tuple[bool, Optional[str], Optional[floa
     if sl_pct > 10:
         # Stop loss molto alto (>10%): richiede conferma + proposta alternativa
         suggested_sl = 2.0
-        return (True, f"⚠️ Attenzione: stai impostando uno stop loss del {sl_pct}%, che è molto alto e rischioso. Ti suggerisco un valore più prudente del {suggested_sl}%. Vuoi usare {suggested_sl}% o preferisci confermare {sl_pct}%?", suggested_sl)
+        return (
+            True,
+            ai_lang.warning_chat("warning_sl_very_high", sl_pct=sl_pct, suggested_sl=suggested_sl),
+            suggested_sl,
+        )
     elif sl_pct > 5:
         # Stop loss alto ma tecnicamente accettabile (5-10%): avviso + conferma
-        return (True, f"⚠️ Attenzione: stai impostando uno stop loss del {sl_pct}%, che è alto. Assicurati di comprendere i rischi. Vuoi confermare {sl_pct}% o preferisci un valore più prudente?", None)
+        return (True, ai_lang.warning_chat("warning_sl_high", sl_pct=sl_pct), None)
     return (False, None, None)
 
 def _extract_confirmation(user_text: str) -> Optional[bool]:
@@ -2709,6 +2746,27 @@ def _handle_pending_sl_user_reply(
                 user_text=user_text,
             )
 
+    if (
+        contextual_sl is None
+        and not contextual_risk
+        and _extract_confirmation(user_text) is True
+    ):
+        try:
+            sl_confirm = float(str(pending_sl).replace("%", "").replace(",", "."))
+        except (TypeError, ValueError):
+            sl_confirm = None
+        if sl_confirm is not None:
+            logger.info("[PENDING_SL_CONFIRM_APPLY] value=%s generic_confirm=yes", sl_confirm)
+            return _commit_sl_value_wizard_reply(
+                sl_confirm,
+                state,
+                cs,
+                params,
+                current_step,
+                skip_high_risk_confirm=True,
+                user_text=user_text,
+            )
+
     lt = user_text.strip().lower()
     if is_rejection(user_text) and not re.search(r"\d", lt):
         state, cs, params, _complete_ok = _cancel_pending_confirmations_recompute_state(
@@ -2963,6 +3021,58 @@ def resolve_input(
     return merged_params, merged_pending
 
 
+def _pin_wizard_step_for_high_risk_pending(cs: Dict[str, Any]) -> Optional[str]:
+    """Step wizard ancorato al pending sl/risk/leva attivo (ordine batch)."""
+    for step in ("leverage", "sl", "risk_pct"):
+        key = _STEP_PENDING_CONFIRMATION_KEYS.get(step)
+        if key and cs.get(key) is not None:
+            return step
+    return None
+
+
+def _origin_step_for_pending_batch(
+    pending_before: Dict[str, Any],
+    cs: Dict[str, Any],
+) -> str:
+    """Step di origine per l'avanzamento wizard dopo conferma pending."""
+    pinned = _pin_wizard_step_for_high_risk_pending(cs)
+    if pinned:
+        return pinned
+    for step in ("leverage", "sl", "risk_pct"):
+        if step in pending_before:
+            return step
+    return cs.get("step") or "sl"
+
+
+def _apply_pending_high_risk_confirm_and_advance(
+    state: Dict[str, Any],
+    cs: Dict[str, Any],
+    params: Dict[str, Any],
+    pending_before: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Conferma pending sl/risk/leva: scrive in params, conserva config_state, avanza wizard.
+    """
+    origin_step = _origin_step_for_pending_batch(pending_before, cs)
+    confirmed = _flush_all_high_risk_pending_to_params(cs, params)
+    params = _sync_strategy_from_periods(params)
+    state["config_status"] = "in_progress"
+    state, cs, params = _sync_state(state, cs, params)
+    logger.info(
+        "[PENDING_CONFIRM_APPLIED] confirmed=%s origin_step=%s params_after=%s",
+        confirmed,
+        origin_step,
+        dict(params),
+    )
+    return _wizard_seq_tail_after_save(
+        state,
+        cs,
+        params,
+        origin_step,
+        summary_followup=_config_complete_followup(),
+    )
+
+
 def _flush_all_high_risk_pending_to_params(cs: Dict[str, Any], params: Dict[str, Any]) -> List[str]:
     """
     Scrive in params tutti i valori ancora in pending (ordine: leva, sl, rischio) e azzera i pending.
@@ -3006,8 +3116,21 @@ def _flush_all_high_risk_pending_to_params(cs: Dict[str, Any], params: Dict[str,
 
 
 def _is_pending_numeric_positive_confirmation_text(user_text: str) -> bool:
-    """Messaggio ridotto a conferma positiva per pending sl/risk/leverage (prima di extract/wizard)."""
-    return is_confirmation(user_text)
+    """Messaggio ridotto a conferma positiva generica per pending sl/risk/leverage (prima di extract/wizard)."""
+    if not is_confirmation(user_text):
+        return False
+    lt = (user_text or "").strip().lower()
+    if re.search(r"\d", lt):
+        return False
+    if _extract_modification_requests(user_text, {}):
+        return False
+    if _user_confirms_sl_in_message(user_text):
+        return False
+    if _user_confirms_pending_risk_in_message(user_text):
+        return False
+    if _user_confirms_pending_leverage_in_message(user_text):
+        return False
+    return True
 
 
 def _is_pending_numeric_negative_confirmation_text(user_text: str) -> bool:
@@ -3364,35 +3487,9 @@ def _try_wizard_pending_batch_resolve(
                 "reply": _build_pending_batch_confirmation_prompt(cs),
                 "state": state,
             }
-        complete_ok = is_config_complete(params)
-        logger.info(
-            "[POST_CONFIRM_CHECK] params=%s complete=%s step=%s",
-            dict(params),
-            complete_ok,
-            cs.get("step"),
+        return _apply_pending_high_risk_confirm_and_advance(
+            state, cs, params, pending_batch
         )
-        if complete_ok:
-            state["config_status"] = "complete"
-            _cleanup_config_state_when_complete(cs)
-            cs["step"] = None
-            state["step"] = None
-            state, cs, params = _sync_state(state, cs, params)
-            return {
-                "reply": _reply_config_complete(params),
-                "state": state,
-                "skip_llm": True,
-            }
-        state["config_status"] = "in_progress"
-        _recompute_step(cs)
-        state, cs, params = _sync_state(state, cs, params)
-        next_ask = (
-            cs.get("step")
-            or free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
-            or "market_type"
-        )
-        cs["step"] = next_ask
-        state, cs, params = _sync_state(state, cs, params)
-        return {"reply": _step_question(next_ask, params), "state": state}
 
     if re.search(r"\bconferm\w*\b", user_text.strip().lower(), re.I):
         state, cs, params = _sync_state(state, cs, params)
@@ -3655,13 +3752,13 @@ def _validate_step_value(step: str, value: Any, params: Dict[str, Any]) -> Tuple
         if not is_valid:
             return (False, error_msg or "Valore di leva non valido.", None)
         
-        sym_display = symbol or "questa coppia"
+        sym_display = symbol or ai_lang.chat("this_pair")
         warning_msg = None
         if leverage_int >= 51:
-            warning_msg = (
-                f"⚠️ Attenzione: stai usando una leva alta ({leverage_int}x) per {sym_display}. "
-                "Le leve elevate aumentano significativamente il rischio. "
-                "Assicurati di comprendere i rischi prima di procedere."
+            warning_msg = ai_lang.warning_chat(
+                "warning_leverage_high_soft",
+                leverage_int=leverage_int,
+                symbol=sym_display,
             )
         
         return (True, None, warning_msg)
@@ -4484,10 +4581,16 @@ def _clear_stale_wizard_pendings(
     current_step: str,
 ) -> None:
     """Cancella pending di step diversi dal corrente; evita che 'ok' confermi valori obsoleti."""
-    active_key = _STEP_PENDING_CONFIRMATION_KEYS.get(current_step)
-    for key in _STEP_PENDING_CONFIRMATION_KEYS.values():
-        if key != active_key and cs.get(key) is not None:
-            cs[key] = None
+    pinned = _pin_wizard_step_for_high_risk_pending(cs)
+    if pinned is not None:
+        cs["step"] = pinned
+        current_step = pinned
+    high_risk_batch = _pending_batch_snapshot(cs)
+    if len(high_risk_batch) <= 1:
+        active_key = _STEP_PENDING_CONFIRMATION_KEYS.get(current_step)
+        for key in _STEP_PENDING_CONFIRMATION_KEYS.values():
+            if key != active_key and cs.get(key) is not None:
+                cs[key] = None
     if params.get("symbol") and current_step != "symbol":
         cs["pending_symbol_confirmation"] = None
         cs.pop("suggested_symbol", None)
@@ -5590,36 +5693,9 @@ def _wizard_seq_handle_message(
     if _is_pending_numeric_positive_confirmation_text(user_text) and pending_before_early:
         pending_before = pending_before_early
         logger.info("[PENDING_CONFIRM_EARLY] pending_before=%s", pending_before)
-        _flush_all_high_risk_pending_to_params(cs, params)
-        params = _sync_strategy_from_periods(params)
-        cs["params"] = params
-        logger.info("[PENDING_CONFIRM_EARLY] params_after=%s", dict(params))
-        pending_after_snap = _pending_batch_snapshot(cs)
-        logger.info("[PENDING_CONFIRM_EARLY] pending_after=%s", pending_after_snap)
-        state, cs, params = _sync_state(state, cs, params)
-        complete_ok = is_config_complete(params)
-        if complete_ok:
-            state["config_status"] = "complete"
-            _cleanup_config_state_when_complete(cs)
-            cs["step"] = None
-            state["step"] = None
-            state, cs, params = _sync_state(state, cs, params)
-            return {
-                "reply": _reply_config_complete(params),
-                "state": state,
-                "skip_llm": True,
-            }
-        state["config_status"] = "in_progress"
-        _recompute_step(cs)
-        state, cs, params = _sync_state(state, cs, params)
-        next_ask = (
-            cs.get("step")
-            or free_plan.first_missing_free_wizard_field(params, _is_step_filled, cs)
-            or "market_type"
+        return _apply_pending_high_risk_confirm_and_advance(
+            state, cs, params, pending_before
         )
-        cs["step"] = next_ask
-        state, cs, params = _sync_state(state, cs, params)
-        return {"reply": _step_question(next_ask, params), "state": state}
 
     pending_batch_out = _try_wizard_pending_batch_resolve(user_text, state, cs, params)
     if pending_batch_out is not None:
