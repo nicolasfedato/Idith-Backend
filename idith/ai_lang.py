@@ -240,6 +240,18 @@ _CHAT: Dict[str, Dict[str, str]] = {
         "it": "Ok, aggiorno",
         "en": "OK, updating",
     },
+    "timeframe_invalid_format": {
+        "it": "Il timeframe '{tf}' non è nel formato corretto. Valori supportati: {examples}. Inserisci uno di questi valori.",
+        "en": "The timeframe '{tf}' is not in the correct format. Supported values: {examples}. Enter one of these values.",
+    },
+    "pair_recommend_volatile": {
+        "it": "Posso impostare {symbol}: è una coppia più volatile rispetto a BTC/ETH. Vuoi usare {symbol}?",
+        "en": "I can set {symbol}: it's a more volatile pair than BTC/ETH. Do you want to use {symbol}?",
+    },
+    "pair_recommend_simple": {
+        "it": "Posso impostare {symbol}. Vuoi usare {symbol}?",
+        "en": "I can set {symbol}. Do you want to use {symbol}?",
+    },
 }
 
 _SUMMARY_LABELS: Dict[str, Dict[str, str]] = {
@@ -501,6 +513,14 @@ def wizard_question_markers(lang: Optional[str] = None) -> tuple[str, ...]:
 
 def summary_first_line_prefix(lang: Optional[str] = None) -> str:
     return summary_label("pair", lang) + ":"
+
+
+def invalid_timeframe_message(tf: str, valid_tfs: Any, lang: Optional[str] = None) -> str:
+    """Localized timeframe format error (matches validators.validate_timeframe copy)."""
+    examples = ", ".join(
+        sorted(valid_tfs, key=lambda x: (int(x[:-1]) if x[:-1].isdigit() else 999, x[-1]))
+    )
+    return chat("timeframe_invalid_format", lang, tf=tf, examples=examples)
 
 
 def _fmt_pending_percent(value: Any) -> str:

@@ -222,9 +222,11 @@ _NON_LEVERAGE_NUMERIC_CONTEXT_RE = re.compile(
 )
 
 _LEV_DIRECT_VALUE_PATTERNS: Tuple[str, ...] = (
-    r"\b(?:leva|leverage|lev)\s*[:=]?\s*(?:x\s*)?(\d+(?:\.\d+)?)\s*x?\b",
-    r"\b(?:metti|inserisci|aggiungi|imposta|usa|voglio|vorrei)\s+(?:la\s+)?(?:leva|leverage|lev)\s+(\d+(?:\.\d+)?)\s*x?\b",
-    r"\b(\d+(?:\.\d+)?)\s*x\b",
+    r"\b(?:leva|leverage|lev)\s*[:=]?\s*(?:x\s*)?(\d+(?:[.,]\d+)?)\s*x?\b",
+    r"\b(?:metti|inserisci|insert|aggiungi|imposta|set|usa|use|voglio|vorrei)\s+(?:la\s+)?(?:leva|leverage|lev)\s+(\d+(?:[.,]\d+)?)\s*x?\b",
+    r"\b(?:metti|inserisci|insert|aggiungi|imposta|set|usa|use|voglio|vorrei)\s+(?:a\s+)?(\d+(?:[.,]\d+)?)\s*x?\b",
+    r"\b(\d+(?:[.,]\d+)?)\s*x?\s+(?:leva|leverage|lev)\b",
+    r"\b(\d+(?:[.,]\d+)?)\s*x\b",
 )
 
 
@@ -4453,12 +4455,8 @@ def _pick_recommended_symbol(market_type: str, high_volatility: bool) -> str:
 
 
 def _pair_recommendation_reply(symbol: str, high_volatility: bool) -> str:
-    if high_volatility:
-        return (
-            f"Posso impostare {symbol}: è una coppia più volatile rispetto a BTC/ETH. "
-            f"Vuoi usare {symbol}?"
-        )
-    return f"Posso impostare {symbol}. Vuoi usare {symbol}?"
+    key = "pair_recommend_volatile" if high_volatility else "pair_recommend_simple"
+    return ai_lang.chat(key, symbol=symbol)
 
 
 _STEP_PENDING_CONFIRMATION_KEYS: Dict[str, str] = {
@@ -5915,6 +5913,10 @@ def _wizard_seq_handle_message(
             if lit is not None and _wizard_hard_limit_error_message("leverage", float(lit)):
                 _log_wizard_numeric_hard_reject_return("leverage")
         state, cs, params = _sync_state(state, cs, params)
+        if current_step == "timeframe":
+            market_type = params.get("market_type", "futures")
+            valid_tfs = validators.get_valid_timeframes(None, market_type)
+            error_msg = ai_lang.invalid_timeframe_message(str(extracted_value), valid_tfs)
         return {"reply": (error_msg or _step_question(current_step, params)), "state": state}
 
     if current_step == "risk_pct":
@@ -5963,7 +5965,12 @@ def _wizard_seq_handle_message(
         if not patch_result.get("ok", True):
             logger.info("[WIZARD_SEQ_INVALID] step=%s repeat", current_step)
             state, cs, params = _sync_state(state, cs, params)
-            return {"reply": patch_result.get("message", _step_question(current_step, params)), "state": state}
+            fail_msg = patch_result.get("message")
+            if fail_msg:
+                market_type = params.get("market_type", "futures")
+                valid_tfs = validators.get_valid_timeframes(None, market_type)
+                fail_msg = ai_lang.invalid_timeframe_message(str(extracted_value), valid_tfs)
+            return {"reply": fail_msg or _step_question(current_step, params), "state": state}
         params = cs["params"].copy()
     elif current_step == "operating_mode":
         params = _apply_operating_mode_preset(params, str(extracted_value))
@@ -8172,6 +8179,8 @@ def run(payload, state=None, history=None, system_prompt: str = ""):
         except ImportError:
             import ai_lang  # type: ignore
         chat_lang = ai_lang.normalize_lang(payload.get("lang"))
+
+    ai_lang.set_request_lang(chat_lang)
 
     if _detect_english_config_reset_intent(user_text):
         logger.info("[RESET_INTENT] detected=True source=english")
