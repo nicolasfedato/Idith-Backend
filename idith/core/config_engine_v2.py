@@ -8,6 +8,15 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from idith.text_normalize_config_values import (
+    extract_market_type_from_text,
+    extract_operating_mode_from_text,
+)
+from idith.text_normalize_user_numbers import (
+    normalize_user_numeric_input,
+    parse_config_float,
+)
+
 # Chiavi gestite dal motore (ordine per compute_next_missing)
 _FIELD_ORDER = (
     "market_type",
@@ -32,21 +41,18 @@ def extract_all_fields(user_text: str) -> dict[str, Any]:
     if not user_text:
         return {}
 
-    raw = user_text.strip()
+    raw = normalize_user_numeric_input(user_text.strip())
     lower = raw.lower()
     out: dict[str, Any] = {}
 
-    # market_type
-    if re.search(r"\bfutures\b|passa\s+a\s+futures", lower):
-        out["market_type"] = "futures"
-    elif re.search(r"\bspot\b", lower):
-        out["market_type"] = "spot"
+    # market_type / operating_mode (normalizzazione centralizzata, typo sport/agressiva ecc.)
+    parsed_market_type = extract_market_type_from_text(raw)
+    if parsed_market_type is not None:
+        out["market_type"] = parsed_market_type
 
-    # operating_mode (italiano)
-    for mode in ("aggressiva", "equilibrata", "selettiva"):
-        if re.search(rf"\b{re.escape(mode)}\b", lower):
-            out["operating_mode"] = mode
-            break
+    parsed_operating_mode = extract_operating_mode_from_text(raw)
+    if parsed_operating_mode is not None:
+        out["operating_mode"] = parsed_operating_mode
 
     # symbol: btcusdt, eth-usdt, SOL / USDT
     sym = re.search(
