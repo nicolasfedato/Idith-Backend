@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 from contextvars import ContextVar
 from typing import Any, Callable, Dict, List, Optional
@@ -145,6 +146,47 @@ _CHAT: Dict[str, Dict[str, str]] = {
     "bot_started_summary": {
         "it": "Bot avviato con la seguente configurazione:",
         "en": "Bot started with the following configuration:",
+    },
+    "bot_cmd_start_reply": {
+        "it": "",
+        "en": (
+            "✅ The bot is now running.\n\n"
+            "You can follow the bot status in the table on the left.\n\n"
+            "To stop it at any time, write:\n"
+            "• stop bot\n"
+            "• block everything"
+        ),
+    },
+    "bot_cmd_stop_reply": {
+        "it": "",
+        "en": (
+            "✅ The bot is now inactive.\n\n"
+            "Do you want to change any parameters or restart the bot?\n\n"
+            "You can:\n"
+            "• modify the configuration\n"
+            "• start the bot again"
+        ),
+    },
+    "bot_cmd_start_footer": {
+        "it": (
+            "\n\n"
+            "Puoi seguire lo stato del bot nella tabella a sinistra.\n\n"
+            "Per interromperlo in qualsiasi momento scrivi in chat:\n"
+            "• ferma bot\n"
+            "• stop bot\n"
+            "• blocca tutto"
+        ),
+        "en": "",
+    },
+    "bot_cmd_stop_footer": {
+        "it": (
+            "\n\n"
+            "Vuoi modificare qualche parametro o riavviare il bot?\n\n"
+            "Puoi:\n"
+            "• modificare la configurazione\n"
+            "• avviare nuovamente il bot"
+        ),
+        "en": "",
     },
     "config_already_ready": {
         "it": "Ciao! La configurazione è già pronta. Vuoi modificare qualcosa o avviare il bot?",
@@ -458,6 +500,34 @@ _PHRASE_VARIANTS: Dict[str, Dict[str, List[str]]] = {
             "OK, let's try again: which leverage?",
         ],
     },
+    "bot_cmd_start_header": {
+        "it": [
+            "✅ Bot avviato.",
+            "✅ Bot attivo.",
+            "✅ Il bot è partito.",
+            "✅ Bot in esecuzione.",
+            "✅ Il bot è stato avviato.",
+            "✅ Avvio completato.",
+            "✅ Il bot è ora operativo.",
+            "✅ Bot online.",
+            "✅ Sistema avviato.",
+            "✅ Tutto pronto, bot avviato.",
+        ],
+    },
+    "bot_cmd_stop_header": {
+        "it": [
+            "✅ Bot fermato.",
+            "✅ Bot arrestato.",
+            "✅ Il bot è stato fermato.",
+            "✅ Stop completato.",
+            "✅ Il bot è ora inattivo.",
+            "✅ Bot disattivato.",
+            "✅ Esecuzione fermata.",
+            "✅ Il bot si è fermato.",
+            "✅ Bot offline.",
+            "✅ Sistema fermato.",
+        ],
+    },
 }
 
 _GUARDRAIL_MARKERS_IT = (
@@ -538,6 +608,26 @@ def phrase_variant(key: str, attempt: int = 0, lang: Optional[str] = None, **kwa
         except KeyError:
             return template
     return template
+
+
+def build_bot_start_reply(lang: Optional[str] = None) -> str:
+    """Localized reply after /bot start (runner command)."""
+    code = normalize_lang(lang or get_request_lang())
+    logger.info("[BOT_CMD_LANG] command=start lang=%s", code)
+    if code == "en":
+        return chat("bot_cmd_start_reply", code)
+    header = random.choice(_PHRASE_VARIANTS["bot_cmd_start_header"]["it"])
+    return header + chat("bot_cmd_start_footer", code)
+
+
+def build_bot_stop_reply(lang: Optional[str] = None) -> str:
+    """Localized reply after /bot stop (runner command)."""
+    code = normalize_lang(lang or get_request_lang())
+    logger.info("[BOT_CMD_LANG] command=stop lang=%s", code)
+    if code == "en":
+        return chat("bot_cmd_stop_reply", code)
+    header = random.choice(_PHRASE_VARIANTS["bot_cmd_stop_header"]["it"])
+    return header + chat("bot_cmd_stop_footer", code)
 
 
 def summary_label(field: str, lang: Optional[str] = None) -> str:

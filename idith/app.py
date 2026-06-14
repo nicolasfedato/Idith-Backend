@@ -3499,33 +3499,7 @@ def _is_runner_status_question(text: str) -> bool:
     return False
 
 
-# Messaggi randomizzati per start/stop bot e stato runner
-START_BOT_MESSAGES = [
-    "✅ Bot avviato.",
-    "✅ Bot attivo.",
-    "✅ Il bot è partito.",
-    "✅ Bot in esecuzione.",
-    "✅ Il bot è stato avviato.",
-    "✅ Avvio completato.",
-    "✅ Il bot è ora operativo.",
-    "✅ Bot online.",
-    "✅ Sistema avviato.",
-    "✅ Tutto pronto, bot avviato."
-]
-
-STOP_BOT_MESSAGES = [
-    "✅ Bot fermato.",
-    "✅ Bot arrestato.",
-    "✅ Il bot è stato fermato.",
-    "✅ Stop completato.",
-    "✅ Il bot è ora inattivo.",
-    "✅ Bot disattivato.",
-    "✅ Esecuzione fermata.",
-    "✅ Il bot si è fermato.",
-    "✅ Bot offline.",
-    "✅ Sistema fermato."
-]
-
+# Messaggi randomizzati per stato runner
 RUNNER_ONLINE_MESSAGES = [
     "✅ Il runner è collegato.",
     "✅ Runner collegato.",
@@ -5936,22 +5910,9 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                 cmd_sub = parts_cmd[1].lower() if len(parts_cmd) >= 2 else ""
                 
                 if cmd_base == "/bot" and cmd_sub == "start":
-                    assistant_reply = random.choice(START_BOT_MESSAGES) + (
-                        "\n\n"
-                        "Puoi seguire lo stato del bot nella tabella a sinistra.\n\n"
-                        "Per interromperlo in qualsiasi momento scrivi in chat:\n"
-                        "• ferma bot\n"
-                        "• stop bot\n"
-                        "• blocca tutto"
-                    )
+                    assistant_reply = ai_lang.build_bot_start_reply(lang)
                 elif cmd_base == "/bot" and cmd_sub == "stop":
-                    assistant_reply = random.choice(STOP_BOT_MESSAGES) + (
-                        "\n\n"
-                        "Vuoi modificare qualche parametro o riavviare il bot?\n\n"
-                        "Puoi:\n"
-                        "• modificare la configurazione\n"
-                        "• avviare nuovamente il bot"
-                    )
+                    assistant_reply = ai_lang.build_bot_stop_reply(lang)
                 else:
                     # Messaggio più chiaro: mostra il testo originale se diverso dal normalizzato
                     if user_message_content != normalized_command:
