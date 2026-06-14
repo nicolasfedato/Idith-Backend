@@ -224,7 +224,7 @@ _NON_LEVERAGE_NUMERIC_CONTEXT_RE = re.compile(
 _LEV_DIRECT_VALUE_PATTERNS: Tuple[str, ...] = (
     r"\b(?:leva|leverage|lev)\s*[:=]?\s*(?:x\s*)?(\d+(?:[.,]\d+)?)\s*x?\b",
     r"\b(?:metti|inserisci|insert|aggiungi|imposta|set|usa|use|voglio|vorrei)\s+(?:la\s+)?(?:leva|leverage|lev)\s+(\d+(?:[.,]\d+)?)\s*x?\b",
-    r"\b(?:metti|inserisci|insert|aggiungi|imposta|set|usa|use|voglio|vorrei)\s+(?:a\s+)?(\d+(?:[.,]\d+)?)\s*x?\b",
+    r"\b(?:metti|inserisci|insert|aggiungi|imposta|set|usa|use|voglio|vorrei)\s+(?:a\s+)?(\d+(?:[.,]\d+)?)\s*x\b",
     r"\b(\d+(?:[.,]\d+)?)\s*x?\s+(?:leva|leverage|lev)\b",
     r"\b(\d+(?:[.,]\d+)?)\s*x\b",
 )
@@ -1866,7 +1866,7 @@ def _wizard_normalize_amp_suffix_as_percent(text: str) -> str:
 
 
 _PERCENT_INPUT_FILLERS = re.compile(
-    r"\b(?:metti|imposta|voglio|scelgo|usa|vorrei|preferisco|a|da|su|il|lo|la|per|con)\b",
+    r"\b(?:metti|imposta|voglio|scelgo|usa|vorrei|preferisco|insert|set|use|inserisci|aggiungi|a|da|su|il|lo|la|per|con)\b",
     re.I,
 )
 
@@ -1944,7 +1944,7 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
     # ============================================================
     logger.info(f"[EXTRACT_IN] step={step} user_text={user_text!r}")
     
-    text = user_text.strip()
+    text = normalize_user_numeric_input(user_text.strip())
     lt = text.lower()
     
     # PROTEZIONE: Se strategy è già filled e NON siamo sullo step strategy, NON estrarre strategy
@@ -2062,6 +2062,13 @@ def _extract_step_value(user_text: str, step: str, params: Dict[str, Any]) -> Op
                 f"[EXTRACT_OUT] step={step} extracted_type=int extracted_value={lev_val_int!r}"
             )
             return lev_val_int
+        pct_raw = extract_percentage_value(text)
+        if pct_raw is not None:
+            lev_val = float(pct_raw)
+            logger.info(
+                f"[EXTRACT_OUT] step={step} extracted_type=float extracted_value={lev_val!r}"
+            )
+            return lev_val
         extracted_value = None
         logger.info(f"[EXTRACT_OUT] step={step} extracted_type={type(extracted_value).__name__ if extracted_value is not None else None} extracted_value={extracted_value!r}")
         return None
@@ -3257,7 +3264,7 @@ def _commit_classified_config_updates(
             if invalid_messages:
                 invalid_block = _invalid_not_applied_block(invalid_messages)
                 reply = f"{reply}\n\n{invalid_block}"
-            return {"reply": reply, "state": state}
+            return {"reply": reply, "state": state, "skip_llm": True}
         state["config_status"] = "in_progress"
         _recompute_step(cs)
         state, cs, params = _sync_state(state, cs, params)
@@ -3373,6 +3380,7 @@ def _try_wizard_pending_batch_resolve(
             return {
                 "reply": _reply_config_complete(params),
                 "state": state,
+                "skip_llm": True,
             }
         state["config_status"] = "in_progress"
         _recompute_step(cs)
@@ -5493,6 +5501,7 @@ def _wizard_seq_tail_after_save(
     return {
         "reply": _reply_config_complete(params, followup=summary_followup),
         "state": state,
+        "skip_llm": True,
     }
 
 
@@ -5598,6 +5607,7 @@ def _wizard_seq_handle_message(
             return {
                 "reply": _reply_config_complete(params),
                 "state": state,
+                "skip_llm": True,
             }
         state["config_status"] = "in_progress"
         _recompute_step(cs)
@@ -5648,9 +5658,9 @@ def _wizard_seq_handle_message(
             if lev_removed_inline:
                 if not isinstance(out_cs, dict):
                     out_cs = cs
-                updates_out["reply"] = _lev_remove_reply_with_summary(
+                updates_out["reply"] = _reply_config_complete(
                     _params_for_summary(out_cs, params)
-                ) + _config_complete_followup()
+                )
                 updates_out["skip_llm"] = True
             return updates_out
 

@@ -2645,6 +2645,71 @@ def _sync_assistant_reply_from_config_params(
     return assistant_reply
 
 
+def _orch_reply_skip_openai_wrap(
+    reply: str,
+    orch_state: Optional[dict],
+    orch_res: Optional[dict],
+) -> bool:
+    """Config/wizard replies must never pass through OpenAI wrap or localization."""
+    if orch_res and isinstance(orch_res, dict) and orch_res.get("skip_llm"):
+        return True
+    text = (reply or "").strip()
+    if not text:
+        return False
+    if ai_lang.chat("config_complete_header", "it") in text or ai_lang.chat("config_complete_header", "en") in text:
+        return True
+    if ai_lang.chat("invalid_not_applied_prefix", "it") in text or ai_lang.chat("invalid_not_applied_prefix", "en") in text:
+        return True
+    if orchestrator_mod is not None and hasattr(orchestrator_mod, "_reply_is_config_summary_guardrail_context"):
+        if orchestrator_mod._reply_is_config_summary_guardrail_context(text):
+            return True
+    if isinstance(orch_state, dict):
+        cs = orch_state.get("config_state")
+        if isinstance(cs, dict):
+            step = cs.get("step")
+            if step is not None and str(step).strip():
+                return True
+            if orch_state.get("config_status") == "complete":
+                params = cs.get("params")
+                if isinstance(params, dict) and ai_lang.summary_line_regex().search(text):
+                    return True
+    return False
+
+
+def _enforce_deterministic_config_complete_reply(
+    reply: str,
+    orch_state: Optional[dict],
+) -> str:
+    """Rebuild config-complete replies from saved params (no OpenAI, no conversational prefix)."""
+    if orchestrator_mod is None or not isinstance(orch_state, dict):
+        return reply or ""
+    if orch_state.get("config_status") != "complete":
+        return reply or ""
+    cs = orch_state.get("config_state")
+    if not isinstance(cs, dict):
+        return reply or ""
+    params = cs.get("params")
+    if not isinstance(params, dict):
+        return reply or ""
+    text = reply or ""
+    is_summary_reply = False
+    if hasattr(orchestrator_mod, "_reply_is_config_summary_guardrail_context"):
+        is_summary_reply = orchestrator_mod._reply_is_config_summary_guardrail_context(text)
+    if not is_summary_reply and ai_lang.summary_line_regex().search(text):
+        is_summary_reply = True
+    if not is_summary_reply:
+        return text
+    summary_params = params
+    if hasattr(orchestrator_mod, "_params_for_guardrail_summary"):
+        summary_params = orchestrator_mod._params_for_guardrail_summary(params)
+    if hasattr(orchestrator_mod, "_params_for_summary"):
+        summary_params = orchestrator_mod._params_for_summary(cs, summary_params)
+    canonical = orchestrator_mod._reply_config_complete(summary_params)
+    if hasattr(orchestrator_mod, "_apply_config_summary_guardrail"):
+        canonical = orchestrator_mod._apply_config_summary_guardrail(canonical, params)
+    return canonical
+
+
 def _sync_config_state_operating_mode_from_reply(
     config_state_to_save: Optional[dict],
     assistant_reply: Optional[str],
@@ -5697,6 +5762,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
     model_used = None
     orch_error_code = None  # es. "invalid_leverage" quando la leva è fuori range
     orch_state = None
+    orch_skip_openai_wrap = False
 
     try:
         # Gestione comandi speciali Supabase (prima della logica runner normale)
@@ -6052,33 +6118,25 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             )
                             state_for_model = orch_state
 
-                        # Bypass wrap LLM: reply orchestrator verbatim (wizard attivo o skip_llm)
+                        assistant_reply_raw = _enforce_deterministic_config_complete_reply(
+                            assistant_reply_raw,
+                            orch_state,
+                        )
+                        orch_skip_openai_wrap = _orch_reply_skip_openai_wrap(
+                            assistant_reply_raw,
+                            orch_state,
+                            orch_res,
+                        )
                         _wrap_cfg_step = None
                         if orch_state is not None and isinstance(orch_state, dict):
                             _wrap_cs = orch_state.get("config_state")
                             if isinstance(_wrap_cs, dict):
                                 _wrap_cfg_step = _wrap_cs.get("step")
-                        _orch_summary_or_invalids = (
-                            "Configurazione completata ✅" in assistant_reply_raw
-                            or "Non ho applicato questi valori" in assistant_reply_raw
-                        )
-                        _wrap_bypass = bool(orch_res.get("skip_llm")) or bool(
-                            _wrap_cfg_step is not None and str(_wrap_cfg_step).strip() != ""
-                        ) or _orch_summary_or_invalids
-                        if _orch_summary_or_invalids:
-                            logger.info("[WRAP_BYPASS] reason=config_summary_or_invalids")
-                        if _wrap_bypass:
-                            _wrap_reason = (
-                                "skip_llm"
-                                if orch_res.get("skip_llm")
-                                else "config_summary_or_invalids"
-                                if _orch_summary_or_invalids
-                                else "wizard_step_repeat"
-                            )
+                        if orch_skip_openai_wrap:
                             logger.info(
-                                "[CHAT_WRAP_BYPASS] reason=%s step=%s",
-                                _wrap_reason,
+                                "[CHAT_WRAP_BYPASS] reason=config_or_wizard step=%s skip_llm=%s",
                                 _wrap_cfg_step if _wrap_cfg_step is not None else "",
+                                bool(orch_res.get("skip_llm")) if isinstance(orch_res, dict) else False,
                             )
 
                         # Se manca OPENAI_API_KEY, ritorna solo la domanda (fallback)
@@ -6087,7 +6145,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             source = "orchestrator"
                             mode = "orchestrator_only"
                             model_used = "orchestrator"
-                        elif _wrap_bypass:
+                        elif orch_skip_openai_wrap:
                             assistant_reply = assistant_reply_raw
                             source = "orchestrator"
                             mode = "orchestrator_only"
@@ -6248,6 +6306,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
         content=assistant_reply,
         lang=lang,
         mode=mode,
+        localize=not orch_skip_openai_wrap,
     )
     
     if not insert_assistant_ok:
