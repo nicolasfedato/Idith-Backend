@@ -7,6 +7,7 @@
 # - mai chiedere API key, mai salvarle
 # -------------------------------------------------
 
+import json
 import os
 import re
 from typing import Any, Dict
@@ -126,7 +127,7 @@ def chat_completion(user_text: str, history=None) -> str:
 WIZARD_QA_SYSTEM = (
     "Sei Idith. L'utente sta completando la configurazione guidata di un bot di trading "
     "(piano Free, integrazione tipo Bybit). "
-    "Rispondi in italiano in modo chiaro e concreto. "
+    "Rispondi in modo chiaro e concreto. "
     "Se confronti più opzioni (es. tre modalità operative Aggressiva / Equilibrata / Selettiva), "
     "usa 2–4 righe bullet brevi con trattino (-) e una riga «In pratica:» se aiuta. "
     "Collega la spiegazione allo step indicato nel contesto quando è pertinente. "
@@ -176,12 +177,17 @@ _STEP_LABEL_IT = {
 
 
 def wizard_config_question_answer(
-    user_question: str, wizard_step: str, params: Dict[str, Any]
+    user_question: str, wizard_step: str, params: Dict[str, Any], lang: str = "it"
 ) -> str:
     """
     Risposta LLM per una domanda dell'utente durante il wizard.
     Non modifica stato; il chiamante concatena la domanda dello step corrente.
     """
+    try:
+        from . import ai_lang
+    except ImportError:
+        import ai_lang  # type: ignore
+
     step_key = wizard_step or "market_type"
     step_human = _STEP_LABEL_IT.get(step_key, step_key)
     snapshot = _wizard_params_snapshot(params or {})
@@ -192,6 +198,7 @@ def wizard_config_question_answer(
     )
     messages = [
         {"role": "system", "content": WIZARD_QA_SYSTEM},
+        {"role": "system", "content": ai_lang.build_language_system_prompt(lang)},
         {"role": "user", "content": payload},
     ]
     print(f"[LLM] Wizard QA model: {MODEL_PRO}")
@@ -199,5 +206,50 @@ def wizard_config_question_answer(
         model=MODEL_PRO,
         input=messages,
         max_output_tokens=500,
+    )
+    return (res.output_text or "").strip()
+
+
+# -------------------------------------------------
+# Preview advice: spiegazione + suggerimenti parametri
+# -------------------------------------------------
+
+PREVIEW_ADVICE_SYSTEM = (
+    "Sei Idith. L'utente chiede spiegazione e suggerimenti sulla sua ultima preview backtest salvata.\n\n"
+    "Rispondi SEMPRE in italiano con ESATTAMENTE questa struttura (tre sezioni, titoli come scritti sotto):\n\n"
+    "Perché la preview è andata così\n"
+    "[2-4 frasi che spiegano il motivo principale del risultato. DEVI citare esplicitamente: "
+    "pnl_pct, win rate, numero operazioni, drawdown, timeframe. "
+    "Cita SL/TP se rilevanti per spiegare stop frequenti o risk/reward.]\n\n"
+    "Cosa proverei a cambiare\n"
+    "[elenco numerato 1-4 con modifiche concrete: timeframe, SL, TP, modalità operativa, rischio, leva]\n\n"
+    "Vuoi che aggiorni la configurazione con questi parametri?\n\n"
+    "Regole:\n"
+    "- Usa SOLO i numeri presenti nel JSON della preview; non inventare metriche.\n"
+    "- Valori ammessi: timeframe 1m,3m,5m,15m,1h,4h,1d; modalità Aggressiva/Equilibrata/Selettiva.\n"
+    "- NON promettere guadagni. NON applicare modifiche: solo consiglio testuale.\n"
+    "- Non usare markdown o asterischi. Non chiedere API key."
+)
+
+
+def preview_advice_answer(user_message: str, snapshot: Dict[str, Any]) -> str:
+    """
+    Risposta LLM per spiegazione preview + suggerimenti parametri.
+    Non modifica stato né configurazione.
+    """
+    payload = (
+        f"Domanda dell'utente:\n{(user_message or '').strip()}\n\n"
+        f"Ultima preview salvata (dati reali, non inventare altri numeri):\n"
+        f"{json.dumps(snapshot, ensure_ascii=False, indent=2)}"
+    )
+    messages = [
+        {"role": "system", "content": PREVIEW_ADVICE_SYSTEM},
+        {"role": "user", "content": payload},
+    ]
+    print(f"[LLM] Preview advice model: {MODEL_PRO}")
+    res = client.responses.create(
+        model=MODEL_PRO,
+        input=messages,
+        max_output_tokens=450,
     )
     return (res.output_text or "").strip()

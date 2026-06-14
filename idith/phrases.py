@@ -6,6 +6,8 @@ Evita ripetizioni identiche nelle risposte di Idith.
 
 from typing import List, Optional
 
+from . import ai_lang
+
 
 # Varianti per domande EMA periodo
 ASK_EMA_PERIOD = [
@@ -132,7 +134,7 @@ def get_phrase(variants: List[str], attempt: int, **kwargs) -> str:
 
 def get_ask_ema_period(attempt: int = 0) -> str:
     """Restituisce una variante della domanda per EMA periodo."""
-    return get_phrase(ASK_EMA_PERIOD, attempt)
+    return ai_lang.phrase_variant("ask_ema_period", attempt)
 
 
 def get_invalid_ema_period(value: str, attempt: int = 0) -> str:
@@ -142,7 +144,7 @@ def get_invalid_ema_period(value: str, attempt: int = 0) -> str:
 
 def get_ask_rsi_period(attempt: int = 0) -> str:
     """Restituisce una variante della domanda per RSI periodo."""
-    return get_phrase(ASK_RSI_PERIOD, attempt)
+    return ai_lang.phrase_variant("ask_rsi_period", attempt)
 
 
 def get_invalid_rsi_period(value: str, attempt: int = 0) -> str:
@@ -152,7 +154,7 @@ def get_invalid_rsi_period(value: str, attempt: int = 0) -> str:
 
 def get_ask_atr_period(attempt: int = 0) -> str:
     """Restituisce una variante della domanda per ATR periodo."""
-    return get_phrase(ASK_ATR_PERIOD, attempt)
+    return ai_lang.phrase_variant("ask_atr_period", attempt)
 
 
 def get_invalid_atr_period(value: str, attempt: int = 0) -> str:
@@ -162,7 +164,7 @@ def get_invalid_atr_period(value: str, attempt: int = 0) -> str:
 
 def get_ask_timeframe(attempt: int = 0) -> str:
     """Restituisce una variante della domanda per timeframe."""
-    return get_phrase(ASK_TIMEFRAME, attempt)
+    return ai_lang.phrase_variant("ask_timeframe", attempt)
 
 
 def get_invalid_timeframe(input_value: str, allowlist: str, attempt: int = 0) -> str:
@@ -172,7 +174,7 @@ def get_invalid_timeframe(input_value: str, allowlist: str, attempt: int = 0) ->
 
 def get_ask_symbol(attempt: int = 0) -> str:
     """Restituisce una variante della domanda per coppia."""
-    return get_phrase(ASK_SYMBOL, attempt)
+    return ai_lang.phrase_variant("ask_symbol", attempt)
 
 
 def get_invalid_symbol(symbol: str, market_type: str, attempt: int = 0) -> str:
@@ -182,7 +184,7 @@ def get_invalid_symbol(symbol: str, market_type: str, attempt: int = 0) -> str:
 
 def get_ask_leverage(attempt: int = 0) -> str:
     """Restituisce una variante della domanda per leva."""
-    return get_phrase(ASK_LEVERAGE, attempt)
+    return ai_lang.phrase_variant("ask_leverage", attempt)
 
 
 def get_invalid_leverage(symbol: str, minLev: float, maxLev: float, attempt: int = 0) -> str:
@@ -192,5 +194,5 @@ def get_invalid_leverage(symbol: str, minLev: float, maxLev: float, attempt: int
 
 def get_positive_transition(attempt: int = 0) -> str:
     """Restituisce una variante per transizioni positive (invece di 'Perfetto')."""
-    return get_phrase(POSITIVE_TRANSITIONS, attempt)
+    return ai_lang.phrase_variant("positive_transition", attempt)
 

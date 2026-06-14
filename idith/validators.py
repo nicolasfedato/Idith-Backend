@@ -346,6 +346,7 @@ def _fetch_valid_symbols_internal(market_type: str) -> set:
     Recupera i simboli validi da Bybit per il market_type specificato.
     Usa cache per evitare troppe chiamate API.
     """
+    market_type = normalize_market_type_input(market_type) or market_type
     if market_type not in ["spot", "futures"]:
         return set()
     
@@ -608,18 +609,74 @@ TIMEFRAME_ALIASES = {
     "5 minuti": "5m",
     "15 minuti": "15m",
     "30 minuti": "30m",
+    "45 minuti": "45m",
+    "60 minuti": "1h",
+    "120 minuti": "2h",
+    "240 minuti": "4h",
     "1 ora": "1h",
     "2 ore": "2h",
+    "due ore": "2h",
     "4 ore": "4h",
+    "quattro ore": "4h",
     "6 ore": "6h",
     "12 ore": "12h",
     "1 giorno": "1d",
+    "un giorno": "1d",
 }
 
 _TF_INPUT_FILLERS = re.compile(
-    r"\b(?:metti|usa|imposta|setta|scegli|scelgo|voglio|vorrei|timeframe|tf|a|da|su)\b",
+    r"\b(?:metti|usa|imposta|setta|set|update|insert|scegli|scelgo|voglio|vorrei|timeframe|tf|to|a|da|su)\b",
     re.I,
 )
+
+_TF_NUMBER_WORDS = {
+    "uno": "1",
+    "una": "1",
+    "un": "1",
+    "due": "2",
+    "tre": "3",
+    "quattro": "4",
+    "cinque": "5",
+    "sei": "6",
+    "sette": "7",
+    "otto": "8",
+    "nove": "9",
+    "dieci": "10",
+    "undici": "11",
+    "dodici": "12",
+    "sessanta": "60",
+    "centoventi": "120",
+    "duecentoquaranta": "240",
+}
+
+_MINUTES_TO_TF = {
+    1: "1m",
+    3: "3m",
+    5: "5m",
+    15: "15m",
+    30: "30m",
+    45: "45m",
+    60: "1h",
+    120: "2h",
+    240: "4h",
+}
+
+
+def _replace_tf_number_words(text: str) -> str:
+    for word, digit in _TF_NUMBER_WORDS.items():
+        text = re.sub(rf"\b{re.escape(word)}\b", digit, text)
+    return text
+
+
+def _minutes_to_timeframe(n: int) -> str:
+    if n in _MINUTES_TO_TF:
+        return _MINUTES_TO_TF[n]
+    if n % 60 == 0:
+        hours = n // 60
+        candidate = f"{hours}h"
+        if candidate in VALID_TIMEFRAMES:
+            return candidate
+    return f"{n}m"
 
 
 def normalize_timeframe_input(text: str) -> Optional[str]:
@@ -645,13 +702,21 @@ def normalize_timeframe_input(text: str) -> Optional[str]:
         return "1h"
     if re.search(r"\b(?:60|sessanta)\s*second[oi]", s):
         return "1m"
+    s = _replace_tf_number_words(s)
+    if s in TIMEFRAME_ALIASES:
+        return TIMEFRAME_ALIASES[s]
     min_m = re.search(r"\b(\d+)\s*minut[oi]", s)
     if min_m:
-        n = int(min_m.group(1))
-        return "1h" if n == 60 else f"{n}m"
+        return _minutes_to_timeframe(int(min_m.group(1)))
+    min_en_m = re.search(r"\b(\d+)\s*minutes?\b", s)
+    if min_en_m:
+        return _minutes_to_timeframe(int(min_en_m.group(1)))
     hour_m = re.search(r"\b(\d+)\s*(?:ora|ore)\b", s)
     if hour_m:
         return f"{int(hour_m.group(1))}h"
+    hour_en_m = re.search(r"\b(\d+)\s*hours?\b", s)
+    if hour_en_m:
+        return f"{int(hour_en_m.group(1))}h"
     return None
 
 
@@ -724,7 +789,12 @@ def parse_positive_int(raw: str, field_name: str, min_v: int, max_v: int) -> int
     if not s:
         raise ValueError(f"{field_name} non può essere vuoto.")
     try:
-        value = int(float(s.replace(",", ".")))
+        from .text_normalize_user_numbers import parse_config_float
+
+        parsed = parse_config_float(s)
+        if parsed is None:
+            raise ValueError
+        value = int(parsed)
     except (ValueError, TypeError):
         raise ValueError(f"{field_name} deve essere un numero intero.")
     if value < min_v or value > max_v:
@@ -819,20 +889,9 @@ def validate_leverage(lev: float, minLev: float, maxLev: float) -> Tuple[bool, O
 
 def _parse_numeric_percentage(value: Any) -> Optional[float]:
     """Parsa valori come 2, 2%, 2,5% in float."""
-    if value is None:
-        return None
-    raw = str(value).strip().lower()
-    if not raw:
-        return None
-    raw = raw.replace("%", "").replace(",", ".").strip()
-    if not raw:
-        return None
-    if not re.fullmatch(r"[+-]?\d+(\.\d+)?", raw):
-        return None
-    try:
-        return float(raw)
-    except (ValueError, TypeError):
-        return None
+    from .text_normalize_user_numbers import parse_config_float
+
+    return parse_config_float(value)
 
 
 def validate_stop_loss(value: Any) -> Tuple[bool, Optional[float], Optional[str], bool]:
@@ -1165,3 +1224,16 @@ def validate_leverage_full(symbol: str, leverage: float, market_type: str) -> Tu
     except (ValueError, TypeError):
         return (True, None, None)
 
+
+def normalize_market_type_input(raw: Any) -> Optional[str]:
+    """Delega alla normalizzazione centralizzata market_type (spot/futures)."""
+    from .text_normalize_config_values import normalize_market_type
+
+    return normalize_market_type(raw)
+
+
+def normalize_operating_mode_input(raw: Any) -> Optional[str]:
+    """Delega alla normalizzazione centralizzata operating_mode."""
+    from .text_normalize_config_values import normalize_operating_mode
+
+    return normalize_operating_mode(raw)

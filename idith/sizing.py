@@ -12,7 +12,11 @@ def position_size(balance_usdt: float, risk_pct: str, atr_mult: str, leverage: s
     - leverage es. "2x"
     """
     try:
-        r = float(str(risk_pct).replace("%","").replace(",", "."))
+        from .text_normalize_user_numbers import parse_config_float
+
+        r = parse_config_float(risk_pct)
+        if r is None:
+            raise ValueError(f"risk_pct non valido: {risk_pct!r}")
     except Exception:
         r = 1.0
     lev = 1.0

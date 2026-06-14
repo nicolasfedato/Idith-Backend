@@ -65,6 +65,14 @@ except Exception as e1:
 
 orchestrator = orchestrator_mod
 
+from . import ai_lang
+
+from .text_normalize_config_values import (
+    STRATEGY_ID_BY_MODE as _REPLY_OPERATING_MODE_STRATEGY_ID,
+    normalize_market_type,
+    normalize_operating_mode,
+)
+
 # Supabase queue module (dopo load_env, non fa raise a import-time).
 # In deploy (es. uvicorn app:app dalla cartella idith/) il package relativo fallisce:
 # servono fallback come per orchestrator, incluso import diretto del modulo sibling.
@@ -114,21 +122,55 @@ except Exception as e1:
                 )
                 supabase_queue = None
 
-# Backtest preview helper (detection + payload)
-runner_backtest_mod = None
+preview_service_mod = None
 try:
-    from . import runner_backtest as runner_backtest_mod
+    from . import preview_service as preview_service_mod
 except Exception:
     try:
-        import idith.runner_backtest as runner_backtest_mod
+        import idith.preview_service as preview_service_mod
     except Exception:
         try:
-            from idith import runner_backtest as runner_backtest_mod
+            from idith import preview_service as preview_service_mod
         except Exception:
             try:
-                import runner_backtest as runner_backtest_mod
+                import preview_service as preview_service_mod
             except Exception:
-                runner_backtest_mod = None
+                preview_service_mod = None
+
+preview_history_service_mod = None
+try:
+    from . import preview_history_service as preview_history_service_mod
+except Exception:
+    try:
+        import idith.preview_history_service as preview_history_service_mod
+    except Exception:
+        try:
+            from idith import preview_history_service as preview_history_service_mod
+        except Exception:
+            try:
+                import preview_history_service as preview_history_service_mod
+            except Exception:
+                preview_history_service_mod = None
+
+preview_advice_service_mod = None
+try:
+    from . import preview_advice_service as preview_advice_service_mod
+except Exception:
+    try:
+        import idith.preview_advice_service as preview_advice_service_mod
+    except Exception:
+        try:
+            from idith import preview_advice_service as preview_advice_service_mod
+        except Exception:
+            try:
+                import preview_advice_service as preview_advice_service_mod
+            except Exception:
+                preview_advice_service_mod = None
+
+logger.info(
+    "[PREVIEW_ADVICE] module_loaded=%s",
+    preview_advice_service_mod is not None,
+)
 
 # ----------------------------------------
 # ENV
@@ -471,30 +513,73 @@ CONFIGURAZIONE CORRENTE:
 """.strip()
 
 
-def build_orchestrator_wrap_prompt(orchestrator_question: str) -> str:
-    """Vincolo RIGIDO: output deve contenere ESATTAMENTE UNA sola domanda, identica a quella dell'orchestrator."""
+def build_orchestrator_wrap_prompt(orchestrator_question: str, lang: Optional[str] = None) -> str:
+    """Vincolo RIGIDO: output deve contenere ESATTAMENTE UNA sola domanda (tradotta se lang=en)."""
     q = (orchestrator_question or "").strip()
-    
-    # Se la risposta dell'orchestrator NON contiene una domanda (nessun '?'),
-    # significa che la configurazione è completa e non dobbiamo forzare domande
-    if "?" not in q:
-        return f"""REGOLE DI OUTPUT:
-- La configurazione è COMPLETA. NON fare domande di configurazione.
-- Rispondi in modo informativo alla domanda dell'utente.
-- NON riproporre strategia, timeframe, leva, rischio, SL/TP o altri parametri di configurazione.
-- NON riaprire step già completati.
-- L'orchestrator ha detto: "{q}"
-- Rispondi informativamente basandoti su questo contesto.
+    has_question = "?" in q
+    lang_rules = ai_lang.build_orchestrator_wrap_lang_rules(lang, has_question)
+
+    if not has_question:
+        return f"""OUTPUT RULES:
+{lang_rules}
+- Orchestrator context: "{q}"
+- Reply informatively based on this context.
 """.strip()
-    
-    return f"""REGOLE DI OUTPUT (RIGIDE - RISPETTA ASSOLUTAMENTE):
-- Il tuo output deve contenere ESATTAMENTE UNA sola domanda in tutto il testo (un solo '?').
-- Quell'unica domanda deve essere IDENTICA alla domanda dell'orchestrator (sotto).
-- VIETATO fare altre domande, VIETATO elenchi di parametri, VIETATO introdurre nuovi step.
-- Puoi scrivere massimo 2-3 frasi prima della domanda finale, solo per contesto minimo.
-- La domanda finale deve essere ESATTAMENTE questa (copia e incolla, non parafrasare):
+
+    return f"""OUTPUT RULES (STRICT):
+{lang_rules}
+- Final question from orchestrator (preserve meaning):
 {q}
 """.strip()
+
+
+def _reply_needs_localization(reply: str, lang: Optional[str]) -> bool:
+    """True when lang=en and the reply still contains Italian orchestrator/static text."""
+    if ai_lang.normalize_lang(lang) != "en":
+        return False
+    text = reply or ""
+    if not text.strip():
+        return False
+    italian_hints = (
+        "Configurazione completata",
+        "Non ho applicato",
+        "Vuoi operare",
+        "Perfetto",
+        "Quale ",
+        "Che coppia",
+        "Che leva",
+        "Che percentuale",
+        "modalità operativa",
+        "Ripartiamo",
+        "Bot resettato",
+        "Leva:",
+        "Stop loss:",
+        "Take profit:",
+        "Timeframe:",
+        "Coppia:",
+        "Spot o Futures",
+        "Scegli ",
+        "Iniziamo",
+        "Ottima scelta",
+        "Errore durante",
+        "Errore nella generazione",
+        "Stai impostando",
+        "Confermi",
+        "Ho resettato",
+    )
+    return any(h in text for h in italian_hints)
+
+
+def _apply_chat_lang_to_reply(reply: str, lang: Optional[str], *, mode: Optional[str] = None) -> str:
+    """Localize static/orchestrator replies when lang=en and text is still Italian."""
+    _ = mode
+    if not _reply_needs_localization(reply, lang):
+        return reply or ""
+    return ai_lang.localize_assistant_reply(
+        reply or "",
+        lang,
+        api_key=OPENAI_API_KEY or None,
+    )
 
 
 def _normalize_question(text: str) -> str:
@@ -764,6 +849,7 @@ class CreateChatPayload(BaseModel):
 class ChatPayload(BaseModel):
     chat_id: Optional[str] = None
     message: str
+    lang: Optional[str] = None
 
 class SaveMessagePayload(BaseModel):
     chat_id: str
@@ -2382,7 +2468,7 @@ def _deep_merge_config_state(existing: dict, incoming: dict) -> dict:
         return copy.deepcopy(existing)
     result = copy.deepcopy(existing)
     # Top-level: step e altri campi (copiare anche None per poter cancellare pending_*)
-    for key in ("step", "error_count", "pending_risk_confirmation", "pending_sl_confirmation", "pending_leverage_confirmation", "suggested_sl", "last_greeting_variant", "period_index"):
+    for key in ("step", "error_count", "pending_risk_confirmation", "pending_sl_confirmation", "pending_leverage_confirmation", "pending_symbol_confirmation", "pending_timeframe_confirmation", "suggested_sl", "last_greeting_variant", "period_index"):
         if key in incoming:
             inval = incoming[key]
             result[key] = copy.deepcopy(inval) if isinstance(inval, dict) else inval
@@ -2404,9 +2490,19 @@ def _deep_merge_config_state(existing: dict, incoming: dict) -> dict:
     db_mode = _norm_mode(db_params.get("operating_mode"))
     operating_mode_changed = inc_mode is not None and inc_mode != db_mode
 
+    from .text_normalize_config_values import normalize_market_type, normalize_operating_mode
+
     for pk, pv in (incoming_params or {}).items():
         if pv is None:
             continue
+        if pk == "operating_mode":
+            norm_mode = normalize_operating_mode(pv)
+            if norm_mode:
+                pv = norm_mode
+        elif pk == "market_type":
+            norm_mt = normalize_market_type(pv)
+            if norm_mt:
+                pv = norm_mt
         if pk == "strategy_params" and isinstance(pv, dict):
             if operating_mode_changed:
                 prev_sp = result_params.get("strategy_params")
@@ -2459,7 +2555,142 @@ def _deep_merge_config_state(existing: dict, incoming: dict) -> dict:
     return result
 
 
-def save_chat_state(chat_id: str, user_id: str, state: dict):
+_OPERATING_MODE_REPLY_RE = re.compile(
+    r"Modalità operativa:\s*(\S+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_operating_mode_from_reply(assistant_reply: Optional[str]) -> Optional[str]:
+    """Estrae operating_mode dalla reply solo se indica una scelta confermata (non una domanda con opzioni)."""
+    if not assistant_reply or not str(assistant_reply).strip():
+        return None
+    text = str(assistant_reply).strip()
+    lt = text.lower()
+    question_markers = (
+        "scegli la modalità",
+        "che modalità preferisci",
+        "che modalità vuoi",
+        "would you like to use",
+        "would you like to",
+    )
+    if any(marker in lt for marker in question_markers):
+        return None
+    modes_in_text = [
+        m
+        for m in ("aggressiva", "equilibrata", "selettiva")
+        if re.search(rf"\b{m}\b", lt)
+    ]
+    if len(modes_in_text) > 1:
+        return None
+    match = _OPERATING_MODE_REPLY_RE.search(text)
+    if not match:
+        return None
+    return normalize_operating_mode(match.group(1))
+
+
+def _apply_operating_mode_bundle_for_save(config_state_to_save: dict, mode: str) -> dict:
+    """Applica operating_mode + strategy_id + strategy_params sul payload PATCH (fonte: reply UI)."""
+    import copy as _copy
+
+    params = config_state_to_save.get("params")
+    if not isinstance(params, dict):
+        params = {}
+
+    if orchestrator_mod is not None and hasattr(orchestrator_mod, "_apply_operating_mode_preset"):
+        params = orchestrator_mod._apply_operating_mode_preset(dict(params), mode)
+    else:
+        fallback_presets = {
+            "aggressiva": ("1", {"rsi_buy": 45, "rsi_sell": 55, "rsi_period": 5}),
+            "equilibrata": ("2", {"rsi_buy": 45, "rsi_sell": 55, "rsi_period": 7, "ema_period": 7}),
+            "selettiva": (
+                "3",
+                {
+                    "rsi_buy": 45,
+                    "rsi_sell": 55,
+                    "rsi_period": 7,
+                    "ema_period": 10,
+                    "atr_period": 7,
+                    "atr_min_threshold": 0.05,
+                },
+            ),
+        }
+        sid, sp = fallback_presets.get(mode, (None, {}))
+        params = dict(params)
+        params["operating_mode"] = mode
+        params["strategy_id"] = sid
+        params["strategy_params"] = _copy.deepcopy(sp)
+
+    config_state_to_save["params"] = params
+    return config_state_to_save
+
+
+def _sync_assistant_reply_from_config_params(
+    assistant_reply: Optional[str],
+    state: Optional[dict],
+) -> str:
+    """Allinea il riepilogo mostrato in chat a state.config_state.params (solo reply, non params)."""
+    if not assistant_reply:
+        return assistant_reply or ""
+    if not isinstance(state, dict):
+        return assistant_reply
+    cs = state.get("config_state")
+    if not isinstance(cs, dict):
+        return assistant_reply
+    params = cs.get("params")
+    if not isinstance(params, dict):
+        return assistant_reply
+    if orchestrator_mod is not None and hasattr(orchestrator_mod, "_sync_reply_summary_from_params"):
+        return orchestrator_mod._sync_reply_summary_from_params(assistant_reply, params)
+    return assistant_reply
+
+
+def _sync_config_state_operating_mode_from_reply(
+    config_state_to_save: Optional[dict],
+    assistant_reply: Optional[str],
+) -> Optional[dict]:
+    """
+    Ricostruisce strategy_id/strategy_params solo dopo scelta esplicita dell'utente.
+    Non inferisce operating_mode dal testo della reply (es. domande che elencano le opzioni).
+    """
+    if not isinstance(config_state_to_save, dict):
+        return config_state_to_save
+    params = config_state_to_save.get("params")
+    if not isinstance(params, dict):
+        return config_state_to_save
+    mode = normalize_operating_mode(params.get("operating_mode"))
+    if not mode:
+        return config_state_to_save
+    return _apply_operating_mode_bundle_for_save(config_state_to_save, mode)
+
+
+def _hard_validate_reply_config_state_before_patch(
+    assistant_reply: Optional[str],
+    patched_params: dict,
+) -> None:
+    mode = _extract_operating_mode_from_reply(assistant_reply)
+    if not mode:
+        return
+    expected_sid = _REPLY_OPERATING_MODE_STRATEGY_ID[mode]
+    actual_mode = str(patched_params.get("operating_mode") or "").strip().lower()
+    actual_sid = (
+        str(patched_params.get("strategy_id"))
+        if patched_params.get("strategy_id") is not None
+        else None
+    )
+    if actual_mode != mode or actual_sid != expected_sid:
+        raise ValueError(
+            f"[FINAL_DB_PATCH] HARD CHECK FAILED: reply mode={mode} strategy_id={expected_sid} "
+            f"payload mode={actual_mode} strategy_id={actual_sid}"
+        )
+
+
+def save_chat_state(
+    chat_id: str,
+    user_id: str,
+    state: dict,
+    assistant_reply: Optional[str] = None,
+):
     """
     Salva lo state dentro la tabella chats.
     """
@@ -2582,7 +2813,24 @@ def save_chat_state(chat_id: str, user_id: str, state: dict):
             config_state_to_save = merged_config_state
         else:
             config_state_to_save = {}
-        
+
+        # Fonte unica: allinea operating_mode/strategy_id al testo mostrato in reply (prima del PATCH).
+        config_state_to_save = _sync_config_state_operating_mode_from_reply(
+            config_state_to_save,
+            assistant_reply,
+        )
+        patched_params = {}
+        if isinstance(config_state_to_save, dict):
+            patched_params = config_state_to_save.get("params") or {}
+            if not isinstance(patched_params, dict):
+                patched_params = {}
+            _hard_validate_reply_config_state_before_patch(assistant_reply, patched_params)
+            logger.info(
+                "[FINAL_DB_PATCH] operating_mode=%s strategy_id=%s",
+                patched_params.get("operating_mode"),
+                patched_params.get("strategy_id"),
+            )
+
         # UPDATE solo per id (ownership già verificata); filtro SOLO .eq("id", chat_id)
         update_payload = {
             "config_status": state.get("config_status", "new"),
@@ -4520,242 +4768,6 @@ def _resolve_runner_device_id(chat_id: str, user_id: str) -> Optional[str]:
     return None
 
 
-_BACKTEST_PREVIEW_TRIGGERS = (
-    "preview",
-    "anteprima",
-    "simulazione",
-    "simula",
-    "backtest",
-    "ultimi 30 giorni",
-    "come si sarebbe comportato",
-    "come avrebbe performato",
-)
-
-
-def _is_backtest_preview_request(text: str) -> bool:
-    """True se il messaggio chiede una preview/backtest (anche senza lookback esplicito)."""
-    normalized = normalize_user_text(text)
-    if not normalized:
-        return False
-    return any(trigger in normalized for trigger in _BACKTEST_PREVIEW_TRIGGERS)
-
-
-def _format_backtest_preview_pct(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    try:
-        n = float(value)
-    except (TypeError, ValueError):
-        return None
-    if n > 0:
-        return f"+{n:.1f}%"
-    return f"{n:.1f}%"
-
-
-def _format_backtest_preview_done_reply(
-    event_payload: Dict[str, Any],
-    lookback_fallback: int,
-) -> str:
-    def _positive_int(key: str, fallback: int) -> int:
-        raw = event_payload.get(key, fallback)
-        try:
-            n = int(raw)
-            if n > 0:
-                return n
-        except (TypeError, ValueError):
-            pass
-        return fallback
-
-    effective_lb = _positive_int("effective_lookback_days", lookback_fallback)
-    requested_lb = _positive_int("requested_lookback_days", lookback_fallback)
-    max_allowed_lb = _positive_int(
-        "max_allowed_lookback_days",
-        effective_lb,
-    )
-    timeframe = event_payload.get("timeframe") or "—"
-    if isinstance(timeframe, str):
-        timeframe = timeframe.strip() or "—"
-
-    lines = [
-        f"Preview ultimi {effective_lb} giorni 📊",
-        f"Timeframe: {timeframe}",
-        "",
-        (
-            f"Per questo timeframe Idith usa massimo {max_allowed_lb} giorni, "
-            "così l'analisi resta veloce e leggibile."
-        ),
-    ]
-    if requested_lb > effective_lb:
-        lines.extend(
-            [
-                "",
-                (
-                    f"Hai chiesto {requested_lb} giorni, ma con timeframe {timeframe} "
-                    f"il massimo consentito è {max_allowed_lb} giorni."
-                ),
-                f"Ho quindi analizzato gli ultimi {effective_lb} giorni.",
-            ]
-        )
-    lines.extend(["", "Risultato stimato:"])
-
-    if event_payload.get("simulated_trades") is not None:
-        lines.append(f"- Ordini stimati: {event_payload['simulated_trades']}")
-    if event_payload.get("wins") is not None:
-        lines.append(f"- Operazioni positive: {event_payload['wins']}")
-    if event_payload.get("losses") is not None:
-        lines.append(f"- Operazioni negative: {event_payload['losses']}")
-    pnl = _format_backtest_preview_pct(event_payload.get("pnl_pct"))
-    if pnl is not None:
-        lines.append(f"- Risultato stimato: {pnl}")
-    dd = _format_backtest_preview_pct(event_payload.get("max_drawdown_pct"))
-    if dd is not None:
-        lines.append(f"- Massima perdita temporanea stimata: {dd}")
-
-    is_mock = event_payload.get("mock") is True
-    if is_mock:
-        note_body = (
-            "questa è una simulazione basata su dati storici/mock e non rappresenta "
-            "una previsione futura né una garanzia di profitto."
-        )
-    else:
-        note_body = (
-            "questa è una simulazione basata su dati storici reali e non rappresenta "
-            "una previsione futura né una garanzia di profitto."
-        )
-
-    lines.extend(
-        [
-            "",
-            "Nota:",
-            note_body,
-        ]
-    )
-    return "\n".join(lines)
-
-
-def _handle_backtest_preview_request(
-    chat_id: str,
-    user_id: str,
-    user_message: str,
-) -> tuple[str, str, str]:
-    """
-    Accoda BACKTEST_PREVIEW su runner_commands e attende BACKTEST_PREVIEW_DONE.
-    Ritorna (assistant_reply, source, mode).
-    """
-    if not runner_backtest_mod:
-        return (
-            "❌ Modulo backtest preview non disponibile sul server.",
-            "backtest_preview",
-            "backtest_preview_error",
-        )
-    if not supabase_queue:
-        return (
-            "❌ Modulo coda runner non disponibile sul server.",
-            "backtest_preview",
-            "backtest_preview_error",
-        )
-
-    device_id = _resolve_runner_device_id(chat_id, user_id)
-    if not device_id:
-        return (
-            "Per generare la preview serve il runner collegato.",
-            "backtest_preview",
-            "backtest_preview_no_runner",
-        )
-
-    chat_state = load_chat_state(chat_id)
-    config_state = chat_state.get("config_state") if isinstance(chat_state, dict) else None
-    lookback_days = runner_backtest_mod.extract_lookback_days(user_message, default=30)
-    payload = runner_backtest_mod.build_backtest_preview_payload(
-        chat_id=chat_id,
-        config_state=config_state if isinstance(config_state, dict) else None,
-        lookback_days=lookback_days,
-    )
-    payload["user_id"] = user_id
-
-    try:
-        command_id = supabase_queue.enqueue_runner_command(
-            device_id, payload, user_id=user_id
-        )
-        logger.info(
-            "[CHAT] BACKTEST_PREVIEW enqueued: command_id=%s chat_id=%s device_id=%s lookback_days=%s",
-            command_id,
-            chat_id,
-            device_id,
-            lookback_days,
-        )
-
-        event_payload: Optional[Dict[str, Any]] = None
-        timeout_seconds = 450.0
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            try:
-                res = (
-                    supabase.table("runner_events")
-                    .select("payload")
-                    .eq("device_id", device_id)
-                    .eq("command_id", command_id)
-                    .eq("type", "BACKTEST_PREVIEW_DONE")
-                    .order("created_at", desc=True)
-                    .limit(1)
-                    .execute()
-                )
-                rows = res.data or []
-                if rows and isinstance(rows[0], dict):
-                    raw_payload = rows[0].get("payload")
-                    if isinstance(raw_payload, dict):
-                        event_payload = raw_payload
-                        break
-            except Exception as poll_err:
-                logger.warning(
-                    "[CHAT] BACKTEST_PREVIEW poll error command_id=%s: %s",
-                    command_id,
-                    poll_err,
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.5, remaining))
-
-        if event_payload:
-            logger.info(
-                "[CHAT] BACKTEST_PREVIEW_DONE received: command_id=%s chat_id=%s",
-                command_id,
-                chat_id,
-            )
-            return (
-                _format_backtest_preview_done_reply(event_payload, lookback_days),
-                "backtest_preview",
-                "backtest_preview_done",
-            )
-
-        logger.warning(
-            "[CHAT] BACKTEST_PREVIEW timeout: command_id=%s device_id=%s timeout_seconds=%s",
-            command_id,
-            device_id,
-            timeout_seconds,
-        )
-        return (
-            "Ho inviato la richiesta al runner, ma non ho ancora ricevuto il risultato. "
-            "Verifica che il runner sia collegato e riprova.",
-            "backtest_preview",
-            "backtest_preview_timeout",
-        )
-    except Exception as e:
-        logger.error(
-            "[CHAT] BACKTEST_PREVIEW enqueue failed: chat_id=%s user_id=%s error=%s",
-            chat_id,
-            user_id,
-            e,
-            exc_info=True,
-        )
-        return (
-            f"❌ Errore nell'invio della preview al runner: {e}",
-            "backtest_preview",
-            "backtest_preview_enqueue_failed",
-        )
-
-
 def get_runner_online_for_user(user_id: str) -> tuple[bool, float | None, str | None]:
     """
     Verifica se il runner è online per l'utente specificato.
@@ -4917,6 +4929,22 @@ def _insert_user_message(chat_id: str, user_id: str, content: str) -> tuple[bool
         error_details = str(e)
         logger.error(f"[CHAT] INSERT user message FAILED: chat_id={chat_id}, user_id={user_id}, error={error_details}")
         return (False, None, e)
+
+
+def _save_assistant_reply(
+    chat_id: str,
+    user_id: str,
+    content: str,
+    lang: Optional[str],
+    *,
+    mode: Optional[str] = None,
+    localize: bool = True,
+) -> tuple[bool, str | None, Exception | None, str]:
+    """Apply chat language then persist assistant message. Returns localized content."""
+    if localize:
+        content = _apply_chat_lang_to_reply(content, lang, mode=mode)
+    ok, message_id, error = _insert_assistant_message(chat_id, user_id, content)
+    return ok, message_id, error, content
 
 
 def _insert_assistant_message(chat_id: str, user_id: str, content: str) -> tuple[bool, str | None, Exception | None]:
@@ -5248,6 +5276,8 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
         raise HTTPException(status_code=401, detail="Not authenticated")
     
     # Log iniziale
+    lang = ai_lang.normalize_lang(payload.lang)
+    logger.info(f"[CHAT_LANG] lang={lang}")
     logger.info(f"[CHAT] POST /chat: chat_id={payload.chat_id}, user_id={user_id}, message_len={len(payload.message)}")
     
     # STEP 1: Verifica/crea chat
@@ -5323,11 +5353,14 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
             source = "reset_error"
             mode = "reset_failed"
             
-            # Salva messaggio assistant
-            insert_assistant_ok, assistant_message_id, assistant_insert_error = _insert_assistant_message(
+            assistant_reply = _apply_chat_lang_to_reply(assistant_reply, lang, mode=mode)
+            insert_assistant_ok, assistant_message_id, assistant_insert_error, assistant_reply = _save_assistant_reply(
                 chat_id=chat_id,
                 user_id=user_id,
                 content=assistant_reply,
+                lang=lang,
+                mode=mode,
+                localize=False,
             )
             
             return {
@@ -5355,11 +5388,12 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
         source = "reset"
         mode = "reset_command"
         
-        # Salva messaggio assistant
-        insert_assistant_ok, assistant_message_id, assistant_insert_error = _insert_assistant_message(
+        insert_assistant_ok, assistant_message_id, assistant_insert_error, assistant_reply = _save_assistant_reply(
             chat_id=chat_id,
             user_id=user_id,
             content=assistant_reply,
+            lang=lang,
+            mode=mode,
         )
         
         if not insert_assistant_ok:
@@ -5385,12 +5419,117 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
         
         return response_data
 
-    # STEP 2.4: Backtest preview (linguaggio naturale) -> runner_commands
-    if runner_backtest_mod and _is_backtest_preview_request(user_message_content):
-        assistant_reply, source, mode = _handle_backtest_preview_request(
+    # STEP 2.3.5: Storico preview salvate -> preview_history_service
+    if (
+        preview_history_service_mod
+        and preview_history_service_mod.is_preview_history_request(user_message_content)
+    ):
+        assistant_reply, source, mode = preview_history_service_mod.handle_preview_history_request(
+            user_id=user_id,
+            deps=preview_history_service_mod.PreviewHistoryDeps(supabase=supabase),
+        )
+        insert_assistant_ok, assistant_message_id, assistant_insert_error, assistant_reply = _save_assistant_reply(
+            chat_id=chat_id,
+            user_id=user_id,
+            content=assistant_reply,
+            lang=lang,
+            mode=mode,
+            localize=False,
+        )
+        if not insert_assistant_ok:
+            error_details = str(assistant_insert_error) if assistant_insert_error else "Unknown error"
+            logger.error(
+                f"[CHAT] INSERT assistant FAILED (preview history): "
+                f"chat_id={chat_id}, user_id={user_id}, error={error_details}"
+            )
+        response_data = {
+            "ok": True,
+            "chat_id": chat_id,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id if insert_assistant_ok else None,
+            "reply": assistant_reply,
+            "source": source,
+            "mode": mode,
+        }
+        logger.info(
+            f"[CHAT] POST /chat PREVIEW_HISTORY reply: chat_id={chat_id}, user_id={user_id}, "
+            f"mode={mode}, insert_user_ok={insert_user_ok}, insert_assistant_ok={insert_assistant_ok}"
+        )
+        return response_data
+
+    _preview_advice_detected = bool(
+        preview_advice_service_mod
+        and preview_advice_service_mod.is_preview_advice_request(user_message_content)
+    )
+    _normal_preview_detected = bool(
+        preview_service_mod
+        and preview_service_mod.is_preview_request(user_message_content)
+    )
+    logger.info(
+        "[PREVIEW_ADVICE] request_detected=%s message=%r module_loaded=%s",
+        _preview_advice_detected,
+        user_message_content,
+        preview_advice_service_mod is not None,
+    )
+    logger.info(
+        "[PREVIEW] normal_preview_detected=%s message=%r module_loaded=%s",
+        _normal_preview_detected,
+        user_message_content,
+        preview_service_mod is not None,
+    )
+
+    # STEP 2.3.6: Spiegazione AI e consigli sull'ultima preview -> preview_advice_service
+    if _preview_advice_detected:
+        logger.info("[PREVIEW_ADVICE] entering advice handler chat_id=%s user_id=%s", chat_id, user_id)
+        assistant_reply, source, mode = preview_advice_service_mod.handle_preview_advice_request(
+            user_id=user_id,
+            user_message=user_message_content,
+            deps=preview_advice_service_mod.PreviewAdviceDeps(supabase=supabase),
+        )
+        insert_assistant_ok, assistant_message_id, assistant_insert_error = _insert_assistant_message(
+            chat_id=chat_id,
+            user_id=user_id,
+            content=assistant_reply,
+        )
+        if not insert_assistant_ok:
+            error_details = str(assistant_insert_error) if assistant_insert_error else "Unknown error"
+            logger.error(
+                f"[CHAT] INSERT assistant FAILED (preview advice): "
+                f"chat_id={chat_id}, user_id={user_id}, error={error_details}"
+            )
+        response_data = {
+            "ok": True,
+            "chat_id": chat_id,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id if insert_assistant_ok else None,
+            "reply": assistant_reply,
+            "source": source,
+            "mode": mode,
+        }
+        logger.info(
+            f"[CHAT] POST /chat PREVIEW_ADVICE reply: chat_id={chat_id}, user_id={user_id}, "
+            f"mode={mode}, insert_user_ok={insert_user_ok}, insert_assistant_ok={insert_assistant_ok}"
+        )
+        logger.info(
+            "[PREVIEW_ADVICE] advice handler completed chat_id=%s user_id=%s mode=%s",
+            chat_id,
+            user_id,
+            mode,
+        )
+        return response_data
+
+    # STEP 2.4: Backtest preview (linguaggio naturale) -> preview_service
+    if _normal_preview_detected:
+        assistant_reply, source, mode = preview_service_mod.handle_preview_request(
             chat_id=chat_id,
             user_id=user_id,
             user_message=user_message_content,
+            deps=preview_service_mod.PreviewDeps(
+                supabase=supabase,
+                supabase_queue=supabase_queue,
+                load_chat_state=load_chat_state,
+                resolve_runner_device_id=_resolve_runner_device_id,
+            ),
         )
         insert_assistant_ok, assistant_message_id, assistant_insert_error = _insert_assistant_message(
             chat_id=chat_id,
@@ -5448,10 +5587,12 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
             assistant_reply = random.choice(RUNNER_OFFLINE_MESSAGES)
         
         # Salva messaggio assistant come per il flusso normale
-        insert_assistant_ok, assistant_message_id, assistant_insert_error = _insert_assistant_message(
+        insert_assistant_ok, assistant_message_id, assistant_insert_error, assistant_reply = _save_assistant_reply(
             chat_id=chat_id,
             user_id=user_id,
             content=assistant_reply,
+            lang=lang,
+            mode="runner_status_question",
         )
         
         if not insert_assistant_ok:
@@ -5555,6 +5696,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
     mode = "unknown"
     model_used = None
     orch_error_code = None  # es. "invalid_leverage" quando la leva è fuori range
+    orch_state = None
 
     try:
         # Gestione comandi speciali Supabase (prima della logica runner normale)
@@ -5850,6 +5992,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     "history": history,
                     "user_id": user_id,
                     "chat_id": chat_id,
+                    "lang": lang,
                 }
 
                 try:
@@ -5864,23 +6007,6 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     orch_state = orch_res.get("state") if (orch_res and isinstance(orch_res, dict)) else None
                     if orch_state is not None:
                         logger.info("[ORCH] state keys: %s", list(orch_state.keys()) if isinstance(orch_state, dict) else type(orch_state).__name__)
-
-                    # Salva stato ogni volta che l'orchestrator restituisce uno state (PATCH su chats)
-                    # FIX: orch_res.get("state") è falsy per {} - usare "is not None" per non saltare save
-                    if orch_res and isinstance(orch_res, dict) and orch_state is not None and isinstance(orch_state, dict):
-                        logger.info("[CONFIG_SAVE] saving state for chat_id=%s", chat_id)
-                        save_result = save_chat_state(chat_id, user_id, orch_state)
-                    else:
-                        _skip_reason = (
-                            "orch_res invalid" if not (orch_res and isinstance(orch_res, dict))
-                            else "orch_state is None" if orch_state is None
-                            else "orch_state not dict"
-                        )
-                        logger.info("[CONFIG_SAVE] SKIP save for chat_id=%s: %s", chat_id, _skip_reason)
-                        if not save_result.get("ok", False):
-                            reason = save_result.get("reason", "unknown")
-                            logger.error(f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}")
-                            raise HTTPException(status_code=500, detail=f"Save chat state failed: {reason}")
 
                     if orch_res and isinstance(orch_res, dict) and orch_res.get("reply"):
                         assistant_reply_raw = orch_res["reply"].strip()
@@ -5976,8 +6102,9 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             conversational_prompt = build_conversational_prompt(user_message_content, history, state_for_model)
                             system_messages = [
                                 {"role": "system", "content": SYSTEM_BASE_IDITH},
+                                {"role": "system", "content": ai_lang.build_language_system_prompt(lang)},
                                 {"role": "system", "content": build_state_context(state_for_model)},
-                                {"role": "system", "content": build_orchestrator_wrap_prompt(assistant_reply_raw)},
+                                {"role": "system", "content": build_orchestrator_wrap_prompt(assistant_reply_raw, lang)},
                             ]
                             if conversational_prompt:
                                 system_messages.append({"role": "system", "content": conversational_prompt})
@@ -5997,6 +6124,63 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                             source = "orchestrator+openai"
                             mode = "orchestrator_wrapped"
                             model_used = chosen_model
+
+                        # Sincronizza riepilogo in reply da config_state.params (fonte unica prima di save/UI).
+                        if orch_state is not None and isinstance(orch_state, dict):
+                            assistant_reply = _sync_assistant_reply_from_config_params(
+                                assistant_reply,
+                                orch_state,
+                            )
+
+                        # Salvataggio finale: payload allineato alla reply mostrata in UI (unica fonte).
+                        if (
+                            orch_res
+                            and isinstance(orch_res, dict)
+                            and orch_state is not None
+                            and isinstance(orch_state, dict)
+                        ):
+                            logger.info("[CONFIG_SAVE] saving state for chat_id=%s (reply-synced)", chat_id)
+                            save_result = save_chat_state(
+                                chat_id,
+                                user_id,
+                                orch_state,
+                                assistant_reply=assistant_reply,
+                            )
+                            if not save_result.get("ok", False):
+                                reason = save_result.get("reason", "unknown")
+                                logger.error(
+                                    f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}"
+                                )
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail=f"Save chat state failed: {reason}",
+                                )
+                    elif (
+                        orch_res
+                        and isinstance(orch_res, dict)
+                        and orch_state is not None
+                        and isinstance(orch_state, dict)
+                    ):
+                        logger.info("[CONFIG_SAVE] saving state for chat_id=%s (no reply)", chat_id)
+                        save_result = save_chat_state(chat_id, user_id, orch_state)
+                        if not save_result.get("ok", False):
+                            reason = save_result.get("reason", "unknown")
+                            logger.error(
+                                f"[CHAT] Save chat state failed: {reason}: chat_id={chat_id}, user_id={user_id}"
+                            )
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"Save chat state failed: {reason}",
+                            )
+                    else:
+                        _skip_reason = (
+                            "orch_res invalid"
+                            if not (orch_res and isinstance(orch_res, dict))
+                            else "orch_state is None"
+                            if orch_state is None
+                            else "orch_state not dict"
+                        )
+                        logger.info("[CONFIG_SAVE] SKIP save for chat_id=%s: %s", chat_id, _skip_reason)
 
                 except Exception as e:
                     import traceback
@@ -6022,6 +6206,7 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
                     conversational_prompt = build_conversational_prompt(user_message_content, history, state)
                     system_messages = [
                         {"role": "system", "content": SYSTEM_BASE_IDITH},
+                        {"role": "system", "content": ai_lang.build_language_system_prompt(lang)},
                         {"role": "system", "content": build_state_context(state)},
                     ]
                     if conversational_prompt:
@@ -6054,11 +6239,15 @@ def chat(payload: ChatPayload, user=Depends(get_current_user)):
         source = "error"
         mode = "exception"
     
-    # STEP 5: Salva messaggio assistant
-    insert_assistant_ok, assistant_message_id, assistant_insert_error = _insert_assistant_message(
+    # STEP 5: Salva messaggio assistant (reply già allineata a config_state.params se orchestrator)
+    if orch_state is not None and isinstance(orch_state, dict):
+        assistant_reply = _sync_assistant_reply_from_config_params(assistant_reply, orch_state)
+    insert_assistant_ok, assistant_message_id, assistant_insert_error, assistant_reply = _save_assistant_reply(
         chat_id=chat_id,
         user_id=user_id,
-        content=assistant_reply
+        content=assistant_reply,
+        lang=lang,
+        mode=mode,
     )
     
     if not insert_assistant_ok:

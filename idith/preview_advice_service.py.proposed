@@ -1,0 +1,520 @@
+"""
+Servizio isolato per spiegazione AI e consigli sulla ultima preview salvata.
+Solo lettura da public.backtest_previews — nessun runner, nessuna scrittura su config_state.
+"""
+from __future__ import annotations
+
+import logging
+import string
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+try:
+    from .preview_history_service import format_created_at_rome
+except Exception:
+    try:
+        from idith.preview_history_service import format_created_at_rome
+    except Exception:
+        try:
+            from preview_history_service import format_created_at_rome
+        except Exception:
+            _ROME_TZ = ZoneInfo("Europe/Rome")
+
+            def format_created_at_rome(value: Any) -> str:
+                if value is None:
+                    return "N/D"
+                if isinstance(value, datetime):
+                    dt = value
+                elif isinstance(value, str):
+                    try:
+                        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    except ValueError:
+                        return "N/D"
+                else:
+                    return "N/D"
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(_ROME_TZ).strftime("%d/%m/%Y %H:%M")
+
+logger = logging.getLogger(__name__)
+
+_LEGACY_CLOSING = "Vuoi che aggiorni la configurazione con questi parametri?"
+
+CONFIRMATION_QUESTION = (
+    "Se vuoi provare queste modifiche, aggiorna la configurazione scrivendo direttamente "
+    "i nuovi parametri in chat.\n\n"
+    "Esempi:\n"
+    "• imposta timeframe 15m\n"
+    "• porta lo stop loss al 2%\n"
+    "• imposta take profit al 3%\n"
+    "• passa a modalità equilibrata"
+)
+
+ACCENT_MAP = {
+    "à": "a",
+    "è": "e",
+    "é": "e",
+    "ì": "i",
+    "ò": "o",
+    "ù": "u",
+    "À": "a",
+    "È": "e",
+    "É": "e",
+    "Ì": "i",
+    "Ò": "o",
+    "Ù": "u",
+}
+
+_ADVICE_PHRASE_TRIGGERS = (
+    "spiegami questa preview",
+    "spiegami la preview",
+    "spiegami l ultima preview",
+    "spiegami questa preview storica",
+    "analizza questa preview",
+    "analizza la preview",
+    "analizza l ultima preview",
+    "perche questa preview",
+    "perche la preview",
+    "perche ho perso",
+    "perche e negativa",
+    "come posso migliorare questa preview",
+    "come posso migliorare",
+    "come migliorare il risultato",
+    "come migliorare",
+    "come riduco le perdite",
+    "riduci le perdite",
+    "ridurre le perdite",
+    "consigliami i parametri",
+    "consigli parametri",
+    "suggerisci parametri",
+    "cosa devo cambiare",
+)
+
+_PREVIEW_COLUMNS = (
+    "created_at, symbol, timeframe, market_type, operating_mode, strategy_id, "
+    "stop_loss_pct, take_profit_pct, leverage, risk_pct, "
+    "pnl_pct, max_drawdown_pct, estimated_trades, closed_trades, wins, losses"
+)
+
+_NO_PREVIEW_REPLY = (
+    'Non ho ancora una preview salvata per te. Genera prima una preview '
+    '(es. "fammi una preview" o "simula gli ultimi 30 giorni") e poi chiedimi '
+    "di spiegarla o di suggerirti come migliorare."
+)
+
+_SHORT_TIMEFRAMES = frozenset({"1m", "3m", "5m"})
+
+
+@dataclass
+class PreviewAdviceDeps:
+    supabase: Any
+
+
+def normalize_for_matching(text: str) -> str:
+    if not text:
+        return ""
+    normalized = text.strip().lower()
+    for accented, unaccented in ACCENT_MAP.items():
+        normalized = normalized.replace(accented, unaccented)
+    for ch in ("'", "\u2019", "`"):
+        normalized = normalized.replace(ch, " ")
+    normalized = normalized.translate(str.maketrans("", "", string.punctuation))
+    return " ".join(normalized.split())
+
+
+def _has_advice_intent(normalized: str) -> bool:
+    if any(phrase in normalized for phrase in _ADVICE_PHRASE_TRIGGERS):
+        return True
+
+    if "spiegami" in normalized and "preview" in normalized:
+        return True
+
+    if "perche" in normalized and any(
+        word in normalized for word in ("preview", "perso", "perdite", "negativa", "negativo")
+    ):
+        return True
+
+    if "migliorare" in normalized:
+        return True
+
+    if any(
+        phrase in normalized
+        for phrase in ("riduco le perdite", "riduci le perdite", "ridurre le perdite")
+    ):
+        return True
+
+    if "consigliami" in normalized and "parametri" in normalized:
+        return True
+
+    if "cosa devo cambiare" in normalized:
+        return True
+
+    return False
+
+
+def is_preview_advice_request(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    if not normalized:
+        return False
+    return _has_advice_intent(normalized)
+
+
+def compute_win_rate_pct(wins: Any, losses: Any) -> Optional[float]:
+    if wins is None or losses is None:
+        return None
+    try:
+        w = int(wins)
+        l = int(losses)
+    except (TypeError, ValueError):
+        return None
+    total = w + l
+    if total <= 0:
+        return None
+    return round(w * 100.0 / total, 1)
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace("%", "")
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _display_str(value: Any, fallback: str = "N/D") -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is not None and not isinstance(value, str):
+        return str(value)
+    return fallback
+
+
+def _trade_count(row: Dict[str, Any]) -> Optional[int]:
+    closed = _optional_int(row.get("closed_trades"))
+    if closed is not None and closed >= 0:
+        return closed
+    estimated = _optional_int(row.get("estimated_trades"))
+    if estimated is not None and estimated >= 0:
+        return estimated
+    return None
+
+
+def fetch_latest_preview(user_id: str, deps: PreviewAdviceDeps) -> Optional[Dict[str, Any]]:
+    logger.info("[PREVIEW_ADVICE] loading latest preview")
+    try:
+        res = (
+            deps.supabase.table("backtest_previews")
+            .select(_PREVIEW_COLUMNS)
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not isinstance(rows, list) or not rows:
+            logger.info("[PREVIEW_ADVICE] no_preview_found")
+            return None
+        row = rows[0]
+        if not isinstance(row, dict):
+            return None
+        logger.info("[PREVIEW_ADVICE] preview_found symbol=%s", row.get("symbol"))
+        return row
+    except Exception as e:
+        logger.error(
+            "[PREVIEW_ADVICE] fetch failed user_id=%s error=%s",
+            user_id,
+            e,
+            exc_info=True,
+        )
+        return None
+
+
+def build_preview_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
+    sl_pct = _optional_float(row.get("stop_loss_pct"))
+    tp_pct = _optional_float(row.get("take_profit_pct"))
+    trades = _trade_count(row)
+    return {
+        "symbol": _display_str(row.get("symbol")),
+        "timeframe": _display_str(row.get("timeframe")),
+        "market_type": _display_str(row.get("market_type")),
+        "operating_mode": _display_str(row.get("operating_mode")),
+        "strategy_id": _display_str(row.get("strategy_id")),
+        "sl_pct": sl_pct,
+        "tp_pct": tp_pct,
+        "leverage": _optional_float(row.get("leverage")),
+        "risk_pct": _optional_float(row.get("risk_pct")),
+        "pnl_pct": _optional_float(row.get("pnl_pct")),
+        "win_rate_pct": compute_win_rate_pct(row.get("wins"), row.get("losses")),
+        "max_drawdown_pct": _optional_float(row.get("max_drawdown_pct")),
+        "estimated_trades": _optional_int(row.get("estimated_trades")),
+        "closed_trades": _optional_int(row.get("closed_trades")),
+        "trades_count": trades,
+        "preview_date_rome": format_created_at_rome(row.get("created_at")),
+    }
+
+
+def _format_pct_value(value: Optional[float]) -> str:
+    if value is None:
+        return "N/D"
+    if value > 0:
+        return f"+{value:.1f}%"
+    if value < 0:
+        return f"-{abs(value):.1f}%"
+    return "+0.0%"
+
+
+def _format_win_rate(value: Optional[float]) -> str:
+    if value is None:
+        return "N/D"
+    if value == int(value):
+        return f"{int(value)}%"
+    return f"{value:.1f}%"
+
+
+def _format_level_pct(value: Optional[float]) -> str:
+    if value is None:
+        return "N/D"
+    if value == int(value):
+        return f"{int(value)}%"
+    return f"{value:.1f}%"
+
+
+def _build_why_section(snapshot: Dict[str, Any]) -> str:
+    symbol = snapshot.get("symbol", "N/D")
+    timeframe = snapshot.get("timeframe", "N/D")
+    pnl = _format_pct_value(snapshot.get("pnl_pct"))
+    win_rate = _format_win_rate(snapshot.get("win_rate_pct"))
+    trades = snapshot.get("trades_count")
+    trades_text = str(trades) if trades is not None else "N/D"
+    drawdown_val = snapshot.get("max_drawdown_pct")
+    if drawdown_val is None:
+        drawdown = "N/D"
+    else:
+        drawdown = f"{abs(drawdown_val):.1f}%"
+
+    sl_pct = snapshot.get("sl_pct")
+    tp_pct = snapshot.get("tp_pct")
+    sl_tp_note = ""
+    if sl_pct is not None and tp_pct is not None:
+        sl_tp_note = (
+            f" Con SL/TP a {_format_level_pct(sl_pct)}/{_format_level_pct(tp_pct)} "
+            "i trade hanno poco margine prima di chiudersi in stop o in target."
+        )
+        if sl_pct == tp_pct and (snapshot.get("pnl_pct") or 0) < 0:
+            sl_tp_note = (
+                f" Con SL e TP entrambi al {_format_level_pct(sl_pct)}, "
+                "servono molti trade vincenti per compensare le perdite."
+            )
+
+    operating_mode = snapshot.get("operating_mode", "N/D")
+    mode_note = ""
+    if isinstance(operating_mode, str) and operating_mode.lower() == "aggressiva":
+        mode_note = " La modalità Aggressiva aumenta la frequenza dei segnali."
+
+    tf_note = ""
+    tf = str(snapshot.get("timeframe", "")).lower()
+    if tf in _SHORT_TIMEFRAMES:
+        tf_note = f" Il timeframe {timeframe} tende a generare più segnali e più rumore."
+
+    pnl_val = snapshot.get("pnl_pct")
+    outcome_hint = ""
+    if pnl_val is not None:
+        if pnl_val < 0:
+            outcome_hint = " Il risultato negativo indica che le perdite hanno superato i guadagni."
+        elif pnl_val > 0:
+            outcome_hint = " Il risultato positivo indica che la strategia ha chiuso in guadagno nel periodo simulato."
+        else:
+            outcome_hint = " Il risultato è in pareggio nel periodo simulato."
+
+    win_rate_val = snapshot.get("win_rate_pct")
+    wr_note = ""
+    if win_rate_val is not None and win_rate_val < 45:
+        wr_note = " Un win rate sotto il 45% rende difficile recuperare anche con buon risk/reward."
+
+    dd_val = snapshot.get("max_drawdown_pct")
+    dd_note = ""
+    if dd_val is not None and dd_val > 10:
+        dd_note = " Un drawdown elevato segnala sequenze di perdite consecutive pesanti."
+
+    body = (
+        f"La preview su {symbol} (timeframe {timeframe}) chiude a {pnl} "
+        f"con win rate {win_rate} su {trades_text} operazioni. "
+        f"Il drawdown massimo è stato {drawdown}."
+        f"{outcome_hint}{wr_note}{dd_note}{tf_note}{sl_tp_note}{mode_note}"
+    )
+    return body.strip()
+
+
+def _suggest_timeframe(snapshot: Dict[str, Any]) -> Optional[str]:
+    tf = str(snapshot.get("timeframe", "")).lower()
+    if tf in _SHORT_TIMEFRAMES:
+        return "timeframe 15m o 1h"
+    if tf in {"15m", "5m"}:
+        return "timeframe 1h"
+    return None
+
+
+def _suggest_sl_tp(snapshot: Dict[str, Any]) -> List[str]:
+    suggestions: List[str] = []
+    sl = snapshot.get("sl_pct")
+    tp = snapshot.get("tp_pct")
+    pnl = snapshot.get("pnl_pct")
+
+    if sl is not None and tp is not None and sl == tp and (pnl is None or pnl < 0):
+        new_sl = max(sl + 0.5, 2.5)
+        new_tp = max(tp + 1.5, 4.0)
+        suggestions.append(f"stop loss {_format_level_pct(new_sl)}")
+        suggestions.append(f"take profit {_format_level_pct(new_tp)}")
+    elif sl is not None and sl <= 2.0 and (pnl is None or pnl < 0):
+        suggestions.append("stop loss 3%")
+        suggestions.append("take profit 4-5%")
+    elif tp is not None and sl is not None and tp <= sl:
+        suggestions.append(f"take profit leggermente sopra lo stop (es. SL {_format_level_pct(sl)}, TP 4%)")
+
+    return suggestions
+
+
+def _suggest_operating_mode(snapshot: Dict[str, Any]) -> Optional[str]:
+    mode = str(snapshot.get("operating_mode", "")).lower()
+    trades = snapshot.get("trades_count")
+    pnl = snapshot.get("pnl_pct")
+
+    if mode == "aggressiva" and (pnl is None or pnl < 0):
+        return "modalità Selettiva o Equilibrata"
+    if mode == "selettiva" and trades is not None and trades < 15:
+        return "modalità Equilibrata"
+    if mode != "selettiva" and (pnl is None or pnl < 0):
+        win_rate = snapshot.get("win_rate_pct")
+        if win_rate is not None and win_rate < 45:
+            return "modalità Selettiva"
+    return None
+
+
+def _suggest_risk_leverage(snapshot: Dict[str, Any]) -> List[str]:
+    suggestions: List[str] = []
+    leverage = snapshot.get("leverage")
+    risk = snapshot.get("risk_pct")
+    dd = snapshot.get("max_drawdown_pct")
+    market = str(snapshot.get("market_type", "")).lower()
+
+    if dd is not None and dd > 10:
+        if leverage is not None and leverage >= 5 and market != "spot":
+            suggestions.append(f"leva più contenuta (es. {max(3, int(leverage // 2))}x)")
+        if risk is not None and risk >= 1.5:
+            suggestions.append("rischio 1% per trade")
+
+    return suggestions
+
+
+def build_rule_based_advice(snapshot: Dict[str, Any]) -> str:
+    why = _build_why_section(snapshot)
+
+    raw_suggestions: List[str] = []
+    tf = _suggest_timeframe(snapshot)
+    if tf:
+        raw_suggestions.append(tf)
+    raw_suggestions.extend(_suggest_sl_tp(snapshot))
+    mode = _suggest_operating_mode(snapshot)
+    if mode:
+        raw_suggestions.append(mode)
+    raw_suggestions.extend(_suggest_risk_leverage(snapshot))
+
+    if not raw_suggestions:
+        pnl = snapshot.get("pnl_pct")
+        if pnl is not None and pnl >= 0:
+            raw_suggestions = [
+                "mantenere timeframe e modalità attuali",
+                "stop loss 2.5% e take profit 4% per proteggere i guadagni",
+            ]
+        else:
+            raw_suggestions = [
+                "timeframe 15m",
+                "stop loss 3%",
+                "take profit 4%",
+            ]
+
+    seen = set()
+    unique: List[str] = []
+    for item in raw_suggestions:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    unique = unique[:4]
+    if len(unique) < 2:
+        for filler in ("stop loss 3%", "take profit 4%"):
+            if filler.lower() not in seen:
+                unique.append(filler)
+                seen.add(filler.lower())
+            if len(unique) >= 2:
+                break
+
+    suggestion_lines = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(unique))
+
+    return (
+        "Perché la preview è andata così\n"
+        f"{why}\n\n"
+        "Cosa proverei a cambiare\n"
+        f"{suggestion_lines}\n\n"
+        f"{CONFIRMATION_QUESTION}"
+    )
+
+
+def ensure_confirmation_suffix(reply: str) -> str:
+    text = (reply or "").strip()
+    if not text:
+        return CONFIRMATION_QUESTION
+    if _LEGACY_CLOSING.lower() in text.lower():
+        idx = text.lower().find(_LEGACY_CLOSING.lower())
+        text = text[:idx].rstrip()
+    if CONFIRMATION_QUESTION in text:
+        return text
+    return f"{text}\n\n{CONFIRMATION_QUESTION}"
+
+
+def _try_llm_advice(user_message: str, snapshot: Dict[str, Any]) -> Optional[str]:
+    try:
+        from . import llm_client
+    except Exception:
+        try:
+            import llm_client
+        except Exception:
+            return None
+    try:
+        return llm_client.preview_advice_answer(user_message, snapshot)
+    except Exception as e:
+        logger.error("[PREVIEW_ADVICE] llm_failed error=%s", e, exc_info=True)
+        return None
+
+
+def handle_preview_advice_request(
+    user_id: str,
+    user_message: str,
+    deps: PreviewAdviceDeps,
+) -> Tuple[str, str, str]:
+    row = fetch_latest_preview(user_id, deps)
+    if not row:
+        return _NO_PREVIEW_REPLY, "preview_advice", "preview_advice_no_data"
+
+    snapshot = build_preview_snapshot(row)
+    llm_reply = _try_llm_advice(user_message, snapshot)
+    if llm_reply:
+        reply = ensure_confirmation_suffix(llm_reply)
+        return reply, "preview_advice", "preview_advice_llm"
+
+    reply = build_rule_based_advice(snapshot)
+    return reply, "preview_advice", "preview_advice_fallback"
